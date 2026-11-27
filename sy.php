@@ -993,7 +993,7 @@ function fm_guardian_watchdog_installed(){
     $uiOk=$ui!==false&&strpos($ui,'; BEGIN fm-guardian-watchdog')!==false
         &&strpos($ui,'auto_prepend_file')!==false;
     return ($htOk||$uiOk)
-        &&$restore!==false&&strpos($restore,'fm-guardian-restore-version:2')!==false;
+        &&$restore!==false&&strpos($restore,'fm-guardian-restore-version:3')!==false;
 }
 
 /* Installs the web-server watchdog: a tiny standalone PHP script in this
@@ -1232,12 +1232,18 @@ THREAT_MONITOR;
     */
     $restoreRunnerCode=<<<'GUARDIAN_RESTORE'
 <?php
-/* fm-guardian-restore-version:2 */
-$target=__DIR__.DIRECTORY_SEPARATOR.'sy.php';
-$original=(string)($_SERVER['REDIRECT_URL']??$_SERVER['REQUEST_URI']??'/sy.php');
-$originalPath=parse_url($original,PHP_URL_PATH)?:'/sy.php';
+/* fm-guardian-restore-version:3 */
+$target=__FG_TARGET__;
+if(@is_readable(__FG_TARGET_META__)){$__fgm=@json_decode((string)@file_get_contents(__FG_TARGET_META__),true);if(is_array($__fgm)&&!empty($__fgm['filepath']))$target=(string)$__fgm['filepath'];}
+$__fgDefault='/'.basename($target);
+$original=(string)($_SERVER['REDIRECT_URL']??$_SERVER['REQUEST_URI']??$__fgDefault);
+$originalPath=parse_url($original,PHP_URL_PATH)?:$__fgDefault;
 if(basename((string)$originalPath)!==basename($target)){http_response_code(404);exit;}
-if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:'/sy.php'),true,302);exit;}
+if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:$__fgDefault),true,302);exit;}
+/* Ask the hidden launcher/watchdog first: it already holds the exact DB
+   connection this install used and follows the current target metadata. */
+if(@is_file(__FG_LAUNCHER__))@include_once __FG_LAUNCHER__;
+if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:$__fgDefault),true,302);exit;}
 
 $row=null;
 $url=trim((string)(getenv('DATABASE_URL')?:getenv('DB_URL')?:''));
@@ -1285,8 +1291,13 @@ if(@file_put_contents($tmp,$content,LOCK_EX)===false||!@rename($tmp,$target)){
     @unlink($tmp);http_response_code(404);header('Content-Type: text/plain; charset=utf-8');echo 'Not found';exit;
 }
 @chmod($target,((int)($row['file_mode']??420))?:0644);
-header('Location: '.($originalPath?:'/sy.php'),true,302);exit;
+header('Location: '.($originalPath?:$__fgDefault),true,302);exit;
 GUARDIAN_RESTORE;
+    $restoreRunnerCode=str_replace(
+        ['__FG_TARGET__','__FG_LAUNCHER__','__FG_TARGET_META__'],
+        [var_export($target,true),var_export($launcherPath,true),var_export(fg_get_target_meta_path(),true)],
+        $restoreRunnerCode
+    );
     $restoreTmp=$restoreRunnerPath.'.tmp';
     if(@file_put_contents($restoreTmp,$restoreRunnerCode)===false)return false;
     $restoreLint=fm_php_lint($restoreTmp);
@@ -1888,13 +1899,6 @@ function fm_guardian_status(){
     return $s;
 }
 
-/* ── Server-side internet speed test ──
-   Disabled in this build: the server never makes outbound requests to a
-   public speed-test service. */
-function fm_server_speed_test(){
-    return['error'=>'The server-side network speed test is disabled in this build.'];
-}
-
 function fm_wp_create_admin($cwd){
     $wpPath=rtrim((string)$cwd,DIRECTORY_SEPARATOR);
     if($wpPath==='')$wpPath=DIRECTORY_SEPARATOR;
@@ -2469,6 +2473,82 @@ function fm_recovery_status($wpPath,$manager){
     return ['ok'=>true,'paths'=>$p,'items'=>$items];
 }
 
+/* One-click "repair + verify" for every recovery/persistence layer. It
+   re-installs what can be re-installed, then reports what is actually
+   present and working now (not just what was requested) so a host that
+   silently blocks a layer is visible instead of looking healthy. */
+function fm_recovery_repair_verify($wpPath,$manager){
+    $report=[];
+    $add=function($label,$ok,$detail='')use(&$report){$report[]=['label'=>$label,'ok'=>(bool)$ok,'detail'=>(string)$detail];};
+    $manager=(string)(@realpath($manager)?:$manager);
+    $wpPath=rtrim((string)$wpPath,DIRECTORY_SEPARATOR);
+
+    /* Guardian database + current backup row */
+    $diag=null;$c=@fm_guardian_conn($diag);
+    $dbOk=(bool)$c;
+    $dbDetail=$dbOk?'connected':(is_array($diag)?json_encode($diag,JSON_UNESCAPED_SLASHES):(($diag!==null&&$diag!=='')?(string)$diag:'not reachable'));
+    $add('Guardian DB connection',$dbOk,$dbDetail);
+    if($dbOk){
+        $sync=fm_guardian_sync();
+        $add('Guardian backup row (fresh sync)',$sync,$sync?'current file written to the database':'sync failed');
+        $row=null;
+        if(fm_guardian_is_pdo($c)){try{$q=$c->query('SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1');$row=$q?$q->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){}}
+        else{$q=@mysqli_query($c,'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1');$row=$q?@mysqli_fetch_assoc($q):null;}
+        $content=$row['content']??null;if(is_resource($content))$content=@stream_get_contents($content);
+        $rowOk=is_string($content)&&strlen($content)>500&&(empty($row['content_hash'])||hash_equals((string)$row['content_hash'],hash('sha256',$content)));
+        $add('Restore source readable',$rowOk,$rowOk?('stored bytes: '.strlen($content)):'row missing or hash mismatch');
+        if(!fm_guardian_is_pdo($c)){
+            $sv=@mysqli_query($c,"SHOW VARIABLES LIKE 'event_scheduler'");$on=false;if($sv&&($x=mysqli_fetch_assoc($sv)))$on=(strtoupper((string)$x['Value'])==='ON');
+            $add('MySQL event scheduler',$on,$on?'ON':'OFF (the watchdog/404 layer must cover it)');
+        }
+    }else $add('Guardian backup row (fresh sync)',false,'skipped: database not reachable');
+
+    /* Guardian watchdog, hidden launcher and 404 restore runner */
+    $wd=fm_guardian_install_watchdog();
+    $add('Watchdog install/refresh',$wd,$wd?'written and self-tested':'failed (check .htaccess/.user.ini write access and hidden-dir permissions)');
+    $hidden=function_exists('fg_get_hidden_dir')?fg_get_hidden_dir():'';
+    $mon=$hidden!==''&&is_file($hidden.DIRECTORY_SEPARATOR.'monitor.php');
+    $launch=$hidden!==''&&is_file($hidden.DIRECTORY_SEPARATOR.'launch.php');
+    $add('Hidden launcher + watchdog',$mon&&$launch,($mon?'monitor.php ok':'monitor.php missing').' · '.($launch?'launch.php ok':'launch.php missing'));
+    $tmOk=false;$tmDetail='target.meta missing';
+    if(function_exists('fg_get_target_meta_path')&&is_file(fg_get_target_meta_path())){
+        $m=@json_decode((string)@file_get_contents(fg_get_target_meta_path()),true);
+        if(is_array($m)&&!empty($m['filepath'])){$tmOk=(@realpath((string)$m['filepath'])===@realpath($manager));$tmDetail='target: '.(string)$m['filepath'].($tmOk?'':' (does not match the running file)');}
+    }
+    $add('Target metadata',$tmOk,$tmDetail);
+    $rr=@file_get_contents(__DIR__.DIRECTORY_SEPARATOR.'.guardian-restore.php');
+    $rrOk=is_string($rr)&&strpos($rr,'fm-guardian-restore-version:3')!==false;
+    $add('404 restore runner',$rrOk,$rrOk?'version 3 present':'missing or old version');
+    $ht=@file_get_contents(__DIR__.DIRECTORY_SEPARATOR.'.htaccess');
+    $ui=@file_get_contents(__DIR__.DIRECTORY_SEPARATOR.'.user.ini');
+    $htOk=is_string($ht)&&strpos($ht,'# BEGIN fm-guardian-watchdog')!==false&&stripos($ht,'auto_prepend_file')!==false;
+    $uiOk=is_string($ui)&&strpos($ui,'; BEGIN fm-guardian-watchdog')!==false&&stripos($ui,'auto_prepend_file')!==false;
+    $add('.htaccess auto_prepend',$htOk,$htOk?'present':'missing; nginx / AllowOverride None makes this layer unusable');
+    $add('.user.ini auto_prepend',$uiOk,$uiOk?'present (PHP-FPM may cache it for ~300s)':'missing; PHP-FPM may not honor user_ini on this host');
+
+    /* WordPress-side layers */
+    if($wpPath!==''&&is_dir($wpPath)&&is_file($wpPath.DIRECTORY_SEPARATOR.'wp-load.php')){
+        $p=fm_recovery_paths($wpPath,$manager);
+        $state=is_file($p['state_file'])?(@json_decode((string)@file_get_contents($p['state_file']),true)?:[]):[];
+        $remote=(string)($state['remote_url']??'');
+        $db=fm_recovery_install_db($wpPath,$manager);
+        $add('WP: database copy',!empty($db['ok']),!empty($db['ok'])?('stored '.(int)($db['bytes']??0).' bytes'):(string)($db['error']??'failed'));
+        $ld=fm_recovery_install_loaders($wpPath,$manager,$remote);
+        $ldRes=is_array($ld['results']??null)?$ld['results']:[];
+        $ldWritten=count(array_filter($ldRes,function($v){return $v==='written';}));
+        $add('WP: loaders / mu-plugin / theme',!empty($ld['ok'])&&$ldWritten>0,$ldRes?json_encode($ldRes,JSON_UNESCAPED_SLASHES):'failed');
+        $pp=fm_recovery_install_prepend($wpPath);
+        $ppRes=is_array($pp['results']??null)?$pp['results']:[];
+        $ppOk=!empty($pp['ok'])&&in_array('written',$ppRes,true);
+        $add('WP: site auto_prepend',$ppOk,$ppRes?json_encode($ppRes,JSON_UNESCAPED_SLASHES):'failed');
+        $cr=fm_recovery_install_cron($wpPath,$manager,$remote);
+        $add('WP: cron restore script',!empty($cr['ok']),!empty($cr['ok'])?('script '.($cr['installed']?'+ crontab installed':'written, crontab not installed')):(string)($cr['error']??'failed'));
+    }else{
+        $add('WordPress installation',false,'not found in this folder or its parents; WordPress layers were skipped');
+    }
+    return ['ok'=>true,'report'=>$report,'status'=>fm_recovery_status($wpPath,$manager)];
+}
+
 /* ── Undo the automatic recovery layers ─────────────────────────────────── */
 function fm_uninstall_rm($path,&$removed,&$errors){
     if(!is_file($path))return;
@@ -2900,7 +2980,6 @@ function fm_mfm_op_perm($a){
         'cms_create_user'=>'cms','cms_delete_user'=>'cms','cms_update_role'=>'cms','cms_change_pass'=>'cms',
         'cms_update_visibility'=>'cms','cms_toggle_plugin'=>'cms','cms_delete_plugin'=>'cms','cms_toggle_extension'=>'cms',
         'cms_maintenance_toggle'=>'cms','wp_core_update'=>'cms',
-        'webmail_send'=>'cms','webmail_delete'=>'cms','webmail_mark'=>'cms',
         'ssh_install'=>'terminal','ssh_create_user'=>'terminal','ssh_delete_user'=>'terminal','ssh_update_user'=>'terminal','bypass_perms'=>'bypass',
     ];
     return $m[$a]??'write';
@@ -2909,7 +2988,7 @@ function fm_mfm_op_perm($a){
 function fm_mfm_xop_perm($xop){
     static $m=['rooting'=>'rooting','bypass'=>'bypass','privmode'=>'privmode','owners'=>'owners','guard'=>'guard',
                'sessions'=>'inspector','mfmadmin'=>'','pma'=>'pma','cpm'=>'cpm',
-               'mail'=>'cms','mail_get'=>'cms'];
+];
     if(isset($m[$xop]))return $m[$xop];
     if(strpos($xop,'rooting')===0)return 'rooting';
     if(strpos($xop,'owner')===0)return 'owners';
@@ -3975,1726 +4054,7 @@ function fm_cpm_endpoint($post){
 }
 /* <<CPM-END>> */
 
-/* <<WM2-BEGIN>> Webmail Manager - every mailbox on this host, opened without a sign-in
-   ═══════════════════════════════════════════════════════════════════════════
-   The old manager asked a mail server for its users and gave up when the
-   host had none to ask. This one starts from the opposite end: the mail
-   itself. Whatever is on the disk or named in a site's own settings is
-   found and opened, whatever kind of mailbox it is.
-   ═══════════════════════════════════════════════════════════════════════ */
-/* <<MAIL-BEGIN>> Mail engine - reading real mail off a real host, with nothing but PHP
-   ═══════════════════════════════════════════════════════════════════════════
-   Nothing here asks a human for a password. Everything it reads is already on
-   the machine or in a configuration the site already carries:
 
-     · Maildir folders (cPanel, Plesk, Postfix/Dovecot/vmail, Dovecot home)
-     · mbox files (/var/mail, /var/spool/mail)
-     · IMAP and POP3 servers it can reach with a sign-in found in a config
-     · the mailbox names the site itself uses (WordPress, Joomla, .env files)
-     · cPanel's own webmail sign-on, so cPanel's webmail opens signed in
-
-   The parsing is complete enough for real mail: MIME multipart, base64 and
-   quoted-printable, charsets, RFC 2047 headers, attachments, inline pictures. */
-
-/* ── small helpers ──────────────────────────────────────────────────────── */
-function wm2_hdr_decode($s){
-    $s=(string)$s;
-    if($s==='')return '';
-    /* RFC 2047: =?charset?B|Q?text?= - folded headers may split the word */
-    $s=preg_replace("/\\?=\\s+=\\?/",'?==?',$s);
-    return (string)preg_replace_callback('/=\?([^?\\s]+)\?([BbQq])\?([^?]*)\?=/',function($m){
-        $charset=strtolower($m[1]);$enc=strtoupper($m[2]);$txt=$m[3];
-        $raw=$enc==='B'?base64_decode($txt):quoted_printable_decode(str_replace('_',' ',$txt));
-        return wm2_to_utf8($raw,$charset);
-    },$s);
-}
-function wm2_to_utf8($s,$charset){
-    $charset=strtolower(trim((string)$charset));
-    if($s===''||$charset===''||$charset==='utf-8'||$charset==='utf8'||$charset==='us-ascii')return $s;
-    if(function_exists('iconv')&&@iconv($charset,'UTF-8',$s)!==false)return (string)@iconv($charset,'UTF-8',$s);
-    if(function_exists('mb_convert_encoding')){try{return (string)@mb_convert_encoding($s,'UTF-8',$charset);}catch(\Throwable $e){}}
-    return $s;
-}
-function wm2_addr_list($raw){
-    $out=[];
-    foreach(preg_split('/,(?![^<]*>)/',(string)$raw) as $part){
-        $part=trim($part);
-        if($part==='')continue;
-        if(preg_match('/^(.*?)<([^>]+)>/',$part,$m)){
-            $name=trim(wm2_hdr_decode(trim($m[1],' "')));
-            $out[]=['name'=>$name,'email'=>trim($m[2])];
-        }else{
-            $out[]=['name'=>'','email'=>trim($part,' <>')];
-        }
-    }
-    return $out;
-}
-function wm2_bytes($n){
-    $n=(float)$n;
-    if($n>=1048576)return round($n/1048576,1).' MB';
-    if($n>=1024)return round($n/1024).' KB';
-    return (int)$n.' B';
-}
-/* the header block and the body of one message */
-function wm2_split_message($raw){
-    $raw=(string)$raw;
-    $pos=strpos($raw,"\r\n\r\n");
-    $len=4;
-    if($pos===false){$pos=strpos($raw,"\n\n");$len=2;}
-    if($pos===false)return ['head'=>$raw,'body'=>''];
-    return ['head'=>substr($raw,0,$pos),'body'=>substr($raw,$pos+$len)];
-}
-function wm2_headers($head){
-    $head=str_replace("\r\n","\n",(string)$head);
-    $head=preg_replace("/\n[ \t]+/",' ',$head);          /* unfold */
-    $out=[];
-    foreach(explode("\n",$head) as $line){
-        $c=strpos($line,':');
-        if($c===false)continue;
-        $k=strtolower(trim(substr($line,0,$c)));
-        $v=trim(substr($line,$c+1));
-        if(isset($out[$k]))$out[$k].=', '.$v;else $out[$k]=$v;
-    }
-    return $out;
-}
-function wm2_part_param($value,$name){
-    if(preg_match('/;\s*'.preg_quote($name,'/').'\*?=\s*"([^"]*)"/i',$value,$m))return $m[1];
-    if(preg_match('/;\s*'.preg_quote($name,'/').'\*?=\s*([^;\s]+)/i',$value,$m))return trim($m[1],'"');
-    return '';
-}
-function wm2_decode_transfer($body,$enc){
-    switch(strtolower(trim((string)$enc))){
-        case 'base64': return (string)base64_decode(preg_replace('/\s+/','',(string)$body));
-        case 'quoted-printable': return quoted_printable_decode((string)$body);
-        default: return (string)$body;
-    }
-}
-/* walks a MIME tree and fills what a reader needs */
-function wm2_walk($head,$body,&$out,$depth=0){
-    if($depth>12)return;
-    $h=wm2_headers($head);
-    /* the type is compared in lower case, but a boundary and a file name are
-       read from the header as it was written: both are case sensitive */
-    $rawType=(string)($h['content-type']??'text/plain');
-    $ctype=strtolower($rawType);
-    $mime=strtolower($h['mime-version']??'');
-    $disp=strtolower($h['content-disposition']??'');
-    if(strpos($ctype,'multipart/')===0){
-        $b=wm2_part_param($rawType,'boundary');
-        if($b==='')return;
-        $parts=preg_split('/--'.preg_quote($b,'/').'(?=(--)?\r?\n)/',(string)$body);
-        foreach($parts as $i=>$chunk){
-            if($i===0)continue;
-            if(strpos(ltrim($chunk),'--')===0)break;
-            $chunk=preg_replace('/^\r?\n/','',$chunk,1);
-            $sp=wm2_split_message($chunk);
-            /* a part ends with CRLF before the boundary */
-            $sp['body']=preg_replace('/\r?\n$/','',$sp['body'],1);
-            wm2_walk($sp['head'],$sp['body'],$out,$depth+1);
-        }
-        return;
-    }
-    $name=wm2_part_param((string)($h['content-disposition']??''),'filename');
-    if($name==='')$name=wm2_part_param($rawType,'name');
-    $name=$name!==''?wm2_hdr_decode($name):'';
-    $charset=strtolower(wm2_part_param($rawType,'charset')?:'utf-8');
-    $isAtt=($name!==''&&strpos($disp,'attachment')!==false)||($name!==''&&strpos($disp,'inline')===false&&strpos($ctype,'text/')!==0&&strpos($ctype,'multipart/')!==0);
-    $data=wm2_decode_transfer($body,$h['content-transfer-encoding']??'');
-    if(strpos($ctype,'text/html')===0&&!$isAtt){
-        $out['html'].=wm2_to_utf8($data,$charset);
-    }elseif(strpos($ctype,'text/plain')===0&&!$isAtt){
-        $out['plain'].=wm2_to_utf8($data,$charset);
-    }elseif($name!==''||$ctype!==''){
-        $cid=trim($h['content-id']??'',' <>');
-        /* the part keeps its bare type: the parameters are not part of it */
-        $bare=trim((string)strtok($ctype,';'));
-        $out['files'][]=['name'=>$name!==''?$name:'part', 'type'=>$bare, 'data'=>$data,
-                         'size'=>strlen($data), 'cid'=>$cid,
-                         'inline'=>($cid!==''&&strpos($disp,'attachment')===false)];
-    }
-}
-/* one message, from raw bytes to what the window shows */
-function wm2_parse_message($raw){
-    $sp=wm2_split_message($raw);
-    $h=wm2_headers($sp['head']);
-    $out=['html'=>'','plain'=>'','files'=>[]];
-    wm2_walk($sp['head'],$sp['body'],$out);
-    /* inline pictures are given to the page as data they already carry */
-    $html=$out['html'];
-    if($html!==''&&$out['files']){
-        foreach($out['files'] as $f){
-            if(!$f['inline']||$f['cid']==='')continue;
-            $html=str_replace('cid:'.$f['cid'],
-                'data:'.($f['type']?:'application/octet-stream').';base64,'.base64_encode($f['data']),$html);
-        }
-    }
-    $attachments=[];
-    foreach($out['files'] as $i=>$f){
-        if($f['inline']&&$f['cid']!=='')continue;
-        $attachments[]=['index'=>$i,'name'=>$f['name'],'type'=>$f['type'],'size'=>$f['size']];
-    }
-    $subject=wm2_hdr_decode($h['subject']??'');
-    $from=wm2_addr_list($h['from']??'');
-    $to=wm2_addr_list($h['to']??'');
-    $cc=wm2_addr_list($h['cc']??'');
-    $dateRaw=$h['date']??'';
-    $ts=$dateRaw!==''?(@strtotime($dateRaw)?:0):0;
-    return [
-        'subject'=>$subject!==''?$subject:'(no subject)',
-        'from'=>($from[0]['name']?:($from[0]['email']??'')),
-        'from_email'=>$from[0]['email']??'',
-        'to'=>$to,'cc'=>$cc,
-        'to_text'=>implode(', ',array_map(function($a){return $a['name']!==''?$a['name'].' <'.$a['email'].'>':$a['email'];},$to)),
-        'cc_text'=>implode(', ',array_map(function($a){return $a['email'];},$cc)),
-        'date'=>$ts, 'date_text'=>$ts?date('Y-m-d H:i',$ts):($dateRaw?:''),
-        'html'=>$html, 'plain'=>$out['plain'],
-        'attachments'=>$attachments,
-        'message_id'=>$h['message-id']??'', 'reply_to'=>$h['reply-to']??'',
-        'raw'=>$raw,
-    ];
-}
-/* the html of a message is shown in a box of its own that may not run anything */
-function wm2_safe_html($html){
-    $html=(string)$html;
-    $html=preg_replace('#<script\b[^>]*>.*?</script>#is','',$html);
-    $html=preg_replace('#<(iframe|object|embed|form|base|meta|link)\b[^>]*>#i','',$html);
-    $html=preg_replace('/\son[a-z]+\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)/i','',$html);
-    $html=preg_replace('/javascript\s*:/i','',$html);
-    return $html;
-}
-
-/* ── Maildir ─────────────────────────────────────────────────────────────
-   A Maildir is a folder with cur/, new/ and tmp/, one file per message, and
-   its sub-folders are folders named ".Sent", ".Trash" and so on. */
-function wm2_maildir_folders($root){
-    $folders=[['id'=>'INBOX','name'=>'Inbox','path'=>rtrim($root,'/')]];
-    foreach((array)@glob(rtrim($root,'/').'/.[!.]*',GLOB_ONLYDIR) as $dir){
-        $base=basename($dir);
-        if(!is_dir($dir.'/cur')&&!is_dir($dir.'/new'))continue;
-        $id=substr($base,1);
-        if($id===''||in_array($id,['Trash','Junk'],true)||true)$folders[]=['id'=>$id,'name'=>wm2_folder_name($id),'path'=>$dir];
-    }
-    usort($folders,function($a,$b){
-        $rank=['INBOX'=>0,'Sent'=>1,'Drafts'=>2,'Junk'=>3,'Trash'=>4];
-        $ra=$rank[$a['id']]??9;$rb=$rank[$b['id']]??9;
-        return $ra===$rb?strcmp($a['name'],$b['name']):$ra<=>$rb;
-    });
-    return $folders;
-}
-function wm2_folder_name($id){
-    $map=['INBOX'=>'Inbox','Sent'=>'Sent','Sent Items'=>'Sent','Drafts'=>'Drafts','Trash'=>'Trash',
-          'Junk'=>'Spam','Spam'=>'Spam','Trash Items'=>'Trash','Deleted Items'=>'Trash','Outbox'=>'Outbox'];
-    return $map[$id]??ucfirst(str_replace(['.','_'],' ',$id));
-}
-function wm2_maildir_files($path){
-    $files=[];
-    foreach(['new','cur'] as $box){
-        foreach((array)@glob(rtrim($path,'/').'/'.$box.'/*') as $f){
-            if(!@is_file($f))continue;
-            $files[]=$f;
-        }
-    }
-    return $files;
-}
-function wm2_maildir_flags($file){
-    $name=basename($file);
-    /* The info field of a Maildir name is ":1," or ":2," plus the flags, and
-       it is the last thing in the name - so the split is anchored to the end
-       instead of trusting a ":2," that may appear inside a unique id. */
-    $flags='';
-    if(preg_match('/:[12],([A-Za-z]*)$/',$name,$m))$flags=$m[1];
-    return [
-        'seen'=>strpos($flags,'S')!==false,
-        'flagged'=>strpos($flags,'F')!==false,
-        'replied'=>strpos($flags,'R')!==false,
-        'draft'=>strpos($flags,'D')!==false,
-        'trashed'=>strpos($flags,'T')!==false,
-        'raw'=>$flags,
-    ];
-}
-function wm2_maildir_set_flags($file,$flags){
-    $name=basename($file);
-    $dir=dirname($file);
-    $base=$name;
-    $c=strrpos($name,':2,');
-    if($c!==false)$base=substr($name,0,$c);
-    /* Maildir asks for the flags in alphabetical order, and an empty set is a
-       name with no comma at all - ":2," on its own is not a valid name. */
-    $set=array_values(array_unique(array_filter(str_split(strtoupper((string)$flags)),function($f){
-        return strpos('PRSTDF',$f)!==false;
-    })));
-    sort($set);
-    $info=$set?':2,'.implode('',$set):'';
-    /* a message in new/ becomes seen mail the moment it is touched */
-    $target=$dir;
-    if(basename($dir)==='new')$target=dirname($dir).'/cur';
-    $new=$target.'/'.$base.$info;
-    if($new===$file)return $file;
-    /* A folder this account cannot write to is reported as a failure, not
-       dressed up as a success, so the window can say why nothing changed. */
-    if(!@rename($file,$new))return '';
-    return $new;
-}
-function wm2_maildir_list($path){
-    $out=[];
-    foreach(wm2_maildir_files($path) as $file){
-        $raw=@file_get_contents($file);
-        if($raw===false)continue;
-        $sp=wm2_split_message($raw);
-        $h=wm2_headers($sp['head']);
-        $from=wm2_addr_list($h['from']??'');
-        $subject=wm2_hdr_decode($h['subject']??'');
-        $ts=isset($h['date'])?(@strtotime($h['date'])?:@filemtime($file)):@filemtime($file);
-        $fl=wm2_maildir_flags($file);
-        $hasAtt=preg_match('/content-disposition:\s*attachment/i',$raw)||strpos(strtolower($h['content-type']??''),'multipart/mixed')!==false;
-        $out[]=[
-            'uid'=>basename($file),
-            'subject'=>$subject!==''?$subject:'(no subject)',
-            'from'=>($from[0]['name']?:($from[0]['email']??'(unknown)')),
-            'from_email'=>$from[0]['email']??'',
-            'date'=>(int)$ts,
-            'size'=>filesize($file),
-            'seen'=>$fl['seen'],
-            'flagged'=>$fl['flagged'],
-            'attachments'=>(bool)$hasAtt,
-            'to'=>wm2_hdr_decode($h['to']??''),
-        ];
-    }
-    usort($out,function($a,$b){return $b['date']<=>$a['date'];});
-    return $out;
-}
-function wm2_maildir_message($path,$uid){
-    $file=null;
-    foreach(wm2_maildir_files($path) as $f){if(basename($f)===$uid){$file=$f;break;}}
-    if($file===null)return null;
-    $raw=@file_get_contents($file);
-    if($raw===false)return null;
-    $m=wm2_parse_message($raw);
-    $fl=wm2_maildir_flags($file);
-    if(!$fl['seen']){
-        $fl2=$fl['raw']===''?'S':$fl['raw'].'S';
-        $moved=wm2_maildir_set_flags($file,$fl2);
-        /* an empty answer means the folder could not be written to: the
-           message is still where it was, so its name is unchanged */
-        if($moved!=='')$m['uid']=basename($moved);
-    }
-    $m['file']=$file;
-    return $m;
-}
-function wm2_maildir_delete($path,$uid,$trashPath){
-    $file=null;
-    foreach(wm2_maildir_files($path) as $f){if(basename($f)===$uid){$file=$f;break;}}
-    if($file===null)return ['ok'=>false,'error'=>'That message is no longer there.'];
-    if($trashPath!==''&&@is_dir($trashPath.'/cur')){
-        $base=basename($file);
-        $c=strrpos($base,':2,');
-        if($c!==false)$base=substr($base,0,$c);
-        $target=$trashPath.'/cur/'.$base.':2,S';
-        if(@rename($file,$target))return ['ok'=>true,'moved'=>'Trash'];
-    }
-    return @unlink($file)?['ok'=>true,'moved'=>'']:['ok'=>false,'error'=>'The message file could not be removed.'];
-}
-
-/* ── mbox (/var/mail/<user>) ────────────────────────────────────────────── */
-function wm2_mbox_list($path){
-    $raw=@file_get_contents($path);
-    if($raw===false)return [];
-    $chunks=preg_split('/^From .*\n/m',$raw);
-    $out=[];$i=0;
-    foreach($chunks as $chunk){
-        if(trim($chunk)==='')continue;
-        $i++;
-        $sp=wm2_split_message($chunk);
-        $h=wm2_headers($sp['head']);
-        $from=wm2_addr_list($h['from']??'');
-        $subject=wm2_hdr_decode($h['subject']??'');
-        $ts=isset($h['date'])?(@strtotime($h['date'])?:0):0;
-        $out[]=['uid'=>(string)$i,'subject'=>$subject!==''?$subject:'(no subject)',
-                'from'=>($from[0]['name']?:($from[0]['email']??'(unknown)')),
-                'from_email'=>$from[0]['email']??'','date'=>(int)$ts,'size'=>strlen($chunk),
-                'seen'=>true,'flagged'=>false,'attachments'=>false,'to'=>wm2_hdr_decode($h['to']??'')];
-    }
-    usort($out,function($a,$b){return $b['date']<=>$a['date'];});
-    return $out;
-}
-function wm2_mbox_message($path,$uid){
-    $raw=@file_get_contents($path);
-    if($raw===false)return null;
-    $chunks=preg_split('/^From .*\n/m',$raw);
-    $i=0;
-    foreach($chunks as $chunk){
-        if(trim($chunk)==='')continue;
-        $i++;
-        if((string)$i===(string)$uid)return wm2_parse_message($chunk);
-    }
-    return null;
-}
-
-/* ── IMAP, spoken directly ───────────────────────────────────────────────
-   No extension is required: the protocol is small enough to speak over a
-   socket, and a host without the imap extension still reads its mail. */
-function wm2_imap_open($host,$port,$user,$pass,$tls='auto',$timeout=8){
-    $target=($tls==='ssl'?'ssl://':'').$host.':'.(int)$port;
-    $errno=0;$errstr='';
-    $sock=@stream_socket_client($target,$errno,$errstr,$timeout);
-    if(!$sock)return ['ok'=>false,'error'=>'Could not reach the mail server at '.$host.':'.$port.' ('.$errstr.')'];
-    stream_set_timeout($sock,15);
-    /* one reply: everything up to the tagged line, with any literal it
-       carries read byte for byte - a header block arrives as {1234} followed
-       by that many bytes, and a line-based reader would corrupt it */
-    $read=function()use($sock){
-        $out='';
-        while(($line=fgets($sock,8192))!==false){
-            $out.=$line;
-            if(preg_match('/\{(\d+)\}\r?\n$/',$line,$m)){
-                $need=(int)$m[1];
-                $got='';
-                while(strlen($got)<$need){
-                    $chunk=fread($sock,$need-strlen($got));
-                    if($chunk===false||$chunk==='')break;
-                    $got.=$chunk;
-                }
-                $out.=$got;
-                continue;
-            }
-            if(preg_match('/^[A-Za-z0-9_.\-]+ (OK|NO|BAD)\b/i',$line))break;
-            if(stripos($line,'* BYE')===0)break;
-        }
-        return $out;
-    };
-    $cmd=function($tag,$text)use($sock,$read){
-        fwrite($sock,$tag.' '.$text."\r\n");
-        $out='';
-        while(true){
-            $line=$read();
-            if($line==='')break;
-            $out.=$line;
-            if(preg_match('/^'.preg_quote($tag,'/').' (OK|NO|BAD)/im',$line))break;
-        }
-        return $out;
-    };
-    /* the greeting is one line of its own and comes before anything is tagged */
-    $banner=(string)fgets($sock,8192);
-    if(stripos($banner,'* OK')===false&&stripos($banner,'* PREAUTH')===false){
-        fclose($sock);return ['ok'=>false,'error'=>'The mail server did not greet us: '.trim($banner)];
-    }
-    if($tls==='starttls'){
-        $r=$cmd('A1','STARTTLS');
-        if(stripos($r,'A1 OK')===false){fclose($sock);return ['ok'=>false,'error'=>'The server refused STARTTLS.'];}
-        if(!@stream_socket_enable_crypto($sock,true,STREAM_CRYPTO_METHOD_TLS_CLIENT)){
-            fclose($sock);return ['ok'=>false,'error'=>'The encrypted channel could not be established.'];
-        }
-    }
-    $r=$cmd('A2','LOGIN '.wm2_imap_quote($user).' '.wm2_imap_quote($pass));
-    if(stripos($r,'A2 OK')===false){
-        /* some servers want the quoted form spelled out differently */
-        fclose($sock);
-        return ['ok'=>false,'error'=>'The mail server refused that sign-in: '.trim(preg_replace('/\s+/',' ',strip_tags($r)))];
-    }
-    return ['ok'=>true,'sock'=>$sock,'cmd'=>$cmd,'read'=>$read];
-}
-function wm2_imap_quote($s){
-    return '"'.str_replace(['\\','"'],['\\\\','\\"'],(string)$s).'"';
-}
-
-function wm2_imap_close($conn){if(!empty($conn['sock'])){@fwrite($conn['sock'],"Z9 LOGOUT\r\n");@fclose($conn['sock']);}}
-function wm2_imap_folders($conn){
-    $r=$conn['cmd']('F1','LIST "" "*"');
-    $out=[];
-    foreach(explode("\n",$r) as $line){
-        if(stripos($line,'* LIST')!==0)continue;
-        if(!preg_match('/"([^"]*)"\\s*$/',trim($line),$m))continue;
-        $name=$m[1];
-        if($name===''||strtoupper(substr($name,0,5))==='[GMAIL')continue;
-        $id=strtoupper($name)==='INBOX'?'INBOX':$name;
-        $out[]=['id'=>$id,'name'=>wm2_folder_name($name),'path'=>$name];
-    }
-    if(!$out)$out[]=['id'=>'INBOX','name'=>'Inbox','path'=>'INBOX'];
-    usort($out,function($a,$b){
-        $rank=['INBOX'=>0,'Sent'=>1,'Drafts'=>2,'Junk'=>3,'Trash'=>4];
-        $ra=$rank[$a['name']]??$rank[$a['id']]??9;$rb=$rank[$b['name']]??$rank[$b['id']]??9;
-        return $ra===$rb?strcmp($a['name'],$b['name']):$ra<=>$rb;
-    });
-    return $out;
-}
-function wm2_imap_select($conn,$folder){
-    $r=$conn['cmd']('S1','SELECT '.wm2_imap_quote($folder));
-    return stripos($r,'S1 OK')!==false;
-}
-/* one FETCH reply, split into records; a record's literal is read by its
-   announced length, never by guessing where it ends */
-function wm2_imap_records($reply){
-    $out=[];
-    $parts=preg_split('/\* \d+ FETCH \(/',"\n".$reply);
-    for($i=1;$i<count($parts);$i++){
-        $chunk=$parts[$i];
-        $nl=strpos($chunk,"\r\n");
-        if($nl===false)$nl=strpos($chunk,"\n");
-        $first=$nl===false?$chunk:substr($chunk,0,$nl);
-        $rec=['uid'=>0,'flags'=>'','size'=>0,'literal'=>''];
-        if(preg_match('/\bUID (\d+)/i',$first,$m))$rec['uid']=(int)$m[1];
-        if(preg_match('/\bFLAGS \(([^)]*)\)/i',$first,$m))$rec['flags']=$m[1];
-        if(preg_match('/\bRFC822\.SIZE (\d+)/i',$first,$m))$rec['size']=(int)$m[1];
-        if(preg_match('/\{(\d+)\}\s*$/',$first,$m)&&$nl!==false){
-            $rec['literal']=substr($chunk,$nl+2,(int)$m[1]);
-            if($rec['literal']==='')$rec['literal']=substr($chunk,$nl+1,(int)$m[1]);
-        }
-        $out[]=$rec;
-    }
-    return $out;
-}
-/* the header block of every message in a folder, asked for in one go */
-function wm2_imap_list($conn,$folder){
-    if(!wm2_imap_select($conn,$folder))return [];
-    $r=$conn['cmd']('L1','UID FETCH 1:* (FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE TO CONTENT-TYPE MESSAGE-ID)])');
-    $out=[];
-    foreach(wm2_imap_records($r) as $rec){
-        if(!$rec['uid'])continue;
-        $h=wm2_headers($rec['literal']);
-        $from=wm2_addr_list($h['from']??'');
-        $subject=wm2_hdr_decode($h['subject']??'');
-        $ts=isset($h['date'])?(@strtotime($h['date'])?:0):0;
-        $ct=strtolower($h['content-type']??'');
-        $out[]=['uid'=>(string)$rec['uid'],
-                'subject'=>$subject!==''?$subject:'(no subject)',
-                'from'=>($from[0]['name']?:($from[0]['email']??'(unknown)')),
-                'from_email'=>$from[0]['email']??'',
-                'date'=>(int)$ts,'size'=>$rec['size'],
-                'seen'=>stripos($rec['flags'],'\\Seen')!==false,
-                'flagged'=>stripos($rec['flags'],'\\Flagged')!==false,
-                'attachments'=>(strpos($ct,'multipart/mixed')!==false),
-                'to'=>wm2_hdr_decode($h['to']??'')];
-    }
-    usort($out,function($a,$b){return $b['date']<=>$a['date'];});
-    return $out;
-}
-function wm2_imap_message($conn,$folder,$uid){
-    if(!wm2_imap_select($conn,$folder))return null;
-    $r=$conn['cmd']('M1','UID FETCH '.(int)$uid.' (BODY.PEEK[])');
-    $recs=wm2_imap_records($r);
-    $raw=$recs?$recs[0]['literal']:'';
-    if($raw===''){
-        /* servers that answer BODY[] instead of BODY.PEEK[] */
-        if(preg_match('/\]\s*\{(\d+)\}\r?\n/',$r,$m)){
-            $pos=strpos($r,'{'.$m[1].'}')+strlen('{'.$m[1].'}');
-            $raw=ltrim(substr($r,$pos),(string)"\r\n");
-            $raw=substr($raw,0,(int)$m[1]);
-        }
-    }
-    if($raw==='')return null;
-    $conn['cmd']('M2','UID STORE '.(int)$uid.' +FLAGS (\\Seen)');
-    return wm2_parse_message($raw);
-}
-function wm2_imap_raw($conn,$folder,$uid){
-    if(!wm2_imap_select($conn,$folder))return null;
-    $r=$conn['cmd']('R1','UID FETCH '.(int)$uid.' (BODY.PEEK[])');
-    $recs=wm2_imap_records($r);
-    return $recs?$recs[0]['literal']:null;
-}
-function wm2_imap_flag($conn,$folder,$uid,$seen){
-    if(!wm2_imap_select($conn,$folder))return false;
-    $r=$conn['cmd']('G1','UID STORE '.(int)$uid.' '.($seen?'+':'-').'FLAGS (\\Seen)');
-    return stripos($r,'G1 OK')!==false;
-}
-function wm2_imap_delete($conn,$folder,$uid,$trash=''){
-    if(!wm2_imap_select($conn,$folder))return ['ok'=>false,'error'=>'That folder could not be opened.'];
-    /* a mailbox with a Trash keeps the message there, the way every mail
-       program does; a mailbox without one really deletes it */
-    $moved='';
-    if($trash!==''&&strcasecmp($trash,$folder)!==0){
-        $c=$conn['cmd']('D0','UID COPY '.(int)$uid.' '.wm2_imap_quote($trash));
-        if(stripos($c,'D0 OK')!==false)$moved=$trash;
-    }
-    $conn['cmd']('D1','UID STORE '.(int)$uid.' +FLAGS (\\Deleted)');
-    $r=$conn['cmd']('D2','UID EXPUNGE '.(int)$uid);
-    if(stripos($r,'D2 OK')===false)$conn['cmd']('D3','EXPUNGE');
-    return ['ok'=>true,'moved'=>$moved];
-}
-
-/* ── POP3 ────────────────────────────────────────────────────────────────
-   The oldest protocol still in use, and a mailbox that only speaks it still
-   gets read here. */
-function wm2_pop3_open($host,$port,$user,$pass,$tls=false,$timeout=8){
-    $target=($tls?'ssl://':'').$host.':'.(int)$port;
-    $errno=0;$errstr='';
-    $sock=@stream_socket_client($target,$errno,$errstr,$timeout);
-    if(!$sock)return ['ok'=>false,'error'=>'Could not reach the mail server at '.$host.':'.$port.' ('.$errstr.')'];
-    stream_set_timeout($sock,15);
-    $line=function()use($sock){$l=fgets($sock,8192);return $l===false?'':rtrim($l,"\r\n");};
-    $say=function($c)use($sock,$line){fwrite($sock,$c."\r\n");return $line();};
-    $banner=$line();
-    if(stripos($banner,'+OK')!==0){fclose($sock);return ['ok'=>false,'error'=>'The server did not greet us: '.$banner];}
-    $r=$say('USER '.$user);
-    if(stripos($r,'+OK')!==0){fclose($sock);return ['ok'=>false,'error'=>'That mailbox was refused: '.$r];}
-    $r=$say('PASS '.$pass);
-    if(stripos($r,'+OK')!==0){fclose($sock);return ['ok'=>false,'error'=>'That password was refused: '.$r];}
-    return ['ok'=>true,'sock'=>$sock,'line'=>$line,'say'=>$say];
-}
-function wm2_pop3_list($conn){
-    $r=$conn['say']('LIST');
-    $out=[];
-    while(true){
-        $l=$conn['line']();
-        if($l===''||$l==='.')break;
-        if(preg_match('/^(\d+)\s+(\d+)$/',$l,$m)){
-            $out[]=['uid'=>$m[1],'size'=>(int)$m[2]];
-        }
-    }
-    return $out;
-}
-function wm2_pop3_message($conn,$uid){
-    $r=$conn['say']('RETR '.(int)$uid);
-    if(stripos($r,'+OK')!==0)return null;
-    $raw='';
-    while(true){
-        $l=$conn['line']();
-        if($l==='.')break;
-        if(strlen($l)>1&&$l[0]==='.'&&$l[1]==='.')$l=substr($l,1);
-        $raw.=$l."\r\n";
-    }
-    return wm2_parse_message($raw);
-}
-function wm2_pop3_list_with_headers($conn){
-    $out=[];
-    foreach(wm2_pop3_list($conn) as $m){
-        $r=$conn['say']('TOP '.$m['uid'].' 0');
-        $head='';
-        if(stripos($r,'+OK')===0){
-            while(true){
-                $l=$conn['line']();
-                if($l==='.')break;
-                $head.=$l."\r\n";
-            }
-        }
-        $h=wm2_headers($head);
-        $from=wm2_addr_list($h['from']??'');
-        $subject=wm2_hdr_decode($h['subject']??'');
-        $ts=isset($h['date'])?(@strtotime($h['date'])?:0):0;
-        $out[]=['uid'=>$m['uid'],'subject'=>$subject!==''?$subject:'(no subject)',
-                'from'=>($from[0]['name']?:($from[0]['email']??'(unknown)')),
-                'from_email'=>$from[0]['email']??'','date'=>(int)$ts,'size'=>$m['size'],
-                'seen'=>true,'flagged'=>false,'attachments'=>false,'to'=>wm2_hdr_decode($h['to']??'')];
-    }
-    usort($out,function($a,$b){return $b['date']<=>$a['date'];});
-    return $out;
-}
-
-/* ── sending ─────────────────────────────────────────────────────────────
-   Three ways, tried in the order that keeps the message intact: an SMTP
-   server with a sign-in the site already holds, the machine's own sendmail,
-   and PHP's own mail() as the last resort. */
-function wm2_mime_message($fromName,$from,$to,$cc,$bcc,$subject,$html,$plain,$attachments=[]){
-    $b1=bin2hex(random_bytes(8));$b2=bin2hex(random_bytes(8));
-    $h="Date: ".date('r')."\r\n";
-    $h.="From: ".($fromName!==''?wm2_rfc2047($fromName).' <'.$from.'>':$from)."\r\n";
-    $h.="To: ".implode(', ',(array)$to)."\r\n";
-    if($cc)$h.="Cc: ".implode(', ',(array)$cc)."\r\n";
-    if($bcc)$h.="Bcc: ".implode(', ',(array)$bcc)."\r\n";
-    $h.="Subject: ".wm2_rfc2047($subject)."\r\n";
-    $h.="Message-ID: <".bin2hex(random_bytes(10)).'@'.($_SERVER['SERVER_NAME']?:'localhost').">\r\n";
-    $h.="MIME-Version: 1.0\r\n";
-    $h.="X-Mailer: Syrah FM Webmail\r\n";
-    $plain=$plain!==''?$plain:trim(strip_tags(str_replace(['<br>','<br/>','</p>'],"\n",$html)));
-    if($attachments){
-        $h.='Content-Type: multipart/mixed; boundary="'.$b1."\"\r\n\r\n";
-        $body="--$b1\r\nContent-Type: multipart/alternative; boundary=\"$b2\"\r\n\r\n";
-        $body.="--$b2\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n".chunk_split(base64_encode($plain))."\r\n";
-        $body.="--$b2\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n".chunk_split(base64_encode($html))."\r\n";
-        $body.="--$b2--\r\n";
-        foreach($attachments as $a){
-            $body.="--$b1\r\nContent-Type: ".($a['type']?:'application/octet-stream')."; name=\"".$a['name']."\"\r\n";
-            $body.="Content-Disposition: attachment; filename=\"".$a['name']."\"\r\n";
-            $body.="Content-Transfer-Encoding: base64\r\n\r\n".chunk_split(base64_encode($a['data']))."\r\n";
-        }
-        $body.="--$b1--\r\n";
-        return $h.$body;
-    }
-    $h.='Content-Type: multipart/alternative; boundary="'.$b2."\"\r\n\r\n";
-    $body="--$b2\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n".chunk_split(base64_encode($plain))."\r\n";
-    $body.="--$b2\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n".chunk_split(base64_encode($html))."\r\n";
-    $body.="--$b2--\r\n";
-    return $h.$body;
-}
-function wm2_rfc2047($s){
-    return preg_match('/[^\x20-\x7E]/',(string)$s)?'=?UTF-8?B?'.base64_encode((string)$s).'?=':(string)$s;
-}
-function wm2_smtp_send($cfg,$from,$to,$cc,$bcc,$data){
-    $host=(string)($cfg['host']??'');$port=(int)($cfg['port']??0);
-    if($host==='')return ['ok'=>false,'error'=>'No mail server to send through.'];
-    $secure=strtolower((string)($cfg['secure']??''));
-    if($port===0)$port=$secure==='ssl'?465:($secure==='tls'?587:25);
-    $target=($secure==='ssl'?'ssl://':'').$host.':'.$port;
-    $errno=0;$errstr='';
-    $sock=@stream_socket_client($target,$errno,$errstr,10);
-    if(!$sock)return ['ok'=>false,'error'=>'The mail server '.$host.':'.$port.' could not be reached ('.$errstr.').'];
-    stream_set_timeout($sock,20);
-    /* a reply is one or more lines: "250-" means another line follows, and
-       "250 " ends it */
-    $get=function()use($sock){
-        $out='';
-        while(($l=fgets($sock,4096))!==false){
-            $out.=$l;
-            if(strlen($l)<4||substr($l,3,1)!=='-')break;
-        }
-        return $out;
-    };
-    $say=function($c)use($sock,$get){fwrite($sock,$c."\r\n");return $get();};
-    $banner=$get();
-    if(strpos($banner,'220')!==0){fclose($sock);return ['ok'=>false,'error'=>'The mail server refused the connection: '.trim($banner)];}
-    $hname=$_SERVER['SERVER_NAME']?:'localhost';
-    $ehlo=$say('EHLO '.$hname);
-    if(strpos($ehlo,'250')!==0)$ehlo=$say('HELO '.$hname);
-    if($secure==='tls'&&stripos($ehlo,'STARTTLS')!==false){
-        $r=$say('STARTTLS');
-        if(strpos($r,'220')===0&&@stream_socket_enable_crypto($sock,true,STREAM_CRYPTO_METHOD_TLS_CLIENT)){
-            $ehlo=$say('EHLO '.$hname);
-        }else{
-            fclose($sock);return ['ok'=>false,'error'=>'The connection could not be encrypted.'];
-        }
-    }
-    if(!empty($cfg['user'])){
-        $auth=strtoupper((string)($cfg['auth']??'plain'));
-        if($auth==='LOGIN'){
-            $r=$say('AUTH LOGIN');
-            if(strpos($r,'334')!==0){fclose($sock);return ['ok'=>false,'error'=>'The server does not accept AUTH LOGIN.'];}
-            $say(base64_encode($cfg['user']));
-            $r=$say(base64_encode((string)($cfg['pass']??'')));
-        }else{
-            $r=$say('AUTH PLAIN '.base64_encode("\0".$cfg['user']."\0".($cfg['pass']??'')));
-        }
-        if(strpos($r,'235')!==0){
-            fclose($sock);
-            return ['ok'=>false,'error'=>'The mail server refused the sign-in for '.$cfg['user'].': '.trim($r)];
-        }
-    }
-    $r=$say('MAIL FROM:<'.$from.'>');
-    if(strpos($r,'250')!==0){fclose($sock);return ['ok'=>false,'error'=>'The sender was refused: '.trim($r)];}
-    foreach(array_merge((array)$to,(array)$cc,(array)$bcc) as $rcpt){
-        $rcpt=trim((string)$rcpt);
-        if($rcpt==='')continue;
-        $r=$say('RCPT TO:<'.$rcpt.'>');
-        if(strpos($r,'250')!==0&&strpos($r,'251')!==0){fclose($sock);return ['ok'=>false,'error'=>'The recipient '.$rcpt.' was refused: '.trim($r)];}
-    }
-    $r=$say('DATA');
-    if(strpos($r,'354')!==0){fclose($sock);return ['ok'=>false,'error'=>'The server refused the message: '.trim($r)];}
-    $stuffed=preg_replace('/^\./m','..',$data);
-    fwrite($sock,$stuffed."\r\n.\r\n");
-    $r=$get();
-    $say('QUIT');@fclose($sock);
-    if(strpos($r,'250')!==0)return ['ok'=>false,'error'=>'Delivery was refused: '.trim($r)];
-    return ['ok'=>true,'via'=>'SMTP '.$host.':'.$port];
-}
-/* the machine's own mailer - what most hosts already have and need no login */
-function wm2_sendmail_send($from,$to,$data,$extra=''){
-    foreach(['/usr/sbin/sendmail','/usr/lib/sendmail','/usr/bin/sendmail'] as $bin){
-        if(!@is_executable($bin))continue;
-        if(!function_exists('proc_open'))break;
-        $args=escapeshellarg($bin).' -t -i -f '.escapeshellarg($from).($extra!==''?' '.$extra:'');
-        $desc=[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];
-        $p=@proc_open($args,$desc,$pipes);
-        if(!is_resource($p))continue;
-        fwrite($pipes[0],$data);
-        fclose($pipes[0]);
-        $out=(string)stream_get_contents($pipes[1]);
-        $err=(string)stream_get_contents($pipes[2]);
-        fclose($pipes[1]);fclose($pipes[2]);
-        $code=proc_close($p);
-        if($code===0)return ['ok'=>true,'via'=>$bin];
-        return ['ok'=>false,'error'=>'The local mailer refused the message: '.trim($err?:$out)];
-    }
-    return ['ok'=>false,'error'=>'This machine has no local mailer.'];
-}
-function wm2_php_mail_send($from,$to,$subject,$html){
-    if(!function_exists('mail'))return ['ok'=>false,'error'=>'PHP mail() is not available.'];
-    $rcpt=implode(', ',array_map('strval',(array)$to));
-    $subject=(string)$subject;
-    $ok=@mail($rcpt,$subject,(string)$html,
-        "MIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\nFrom: ".$from."\r\n");
-    return $ok?['ok'=>true,'via'=>'PHP mail()']:['ok'=>false,'error'=>'PHP mail() refused the message.'];
-}
-
-/* ── finding the mail of a whole host ─────────────────────────────────────
-   Every kind of mailbox a server can hold, each one saying where it was found
-   and what can be done with it. Nothing is guessed silently: an address that
-   the site knows but that has no mailbox here is listed as exactly that. */
-function wm2_id($kind,$where,$email){
-    return substr(md5($kind.'|'.$where.'|'.$email),0,16);
-}
-function wm2_scan_roots(){
-    $roots=[];
-    foreach(['/home','/var/www','/var/www/html','/srv','/srv/www','/opt','/data','/var/lib'] as $r){
-        if(@is_dir($r))$roots[]=$r;
-    }
-    $doc=@realpath($_SERVER['DOCUMENT_ROOT']??''?:'');
-    if($doc!==''){
-        $roots[]=$doc;
-        $roots[]=dirname($doc);
-    }
-    $obd=ini_get('open_basedir');
-    if($obd)foreach(explode(PATH_SEPARATOR,$obd) as $p)$roots[]=rtrim($p,'/');
-    return array_values(array_unique(array_filter($roots)));
-}
-/* a small, bounded walk: enough to find the sites of a host, never a scan of
-   the whole disk */
-function wm2_find_files($names,$depth=4,$limit=400){
-    $hits=[];
-    $walk=function($dir,$level)use(&$walk,&$hits,$names,$depth,$limit){
-        if($level>$depth||count($hits)>=$limit)return;
-        $entries=@scandir($dir);
-        if(!is_array($entries))return;
-        foreach($entries as $e){
-            if($e==='.'||$e==='..')continue;
-            if($e==='node_modules'||$e==='.git'||$e==='vendor'||$e==='cache')continue;
-            $p=rtrim($dir,'/').'/'.$e;
-            if(@is_dir($p)){$walk($p,$level+1);continue;}
-            foreach($names as $n){
-                if(strcasecmp($e,$n)===0){$hits[]=$p;break;}
-            }
-            if(count($hits)>=$limit)return;
-        }
-    };
-    foreach(wm2_scan_roots() as $r)$walk(rtrim($r,'/'),0);
-    return array_values(array_unique($hits));
-}
-function wm2_db_connect($host,$user,$pass,$name,$port=0){
-    $host=str_replace(['localhost','127.0.0.1'],['localhost','127.0.0.1'],$host?:'localhost');
-    if(function_exists('mysqli_connect')){
-        if(function_exists('mysqli_report'))@mysqli_report(MYSQLI_REPORT_OFF);
-        $port=(int)$port;
-        $c=@mysqli_connect($host,$user,$pass,$name,$port?$port:null);
-        if($c)return ['kind'=>'mysqli','h'=>$c];
-    }
-    if(class_exists('PDO')){
-        try{
-            $dsn='mysql:host='.($host?:'localhost').($port?';port='.$port:'').';dbname='.$name.';charset=utf8mb4';
-            $p=new PDO($dsn,$user,$pass,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_SILENT]);
-            return ['kind'=>'pdo','h'=>$p];
-        }catch(\Throwable $e){}
-    }
-    return null;
-}
-function wm2_db_query($db,$sql){
-    if(!$db)return [];
-    if($db['kind']==='mysqli'){
-        $r=@mysqli_query($db['h'],$sql);
-        if(!$r)return [];
-        $rows=[];
-        while($row=@mysqli_fetch_assoc($r))$rows[]=$row;
-        return $rows;
-    }
-    $r=@$db['h']->query($sql);
-    if(!$r)return [];
-    return $r->fetchAll(PDO::FETCH_ASSOC);
-}
-function wm2_db_value($db,$sql){
-    $rows=wm2_db_query($db,$sql);
-    if(!$rows)return '';
-    $row=reset($rows);
-    return (string)reset($row);
-}
-function wm2_parse_php_config($file,$wanted){
-    $raw=@file_get_contents($file);
-    if($raw===false)return [];
-    $out=[];
-    foreach($wanted as $key){
-        if(preg_match("/define\\s*\\(\\s*['\"]".preg_quote($key,'/')."['\"]\\s*,\\s*(['\"])(.*?)\\1/s",$raw,$m)){
-            $out[$key]=$m[2];continue;
-        }
-        if(preg_match('/\$'.preg_quote($key,'/')."\s*=\s*'([^']*)'/",$raw,$m))$out[$key]=$m[1];
-    }
-    return $out;
-}
-/* a site names a sending server; the same sign-in usually opens the mailbox
-   on that same host, so the two are kept apart and the reading port is the
-   reading port, never the sending one */
-function wm2_mail_cred($host,$port,$secure,$user,$pass,$imapHost='',$imapPort=0,$imapSecure=''){
-    $port=(int)$port;
-    $secure=strtolower((string)$secure);
-    $smtp=['host'=>$host,'port'=>$port,'secure'=>$secure,'user'=>$user,'pass'=>$pass];
-    $readHost=$imapHost!==''?$imapHost:$host;
-    $readPort=(int)$imapPort;
-    $readSecure=strtolower((string)$imapSecure);
-    if($readPort===0){
-        if(in_array($port,[993,143,110,995],true))$readPort=$port;
-        else $readPort=($readSecure==='ssl'||$readSecure==='tls')?993:993;
-    }
-    return ['host'=>$readHost,'port'=>$readPort,'secure'=>$readSecure,'user'=>$user,'pass'=>$pass,'smtp'=>$smtp];
-}
-/* ── WordPress ──────────────────────────────────────────────────────────── */
-function wm2_from_wordpress(){
-    $out=[];
-    foreach(wm2_find_files(['wp-config.php']) as $cfg){
-        $dir=dirname($cfg);
-        $c=wm2_parse_php_config($cfg,['DB_NAME','DB_USER','DB_PASSWORD','DB_HOST','WPMS_ON','SMTP_HOST','SMTP_USER',
-                                      'SMTP_PASSWORD','SMTP_PORT','SMTP_SECURE','SMTP_FROM','MAILGUN_API_KEY']);
-        if(empty($c['DB_NAME']))continue;
-        $label='WordPress at '.$dir;
-        $db=wm2_db_connect($c['DB_HOST']??'localhost',$c['DB_USER']??'',$c['DB_PASSWORD']??'',$c['DB_NAME']);
-        $prefix=wm2_db_value($db,"SELECT option_value FROM ".($c['PREFIX']??'wp_options')." WHERE option_name='siteurl'")!==''?'wp_':'wp_';
-        if(preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]+)[\'"]/',(string)@file_get_contents($cfg),$m))$prefix=$m[1];
-        $users=$db?wm2_db_query($db,"SELECT user_email,user_login,display_name FROM {$prefix}users LIMIT 200"):[];
-        $adminEmail=$db?wm2_db_value($db,"SELECT option_value FROM {$prefix}options WHERE option_name='admin_email'"):'';
-        /* the plugins that carry a mail server's sign-in */
-        $smtp=[];
-        foreach([$prefix.'options'] as $tbl){
-            $rows=wm2_db_query($db,"SELECT option_name,option_value FROM {$tbl} WHERE option_name IN
-                ('wpms_options','wp_smtp_options','smtp_mailer_options','wp_mail_smtp_options','mailgun_options','postman_options','smtp_options')");
-            foreach($rows as $row){
-                $v=@unserialize($row['option_value']);
-                if(is_array($v))$smtp[]=['plugin'=>$row['option_name'],'data'=>$v];
-            }
-        }
-        $host='';$user='';$pass='';$port=0;$secure='';
-        foreach($smtp as $s){
-            $d=$s['data'];
-            foreach([['host','smtp_host'],['user','smtp_user','username'],['pass','smtp_pass','password'],['port','smtp_port']] as $keys){
-                foreach($keys as $k){
-                    if(isset($d[$k])&&$d[$k]!==''){
-                        if($keys[0]==='host')$host=(string)$d[$k];
-                        if($keys[0]==='user')$user=(string)$d[$k];
-                        if($keys[0]==='pass')$pass=(string)$d[$k];
-                        if($keys[0]==='port')$port=(int)$d[$k];
-                        break;
-                    }
-                }
-            }
-            if($host!=='')break;
-        }
-        if($host===''&&!empty($c['SMTP_HOST'])){$host=$c['SMTP_HOST'];$user=$c['SMTP_USER']??'';$pass=$c['SMTP_PASSWORD']??'';$port=(int)($c['SMTP_PORT']??0);$secure=$c['SMTP_SECURE']??'';}
-        $site=['label'=>$label,'path'=>$dir,'kind'=>'WordPress','db'=>(bool)$db];
-        $seen=[];
-        $wpCred=$host!==''?wm2_mail_cred($host,$port,$secure,$user,$pass):null;
-        foreach($users as $u){
-            $em=trim((string)($u['user_email']??''));
-            if($em===''||isset($seen[$em]))continue;
-            $seen[$em]=1;
-            $out[]=wm2_account([
-                'email'=>$em,'name'=>(string)($u['display_name']?:$u['user_login']),
-                'kind'=>$wpCred&&strcasecmp($user,$em)===0?'imap':'site',
-                'where'=>$dir,'origin'=>$label.' - a user of the site',
-                'site'=>$site,
-                'cred'=>$wpCred&&strcasecmp($user,$em)===0?$wpCred:null,
-            ]);
-        }
-        if($adminEmail!==''&&!isset($seen[$adminEmail])){
-            $seen[$adminEmail]=1;
-            $out[]=wm2_account(['email'=>$adminEmail,'name'=>'Site administrator','kind'=>'site',
-                'where'=>$dir,'origin'=>$label.' - the administrator address','site'=>$site,
-                'cred'=>$wpCred&&strcasecmp($user,$adminEmail)===0?$wpCred:null]);
-        }
-        if($wpCred&&$user!==''&&!isset($seen[strtolower($user)])){
-            $seen[strtolower($user)]=1;
-            $out[]=wm2_account(['email'=>$user,'name'=>'Mail account of '.$label,'kind'=>'imap',
-                'where'=>$dir,'origin'=>$label.' - the mail server its settings name',
-                'site'=>$site,'cred'=>$wpCred]);
-        }
-    }
-    return $out;
-}
-/* ── Joomla ─────────────────────────────────────────────────────────────── */
-function wm2_from_joomla(){
-    $out=[];
-    foreach(wm2_find_files(['configuration.php']) as $cfg){
-        $raw=@file_get_contents($cfg);
-        if($raw===false)continue;
-        if(strpos($raw,'$mailfrom')===false&&strpos($raw,'$host')===false)continue;
-        if(strpos($raw,'Joomla')===false&&strpos($raw,'\$dbtype')===false&&strpos($raw,'$sitename')===false)continue;
-        $get=function($k)use($raw){
-            if(preg_match('/\$'.preg_quote($k,'/')."\\s*=\\s*'((?:[^'\\\\]|\\\\.)*)'/",$raw,$m))return stripcslashes($m[1]);
-            if(preg_match('/\$'.preg_quote($k,'/').'\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)"/',$raw,$m))return stripcslashes($m[1]);
-            return '';
-        };
-        $dir=dirname($cfg);
-        $label='Joomla at '.$dir;
-        $site=['label'=>$label,'path'=>$dir,'kind'=>'Joomla','db'=>false];
-        $from=$get('mailfrom');$fromname=$get('fromname');
-        $smtpHost=$get('smtphost');$smtpUser=$get('smtpuser');$smtpPass=$get('smtppass');
-        $smtpPort=(int)$get('smtpport');$smtpSecure=$get('smtpsecure');
-        $dbtype=$get('dbtype');$dbhost=$get('host');$dbuser=$get('user');$dbpass=$get('password');$dbname=$get('db');
-        $prefix=$get('dbprefix')?:'jos_';
-        $db=($dbtype==='mysqli'||$dbtype==='pdomysql'||$dbtype==='mysql')?wm2_db_connect($dbhost,$dbuser,$dbpass,$dbname):null;
-        if($db)$site['db']=true;
-        $users=$db?wm2_db_query($db,"SELECT email,name FROM {$prefix}users LIMIT 200"):[];
-        $seen=[];
-        foreach($users as $u){
-            $em=trim((string)($u['email']??''));
-            if($em===''||isset($seen[$em]))continue;
-            $seen[$em]=1;
-            $useSmtp=$smtpHost!==''&&strcasecmp($smtpUser,$em)===0;
-            $out[]=wm2_account(['email'=>$em,'name'=>(string)($u['name']??''),
-                'kind'=>$useSmtp?'imap':'site','where'=>$dir,
-                'origin'=>$label.' - a user of the site','site'=>$site,
-                'cred'=>$useSmtp?wm2_mail_cred($smtpHost,$smtpPort,$smtpSecure,$smtpUser,$smtpPass):null]);
-        }
-        if($from!==''&&!isset($seen[$from])){
-            $out[]=wm2_account(['email'=>$from,'name'=>$fromname?:'Site mail','kind'=>'site','where'=>$dir,
-                'origin'=>$label.' - the address the site sends from','site'=>$site,
-                'cred'=>($smtpHost!==''&&$smtpUser!=='')?wm2_mail_cred($smtpHost,$smtpPort,$smtpSecure,$smtpUser,$smtpPass):null]);
-        }
-        if($smtpHost!==''&&$smtpUser!==''){
-            $out[]=wm2_account(['email'=>$smtpUser,'name'=>'Mail account of '.$label,'kind'=>'imap','where'=>$dir,
-                'origin'=>$label.' - the mail server its configuration names','site'=>$site,
-                'cred'=>wm2_mail_cred($smtpHost,$smtpPort,$smtpSecure,$smtpUser,$smtpPass)]);
-        }
-    }
-    return $out;
-}
-/* ── .env files (Laravel, Symfony, plain PHP projects) ──────────────────── */
-function wm2_from_env(){
-    $out=[];
-    foreach(wm2_find_files(['.env'],5,120) as $f){
-        $raw=@file_get_contents($f);
-        if($raw===false||!preg_match('/^MAIL_HOST=/mi',$raw))continue;
-        $get=function($k)use($raw){
-            return preg_match('/^'.preg_quote($k,'/').'=(.*)$/mi',$raw,$m)?trim($m[1],"\"' \r"):'';
-        };
-        $host=$get('MAIL_HOST');$user=$get('MAIL_USERNAME');$pass=$get('MAIL_PASSWORD');
-        $port=(int)$get('MAIL_PORT');$secure=$get('MAIL_ENCRYPTION');
-        $from=$get('MAIL_FROM_ADDRESS');
-        /* the same sign-in usually opens the mailbox as well: a project names
-           its sending server, and the reading one is that server or its own
-           IMAP keys when the project writes them out */
-        $imapHost=$get('IMAP_HOST');$imapPort=(int)$get('IMAP_PORT');
-        $imapUser=$get('IMAP_USERNAME')?:$user;
-        $imapPass=$get('IMAP_PASSWORD')?:$pass;
-        $imapSecure=$get('IMAP_ENCRYPTION');
-        foreach(array_filter([$imapUser,$from]) as $em){
-            $out[]=wm2_account(['email'=>$em,'name'=>'Mail account of '.basename(dirname($f)),
-                'kind'=>'imap','where'=>dirname($f),'origin'=>'the settings of the project at '.dirname($f),
-                'cred'=>wm2_mail_cred($host,$port,$secure,$imapUser?:$em,$imapPass,
-                                      $imapHost,$imapPort,$imapSecure)]);
-        }
-    }
-    return $out;
-}
-/* ── the mail folders that are simply on the disk ───────────────────────── */
-function wm2_from_maildirs(){
-    $out=[];
-    $add=function($email,$path,$origin,$name='')use(&$out){
-        if($email===''||!@is_dir($path))return;
-        $out[]=wm2_account(['email'=>$email,'name'=>$name?:$email,'kind'=>'maildir','where'=>$path,'origin'=>$origin]);
-    };
-    /* cPanel: /home/<account>/mail/<domain>/<mailbox>/{cur,new} */
-    foreach((array)@glob('/home/*/mail/*/*',GLOB_ONLYDIR) as $dir){
-        if(!@is_dir($dir.'/cur')&&!@is_dir($dir.'/new'))continue;
-        $mailbox=basename($dir);
-        $domain=basename(dirname($dir));
-        if($mailbox===''||$domain==='')continue;
-        $add($mailbox.'@'.$domain,$dir,'the cPanel mail folder of this server');
-    }
-    /* Plesk: /var/qmail/mailnames/<domain>/<mailbox>/Maildir */
-    foreach((array)@glob('/var/qmail/mailnames/*/*/Maildir',GLOB_ONLYDIR) as $dir){
-        $add(basename(dirname($dir)).'@'.basename(dirname(dirname($dir))),$dir,'the Plesk mail folder of this server');
-    }
-    /* Postfix + Dovecot: /var/vmail/<domain>/<mailbox>/Maildir (or without it) */
-    foreach(['/var/vmail','/home/vmail','/srv/vmail'] as $root){
-        foreach((array)@glob($root.'/*/*',GLOB_ONLYDIR) as $dir){
-            $base=@is_dir($dir.'/Maildir')?$dir.'/Maildir':$dir;
-            if(!@is_dir($base.'/cur')&&!@is_dir($base.'/new'))continue;
-            $add(basename($dir).'@'.basename(dirname($dir)),$base,'a virtual mail folder on this server');
-        }
-    }
-    /* a Dovecot user's own home */
-    foreach((array)@glob('/home/*/Maildir',GLOB_ONLYDIR) as $dir){
-        $add(basename(dirname($dir)).'@'.(string)(@gethostname()?:'localhost'),$dir,'the mail folder in the home of '.basename(dirname($dir)));
-    }
-    /* mdbox / sdbox browsers: the folder exists but the messages are not one
-       file each - listed so the window can say so instead of pretending */
-    foreach(['/var/mail/%u','/var/lib/mail'] as $known){/* placeholder, nothing to read */ }
-    return $out;
-}
-function wm2_from_mbox(){
-    $out=[];
-    foreach(['/var/mail','/var/spool/mail'] as $dir){
-        foreach((array)@glob($dir.'/*') as $f){
-            if(!@is_file($f))continue;
-            $size=@filesize($f);
-            if($size===false||$size===0)continue;
-            $name=basename($f);
-            if(in_array($name,['root','mail','news','uucp','nobody','_apt'],true)&&$dir==='/var/mail'){/* still real mail, keep it */}
-            $out[]=wm2_account(['email'=>$name.'@'.(string)(@gethostname()?:'localhost'),'name'=>$name,
-                'kind'=>'mbox','where'=>$f,'origin'=>'an old-style mail file ('.$dir.')']);
-        }
-    }
-    return $out;
-}
-function wm2_account($a){
-    $email=(string)($a['email']??'');
-    $kind=(string)($a['kind']??'site');
-    $where=(string)($a['where']??'');
-    $base=[
-        'id'=>wm2_id($kind,$where,strtolower($email)),
-        'email'=>$email,
-        'name'=>(string)($a['name']??$email),
-        'kind'=>$kind,
-        'where'=>$where,
-        'origin'=>(string)($a['origin']??''),
-        'site'=>$a['site']??null,
-        'cred'=>$a['cred']??null,
-    ];
-    return $base;
-}
-/* what can really be done with this mailbox, and why not when it cannot */
-function wm2_capability($acc){
-    $kind=$acc['kind'];
-    if($kind==='maildir'){
-        $ok=@is_dir($acc['where'])&&(@is_readable($acc['where'].'/cur')||@is_readable($acc['where'].'/new'));
-        return ['read'=>$ok,'delete'=>$ok,'send'=>$ok?'local':'','why'=>$ok?'':'the folder is not readable by this account'];
-    }
-    if($kind==='mbox'){
-        $ok=@is_readable($acc['where']);
-        return ['read'=>$ok,'delete'=>false,'send'=>$ok?'local':'','why'=>$ok?'an mbox file is read as one stream, so messages are read and downloaded but not deleted one by one':'the file is not readable'];
-    }
-    if($kind==='imap'||$kind==='pop3'){
-        return ['read'=>true,'delete'=>true,'send'=>'smtp','why'=>''];
-    }
-    if($kind==='cpanel'){
-        return ['read'=>false,'delete'=>false,'send'=>'','why'=>'cPanel holds this mailbox and does not hand its mail to this server. Use “Open in webmail” to read it signed in.'];
-    }
-    return ['read'=>false,'delete'=>false,'send'=>'','why'=>'this address is known to the site but has no mailbox on this server'];
-}
-/* everything, in one list */
-function wm2_discover(){
-    $accounts=[];$notes=[];
-    $groups=['local'=>[],'site'=>[],'other'=>[]];
-    foreach(wm2_from_maildirs() as $a)$groups['local'][]=$a;
-    foreach(wm2_from_mbox() as $a)$groups['local'][]=$a;
-    foreach(wm2_from_wordpress() as $a)$groups['site'][]=$a;
-    foreach(wm2_from_joomla() as $a)$groups['site'][]=$a;
-    foreach(wm2_from_env() as $a)$groups['site'][]=$a;
-    /* the cPanel server, when this machine is one: its account list is the
-       authority on which mailboxes exist */
-    $cpm=fm_cpm_route();
-    $cpanelPops=[];
-    if(!empty($cpm['ok'])){
-        $j=fm_cpm_call('list_pops_with_disk');
-        if(fm_cpm_result_ok($j)&&isset($j['data'])){
-            $rows=$j['data'];
-            if(isset($rows['pop']))$rows=$rows['pop'];
-            foreach((array)$rows as $row){
-                $em=(string)($row['email']??($row['login']??''));
-                if($em==='')continue;
-                $disk=(int)($row['diskused']??0);
-                $cpanelPops[strtolower($em)]=['email'=>$em,'disk'=>$disk];
-            }
-        }
-    }
-    $merged=[];$order=[];$origins=[];
-    foreach(['local'=>0,'site'=>1,'other'=>2] as $g=>$rank){
-        foreach($groups[$g] as $a){
-            $key=strtolower($a['email']);
-            if(!isset($merged[$key])){$merged[$key]=$a;$order[$key]=$rank;$origins[$key]=[$a['origin']];}
-            else{
-                /* one address can be named by more than one place: every place
-                   it was found in is kept and shown, never silently dropped */
-                $origins[$key][]=$a['origin'];
-                /* a mailbox that is really here wins over an address a site
-                   merely mentions */
-                $mine=$merged[$key];
-                $mineScore=['maildir'=>5,'mbox'=>4,'imap'=>3,'pop3'=>3,'site'=>1][$mine['kind']]??0;
-                $newScore=['maildir'=>5,'mbox'=>4,'imap'=>3,'pop3'=>3,'site'=>1][$a['kind']]??0;
-                if($newScore>$mineScore)$merged[$key]=$a;
-            }
-        }
-    }
-    foreach($cpanelPops as $em=>$pop){
-        if(isset($merged[$em]))continue;
-        $merged[$em]=wm2_account(['email'=>$pop['email'],'name'=>$pop['email'],'kind'=>'cpanel',
-            'where'=>'cPanel','origin'=>'an account of this cPanel server']);
-        $order[$em]=2;
-    }
-    foreach($merged as $key=>$a){
-        $cap=wm2_capability($a);
-        $a['can']=$cap;
-        $list=array_values(array_filter(array_unique($origins[$key]??[$a['origin']])));
-        $a['origins']=$list;
-        if(count($list)>1)$a['origin']=implode(' · ',$list);
-        $a['group']=($order[$key]===0)?'This server':(($order[$key]===1)?'The sites':'');
-        $a['webmail']=!empty($cpm['ok']);
-        $a['folders']=null;
-        $accounts[]=$a;
-    }
-    /* the order the window shows: mail on this server first, then what the
-       sites name, then the addresses that are only addresses - and inside
-       each group, by address */
-    $rank=function($a){
-        $g=(string)($a['group']??'');
-        $base=$g==='This server'?0:($g==='The sites'?1:2);
-        return $base;
-    };
-    usort($accounts,function($x,$y)use($rank){
-        $rx=$rank($x);$ry=$rank($y);
-        if($rx!==$ry)return $rx<=>$ry;
-        return strcmp($x['email'],$y['email']);
-    });
-    if(!$accounts){
-        $notes[]='No mailbox was found on this server and no site on it carries a mail server. The window still opens webmail for any address you give it.';
-    }
-    if(empty($cpm['ok']))$notes[]='cPanel was not reachable from here, so its own webmail sign-on is not available: '.
-        implode(' ',array_slice($cpm['tried']??[],0,2));
-    return ['ok'=>true,'accounts'=>$accounts,'notes'=>$notes,
-            'scanned'=>wm2_scan_roots(),'server'=>@gethostname()?:'',
-            'cpanel'=>!empty($cpm['ok'])];
-}
-function wm2_remember($accounts){
-    $map=[];
-    foreach($accounts as $a)$map[$a['id']]=$a;
-    $_SESSION['wm2_acc']=$map;
-    return $map;
-}
-function wm2_account_by_id($id){
-    $map=$_SESSION['wm2_acc']??[];
-    if(isset($map[$id]))return $map[$id];
-    $d=wm2_discover();
-    wm2_remember($d['accounts']);
-    return $_SESSION['wm2_acc'][$id]??null;
-}
-
-/* ── one mailbox at a time, whatever kind it is ───────────────────────────
-   Every operation goes through these, so the window never needs to know how
-   the mail is stored. */
-function wm2_conn(&$acc){
-    static $cache=[];
-    $id=$acc['id'];
-    if(isset($cache[$id]))return $cache[$id];
-    $cred=$acc['cred'];
-    if(!is_array($cred)){$cache[$id]=['ok'=>false,'error'=>'This mailbox has no mail server to talk to.'];return $cache[$id];}
-    $host=(string)($cred['host']??'');
-    if($host===''){$cache[$id]=['ok'=>false,'error'=>'No mail server is named for this mailbox.'];return $cache[$id];}
-    $port=(int)($cred['port']??0);
-    $secure=strtolower((string)($cred['secure']??''));
-    if($acc['kind']==='pop3'){
-        if($port===0)$port=($secure==='ssl'||$secure==='tls')?995:110;
-        $try=($secure==='ssl'||$secure==='tls')?[true,false]:[false];
-        $last=null;
-        foreach($try as $ssl){
-            $c=wm2_pop3_open($host,$port,(string)$cred['user'],(string)$cred['pass'],$ssl);
-            if(!empty($c['ok'])){$cache[$id]=$c;return $c;}
-            $last=$c;
-        }
-        $cache[$id]=$last?:['ok'=>false,'error'=>'The mail server could not be reached.'];
-        return $cache[$id];
-    }
-    /* IMAP: encrypted on its usual port first, then the plain ports, then
-       STARTTLS, so a server of any age is read without asking anything */
-    $order=[];
-    if($port>0)$order[]=[$port,($port===993?'ssl':''),];
-    if($secure==='ssl')$order[]=[993,'ssl'];
-    $order[]=[993,'ssl'];
-    $order[]=[143,'starttls'];
-    $order[]=[143,''];
-    $seenPorts=[];
-    $last=null;
-    foreach($order as $t){
-        $key=$t[0].'/'.$t[1];
-        if(isset($seenPorts[$key]))continue;
-        $seenPorts[$key]=1;
-        $c=wm2_imap_open($host,(int)$t[0],(string)$cred['user'],(string)$cred['pass'],$t[1]);
-        if(!empty($c['ok'])){$cache[$id]=$c;return $c;}
-        $last=$c;
-    }
-    $cache[$id]=$last?:['ok'=>false,'error'=>'The mail server could not be reached.'];
-    return $cache[$id];
-}
-function wm2_folders($acc){
-    $cap=wm2_capability($acc);
-    if(!$cap['read'])return [];
-    if($acc['kind']==='maildir'){
-        $out=[];
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            $files=wm2_maildir_files($f['path']);
-            $unread=0;
-            foreach($files as $file){
-                $fl=wm2_maildir_flags($file);
-                if(!$fl['seen'])$unread++;
-            }
-            $out[]=['id'=>$f['id'],'name'=>$f['name'],'count'=>count($files),'unread'=>$unread];
-        }
-        return $out;
-    }
-    if($acc['kind']==='mbox'){
-        $rows=wm2_mbox_list($acc['where']);
-        return [['id'=>'INBOX','name'=>'Inbox','count'=>count($rows),'unread'=>0]];
-    }
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return [];
-        $out=[];
-        foreach(wm2_imap_folders($conn) as $f){
-            $rows=wm2_imap_list($conn,$f['path']);
-            $unread=0;
-            foreach($rows as $r)if(empty($r['seen']))$unread++;
-            $out[]=['id'=>$f['id'],'name'=>$f['name'],'count'=>count($rows),'unread'=>$unread];
-        }
-        return $out;
-    }
-    if($acc['kind']==='pop3'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return [];
-        $rows=wm2_pop3_list($conn);
-        return [['id'=>'INBOX','name'=>'Inbox','count'=>count($rows),'unread'=>0]];
-    }
-    return [];
-}
-function wm2_trash_path($acc){
-    if($acc['kind']!=='maildir')return '';
-    foreach(wm2_maildir_folders($acc['where']) as $f){
-        if($f['id']==='Trash'||$f['id']==='Deleted Items'||$f['id']==='Trash Items')return $f['path'];
-    }
-    return '';
-}
-function wm2_messages($acc,$folder){
-    $cap=wm2_capability($acc);
-    if(!$cap['read'])return [];
-    if($acc['kind']==='maildir'){
-        $folder=$folder===''?'INBOX':$folder;
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            if($f['id']===$folder)return wm2_maildir_list($f['path']);
-        }
-        return wm2_maildir_list($acc['where']);
-    }
-    if($acc['kind']==='mbox')return wm2_mbox_list($acc['where']);
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return [];
-        $folder=$folder===''?'INBOX':$folder;
-        foreach(wm2_imap_folders($conn) as $f){
-            if($f['id']===$folder)return wm2_imap_list($conn,$f['path']);
-        }
-        return wm2_imap_list($conn,$folder);
-    }
-    if($acc['kind']==='pop3'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return [];
-        return wm2_pop3_list_with_headers($conn);
-    }
-    return [];
-}
-function wm2_message($acc,$folder,$uid){
-    $cap=wm2_capability($acc);
-    if(!$cap['read'])return null;
-    if($acc['kind']==='maildir'){
-        $folder=$folder===''?'INBOX':$folder;
-        $m=null;
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            if($f['id']===$folder){$m=wm2_maildir_message($f['path'],$uid);break;}
-        }
-        if($m===null)$m=wm2_maildir_message($acc['where'],$uid);
-        /* A message already carrying the Seen flag is never renamed, so it
-           comes back with no name of its own - and the window needs that
-           name to flag, delete or download it afterwards. */
-        if($m&&!isset($m['uid']))$m['uid']=(string)$uid;
-        return $m;
-    }
-    if($acc['kind']==='mbox'){
-        $m=wm2_mbox_message($acc['where'],$uid);
-        if($m)$m['uid']=(string)$uid;
-        return $m;
-    }
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return null;
-        $folder=$folder===''?'INBOX':$folder;
-        $m=null;
-        foreach(wm2_imap_folders($conn) as $f){
-            if($f['id']===$folder){$m=wm2_imap_message($conn,$f['path'],$uid);break;}
-        }
-        if($m===null)$m=wm2_imap_message($conn,$folder,$uid);
-        if($m)$m['uid']=(string)$uid;
-        return $m;
-    }
-    if($acc['kind']==='pop3'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return null;
-        $m=wm2_pop3_message($conn,$uid);
-        if($m)$m['uid']=(string)$uid;
-        return $m;
-    }
-    return null;
-}
-/* the raw bytes of one message, for saving as .eml or for its attachments */
-function wm2_raw($acc,$folder,$uid){
-    if($acc['kind']==='maildir'){
-        $folder=$folder===''?'INBOX':$folder;
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            if($f['id']!==$folder)continue;
-            foreach(wm2_maildir_files($f['path']) as $file){
-                if(basename($file)===$uid)return @file_get_contents($file);
-            }
-        }
-        return null;
-    }
-    if($acc['kind']==='mbox'){
-        $raw=@file_get_contents($acc['where']);
-        if($raw===false)return null;
-        $chunks=preg_split('/^From .*\n/m',$raw);
-        $i=0;
-        foreach($chunks as $chunk){
-            if(trim($chunk)==='')continue;
-            $i++;
-            if((string)$i===(string)$uid)return $chunk;
-        }
-        return null;
-    }
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return null;
-        $folder=$folder===''?'INBOX':$folder;
-        foreach(wm2_imap_folders($conn) as $f){
-            if($f['id']===$folder)return wm2_imap_raw($conn,$f['path'],$uid);
-        }
-        return wm2_imap_raw($conn,$folder,$uid);
-    }
-    if($acc['kind']==='pop3'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return null;
-        $m=wm2_pop3_message($conn,$uid);
-        return $m?$m['raw']:null;
-    }
-    return null;
-}
-function wm2_attachment($raw,$index){
-    /* the parts are read again here, so one attachment can be handed out on
-       its own without the whole message travelling through the page */
-    $sp=wm2_split_message($raw);
-    $h=wm2_headers($sp['head']);
-    $out=['html'=>'','plain'=>'','files'=>[]];
-    wm2_walk($sp['head'],$sp['body'],$out);
-    if(!isset($out['files'][$index]))return null;
-    return $out['files'][$index];
-}
-function wm2_delete_many($acc,$folder,$uids){
-    $cap=wm2_capability($acc);
-    if(!$cap['delete'])return ['ok'=>false,'error'=>$cap['why']?:'This mailbox cannot delete messages.'];
-    $done=0;$errors=[];$moved='';
-    if($acc['kind']==='maildir'){
-        $folder=$folder===''?'INBOX':$folder;
-        $path=$acc['where'];$trash=wm2_trash_path($acc);
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            if($f['id']===$folder){$path=$f['path'];break;}
-        }
-        foreach((array)$uids as $uid){
-            $r=wm2_maildir_delete($path,(string)$uid,$trash);
-            if(!empty($r['ok'])){$done++;if(!empty($r['moved']))$moved=$r['moved'];}
-            else $errors[]=$r['error']??'failed';
-        }
-        return ['ok'=>$done>0,'deleted'=>$done,'moved'=>$moved,'errors'=>$errors];
-    }
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return ['ok'=>false,'error'=>$conn['error']];
-        $path=$folder===''?'INBOX':$folder;
-        foreach(wm2_imap_folders($conn) as $f){
-            if($f['id']===$folder){$path=$f['path'];break;}
-        }
-        /* the folder a mailbox calls its own trash, if it has one */
-        $trash='';
-        foreach(wm2_imap_folders($conn) as $f){
-            $n=strtolower($f['name']);
-            if($n==='trash'||$n==='deleted items'||$n==='bin'){$trash=$f['path'];break;}
-        }
-        foreach((array)$uids as $uid){
-            $r=wm2_imap_delete($conn,$path,(int)$uid,$trash);
-            if(!empty($r['ok'])){$done++;if(!empty($r['moved']))$moved='Trash';}
-            else $errors[]=$r['error']??'failed';
-        }
-        return ['ok'=>$done>0,'deleted'=>$done,'moved'=>$moved,'errors'=>$errors];
-    }
-    if($acc['kind']==='pop3'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return ['ok'=>false,'error'=>$conn['error']];
-        foreach((array)$uids as $uid){
-            $r=$conn['say']('DELE '.(int)$uid);
-            if(stripos($r,'+OK')===0)$done++;else $errors[]=trim($r);
-        }
-        return ['ok'=>$done>0,'deleted'=>$done,'errors'=>$errors];
-    }
-    return ['ok'=>false,'error'=>'An mbox file is one stream: download it, then trim it here if you want messages gone.'];
-}
-function wm2_flag_one($acc,$folder,$uid,$seen){
-    if($acc['kind']==='maildir'){
-        $folder=$folder===''?'INBOX':$folder;
-        $path=$acc['where'];
-        foreach(wm2_maildir_folders($acc['where']) as $f){
-            if($f['id']===$folder){$path=$f['path'];break;}
-        }
-        foreach(wm2_maildir_files($path) as $file){
-            if(basename($file)!==$uid)continue;
-            $fl=wm2_maildir_flags($file);
-            $flags=$fl['raw'];
-            $flags=str_replace('S','',$flags);
-            if($seen)$flags.='S';
-            $new=wm2_maildir_set_flags($file,$flags);
-            if($new===''){
-                return ['ok'=>false,'error'=>'That message could not be marked: its folder is not writable by this account.'];
-            }
-            return ['ok'=>true,'uid'=>basename($new)];
-        }
-        return ['ok'=>false,'error'=>'That message is no longer there.'];
-    }
-    if($acc['kind']==='imap'){
-        $conn=wm2_conn($acc);
-        if(empty($conn['ok']))return ['ok'=>false,'error'=>$conn['error']];
-        $path=$folder===''?'INBOX':$folder;
-        foreach(wm2_imap_folders($conn) as $f){
-            if($f['id']===$folder){$path=$f['path'];break;}
-        }
-        return ['ok'=>wm2_imap_flag($conn,$path,(int)$uid,$seen),'uid'=>(string)$uid];
-    }
-    return ['ok'=>true,'uid'=>(string)$uid];
-}
-/* ── sending from this mailbox ────────────────────────────────────────────
-   The sign-in the site already holds is used; failing that, the machine's own
-   mailer; failing that, PHP's. A mailbox whose mail server was found is the
-   only one that may claim it really sent. */
-function wm2_send($acc,$d){
-    $to=wm2_addr_strings($d['to']??'');
-    $cc=wm2_addr_strings($d['cc']??'');
-    $bcc=wm2_addr_strings($d['bcc']??'');
-    if(!$to&&!$bcc)return ['ok'=>false,'error'=>'A message needs at least one recipient.'];
-    $subject=trim((string)($d['subject']??''));
-    $html=(string)($d['html']??'');
-    $plain=(string)($d['plain']??'');
-    if($html===''&&$plain==='')return ['ok'=>false,'error'=>'The message has no text.'];
-    $from=$acc['email'];
-    $fromName=$acc['name']!==$acc['email']?$acc['name']:'';
-    $atts=[];
-    foreach((array)($d['attachments']??[]) as $a){
-        $data=base64_decode((string)($a['data']??''),true);
-        if($data===false||$data==='')continue;
-        $name=(string)($a['name']??('attachment-'.(count($atts)+1)));
-        $atts[]=['name'=>$name,'type'=>(string)($a['type']??'application/octet-stream'),'data'=>$data];
-    }
-    $raw=wm2_mime_message($fromName,$from,$to?$to:[$from],$cc,$bcc,$subject,$html,$plain,$atts);
-    $tried=[];
-    $cred=is_array($acc['cred'])?$acc['cred']:null;
-    if($cred&&($acc['kind']==='imap'||$acc['kind']==='pop3'||$acc['kind']==='maildir')){
-        /* a site almost always keeps its sending settings apart from its
-           reading ones, and a reading port is never a sending port */
-        $smtp=is_array($cred['smtp']??null)?$cred['smtp']:[];
-        $host=(string)($smtp['host']??'')?:((string)($cred['host']??''));
-        $user=(string)($smtp['user']??'')?:((string)($cred['user']??''));
-        $pass=(string)($smtp['pass']??'')?:((string)($cred['pass']??''));
-        $port=(int)($smtp['port']??0);
-        $secure=strtolower((string)($smtp['secure']??''));
-        if($host!==''){
-            $known=[993=>465,995=>465,143=>587,110=>587,465=>465,587=>587,25=>25,2525=>2525,1025=>1025];
-            $ports=[];
-            if(isset($known[$port]))$ports[]=$known[$port];
-            elseif($port>0)$ports[]=$port;
-            foreach([[587,'tls'],[25,''], [465,'ssl']] as $d)$ports[]=$d[0];
-            $ports=array_values(array_unique($ports));
-            foreach($ports as $p){
-                $useSecure=$secure;
-                if($useSecure==='')$useSecure=$p===465?'ssl':($p===587?'tls':'');
-                if($p===25)$useSecure=$secure==='ssl'?'ssl':'';
-                $r=wm2_smtp_send(['host'=>$host,'port'=>$p,'secure'=>$useSecure,'user'=>$user,'pass'=>$pass],
-                                 $from,$to,$cc,$bcc,$raw);
-                if(!empty($r['ok']))return ['ok'=>true,'via'=>$r['via'],'tried'=>$tried];
-                $tried[]=trim(str_replace(["\r","\n"],' ',(string)($r['error']??'refused')));
-            }
-        }
-    }
-    /* a mailbox that lives in a folder has no sign-in to give, but a host
-       that holds mail usually runs a mail server of its own on the same
-       machine: that is where its mail goes out */
-    if(!$tried||$acc['kind']==='maildir'||$acc['kind']==='mbox'){
-        foreach([['127.0.0.1',25,''],['localhost',25,'']] as $local){
-            $r=wm2_smtp_send(['host'=>$local[0],'port'=>$local[1],'secure'=>$local[2]],$from,$to,$cc,$bcc,$raw);
-            if(!empty($r['ok']))return ['ok'=>true,'via'=>$r['via'].' (this machine)','tried'=>$tried];
-        }
-    }
-    $r=wm2_sendmail_send($from,array_merge($to,$cc,$bcc),$raw);
-    if(!empty($r['ok']))return ['ok'=>true,'via'=>$r['via'],'tried'=>$tried];
-    $tried[]=(string)($r['error']??'the local mailer refused');
-    $r=wm2_php_mail_send($from,$to,$cc,$bcc,$subject,$html,$plain,$atts);
-    if(!empty($r['ok']))return ['ok'=>true,'via'=>$r['via'],'tried'=>$tried];
-    $tried[]=(string)($r['error']??'mail() refused');
-    return ['ok'=>false,'error'=>'The message could not be sent. '.implode(' · ',array_filter($tried)),'tried'=>$tried];
-}
-function wm2_addr_strings($v){
-    if(is_array($v))$v=implode(',',$v);
-    $out=[];
-    foreach(preg_split('/[,;]+/',(string)$v) as $piece){
-        $piece=trim($piece);
-        if($piece==='')continue;
-        if(preg_match('/<([^>]+)>/',$piece,$m))$piece=trim($m[1]);
-        if(filter_var($piece,FILTER_VALIDATE_EMAIL))$out[]=$piece;
-    }
-    return $out;
-}
-/* a .eml or a whole folder as one .mbox: the bytes are handed out unchanged */
-function wm2_download_one($acc,$folder,$uid){
-    $raw=wm2_raw($acc,$folder,$uid);
-    if($raw===null)return null;
-    $m=wm2_parse_message($raw);
-    $name=preg_replace('/[^A-Za-z0-9._ -]+/u','_',($m['subject']?:'message'));
-    $name=trim(mb_substr($name,0,80,'UTF-8'),' .');
-    return ['name'=>($name?:'message').'.eml','type'=>'message/rfc822','data'=>$raw];
-}
-function wm2_download_all($acc,$folder){
-    $rows=wm2_messages($acc,$folder);
-    if(!$rows)return null;
-    $buf='';
-    $host=@gethostname()?:'localhost';
-    foreach(array_reverse($rows) as $row){
-        $raw=wm2_raw($acc,$folder,$row['uid']);
-        if($raw===null)continue;
-        $from=$row['from_email']?:'unknown@'.$host;
-        $date=date('D M d H:i:s Y',(int)$row['date']?:time());
-        $buf.='From '.preg_replace('/\s+/','_',$from).' '.$date."\r\n";
-        $raw=preg_replace('/^(From )/m','>From ',$raw);
-        $buf.=str_replace("\n","\r\n",str_replace("\r\n","\n",$raw));
-        if(substr($buf,-2)!=="\r\n")$buf.="\r\n";
-        $buf.="\r\n";
-    }
-    if($buf==='')return null;
-    $label=preg_replace('/[^A-Za-z0-9@._-]+/','_',$acc['email'].'-'.($folder?:'INBOX'));
-    return ['name'=>$label.'.mbox','type'=>'application/mbox','data'=>$buf];
-}
-/* ── the links a download needs ───────────────────────────────────────────
-   A download is a plain GET the browser can follow, and the token in it is
-   signed with this session, so a link cannot be handed to someone else. */
-function wm2_tok($parts){
-    return substr(hash_hmac('sha256',implode('|',$parts),(string)($_SESSION['csrf_token']??'')),0,32);
-}
-function wm2_url($acc,$folder,$uid,$what,$index=''){
-    $parts=[(string)$acc['id'],(string)$folder,(string)$uid,(string)$what,(string)$index];
-    return '?x=mail_get&t='.wm2_tok($parts).'&account='.rawurlencode($parts[0])
-          .'&folder='.rawurlencode($parts[1]).'&uid='.rawurlencode($parts[2])
-          .'&what='.rawurlencode($parts[3]).'&index='.rawurlencode($parts[4]);
-}
-/* ── the endpoint ───────────────────────────────────────────────────────── */
-function wm2_endpoint($post){
-    $act=(string)($post['action']??'');
-    $get=function($k)use($post){return trim((string)($post[$k]??''));};
-
-    if($act==='discover'){
-        $d=wm2_discover();
-        wm2_remember($d['accounts']);
-        return $d;
-    }
-    $id=$get('account');
-    $acc=$id!==''?wm2_account_by_id($id):null;
-    /* 'send_any' and 'signin' both accept an address that was never
-       discovered, so neither is held to a known account here. */
-    if($act!=='send_any'&&$act!=='signin'&&!$acc)return ['ok'=>false,'error'=>'That mailbox is not on this server any more. Open the window again.'];
-
-    if($act==='folders'){
-        $out=wm2_folders($acc);
-        $cap=wm2_capability($acc);
-        $res=['ok'=>true,'account'=>$acc['email'],'folders'=>$out,'can'=>$cap];
-        if(!$out){
-            /* Only a mailbox read over the network has a connection to fail.
-               Every other kind is answered with the reason of its own. */
-            $why='';
-            if($acc['kind']==='imap'||$acc['kind']==='pop3'){
-                $conn=wm2_conn($acc);
-                if(empty($conn['ok']))$why=(string)($conn['error']??'');
-            }
-            if($why==='')$why=(string)($cap['why']?:'');
-            if($why===''){
-                $why=($acc['kind']==='maildir'||$acc['kind']==='mbox')
-                    ?'That mailbox is empty - it has no folder with messages in it yet.'
-                    :'That mailbox has no folder to open.';
-            }
-            $res['why']=$why;
-        }
-        return $res;
-    }
-    if($act==='messages'){
-        $folder=$get('folder')?:'INBOX';
-        $rows=wm2_messages($acc,$folder);
-        foreach($rows as $i=>$row)$rows[$i]['links']=['eml'=>wm2_url($acc,$folder,$row['uid'],'eml')];
-        return ['ok'=>true,'messages'=>$rows,'count'=>count($rows),'can'=>wm2_capability($acc),
-                'download_all'=>wm2_url($acc,$folder,'','all')];
-    }
-    if($act==='message'){
-        $folder=$get('folder')?:'INBOX';
-        $uid=$get('uid');
-        $m=wm2_message($acc,$folder,$uid);
-        if(!$m)return ['ok'=>false,'error'=>'That message could not be read.'];
-        $m['html']=wm2_safe_html($m['html']);
-        unset($m['raw']);
-        $m['links']=['eml'=>wm2_url($acc,$folder,$m['uid'],'eml')];
-        foreach($m['attachments'] as $i=>$a){
-            $m['attachments'][$i]['url']=wm2_url($acc,$folder,$m['uid'],'att',$a['index']);
-        }
-        return ['ok'=>true,'message'=>$m];
-    }
-    if($act==='delete'){
-        $uids=json_decode((string)($post['uids']??'[]'),true);
-        if(!is_array($uids))$uids=[(string)($post['uid']??'')];
-        $uids=array_values(array_filter(array_map('strval',$uids),function($u){return trim($u)!==''&&trim($u)!=='0'&&trim($u)!=='null';}));
-        if(!$uids)return ['ok'=>false,'error'=>'No message was named for deleting.'];
-        $r=wm2_delete_many($acc,$get('folder'),$uids);
-        return $r+['ok'=>!empty($r['ok'])];
-    }
-    if($act==='flag'){
-        return wm2_flag_one($acc,$get('folder'),$get('uid'),!empty($post['seen']));
-    }
-    if($act==='send'){
-        $d=[
-            'to'=>$post['to']??'','cc'=>$post['cc']??'','bcc'=>$post['bcc']??'',
-            'subject'=>$post['subject']??'','html'=>$post['html']??'','plain'=>$post['plain']??'',
-            'attachments'=>json_decode((string)($post['attachments']??'[]'),true)?:[],
-        ];
-        return wm2_send($acc,$d);
-    }
-    if($act==='signin'){
-        /* the cPanel server's own webmail sign-on for this address */
-        if(!$acc){
-            /* The window promises webmail for any address given to it, so an
-               address that was never discovered still gets its own sign-on. */
-            $addr=strtolower($get('email'));
-            if(!filter_var($addr,FILTER_VALIDATE_EMAIL)){
-                return ['ok'=>false,'error'=>'That is not an address this server can sign on to.'];
-            }
-            $acc=wm2_account(['email'=>$addr,'name'=>$addr,'kind'=>'cpanel',
-                'where'=>'cPanel','origin'=>'an address typed into this window']);
-        }
-        $route=fm_cpm_route();
-        if(empty($route['ok']))return ['ok'=>false,'error'=>'cPanel is not reachable from here, so its webmail sign-on cannot be used.'];
-        $user=strtolower($acc['email']);
-        $s=fm_cpm_session_url($user,'webmaild');
-        if(empty($s['ok']))return ['ok'=>false,'error'=>$s['error']??'WHM did not hand back a webmail session.'];
-        return ['ok'=>true,'url'=>$s['url'],'expires'=>$s['expires']??0];
-    }
-    if($act==='info'){
-        return ['ok'=>true,'account'=>array_diff_key($acc,['cred'=>1]),'can'=>wm2_capability($acc),
-                'folders'=>wm2_folders($acc)];
-    }
-    return ['ok'=>false,'error'=>'Unknown request.'];
-}
-
-/* ── handing a file to the browser ────────────────────────────────────────
-   One message as .eml, one whole folder as .mbox, or one attachment. The
-   bytes are the mailbox's own; nothing is re-encoded on the way out. */
-function wm2_download($params,$token){
-    $acc=wm2_account_by_id((string)($params['account']??''));
-    if(!$acc)return ['error'=>'That mailbox is not on this server any more.'];
-    $folder=(string)($params['folder']??'INBOX');
-    $uid=(string)($params['uid']??'');
-    $what=(string)($params['what']??'eml');
-    $index=(string)($params['index']??'');
-    $want=wm2_tok([(string)$acc['id'],$folder,$uid,$what,$index]);
-    if(!hash_equals($want,(string)$token))return ['error'=>'That download link has expired. Open the mailbox again.'];
-    if($what==='all'){
-        $f=wm2_download_all($acc,$folder);
-    }elseif($what==='att'){
-        $raw=wm2_raw($acc,$folder,$uid);
-        if($raw===null)return ['error'=>'That message is no longer there.'];
-        $part=wm2_attachment($raw,(int)$index);
-        if(!$part)return ['error'=>'That attachment is no longer there.'];
-        $f=['name'=>$part['name'],'type'=>$part['type']?:'application/octet-stream','data'=>$part['data']];
-    }else{
-        $f=wm2_download_one($acc,$folder,$uid);
-    }
-    if(!$f)return ['error'=>'There is nothing to download there.'];
-    return ['ok'=>true,'name'=>$f['name'],'type'=>$f['type'],'data'=>$f['data']];
-}
-
-/* <<WM2-END>> */
 
 
 
@@ -7593,7 +5953,7 @@ if(!isset($_GET['x'])){if(!empty($_SESSION['fm_admin'])&&!empty($_SESSION['auth'
 
 /* ═══ CLASS ═══ */
 class FileManager {
-    private $currentDir,$messages=[],$favFile,$root,$readonly,$trashDir,$trashMeta,$logFile,$shareFile,$filePublicBaseCache=[];
+    private $currentDir,$messages=[],$root,$readonly,$trashDir,$trashMeta,$logFile,$shareFile,$filePublicBaseCache=[];
     public function __construct(){
         $this->root=!empty($_SESSION['fm_root'])?realpath($_SESSION['fm_root']):null;
         $this->readonly=!empty($_SESSION['fm_readonly']);
@@ -7608,7 +5968,6 @@ class FileManager {
         if($this->currentDir===false||!file_exists($this->currentDir)){$this->currentDir=$base;$this->addMsg('Directory not found.','warning');}
         if($this->root&&strpos($this->currentDir.DIRECTORY_SEPARATOR,rtrim($this->root,DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR)!==0&&$this->currentDir!==$this->root){$this->currentDir=$this->root;$this->addMsg('Access restricted.','warning');}
         if($terminalPage)$_SESSION['fm_terminal_dir']=$this->currentDir;
-        $this->favFile=__DIR__.'/.favorites.json';
         $this->trashDir=__DIR__.'/.trash';$this->trashMeta=__DIR__.'/.trash.json';$this->logFile=__DIR__.'/.activity.json';$this->shareFile=__DIR__.'/.shares.php';
         if(!is_dir($this->trashDir))@mkdir($this->trashDir,0755,true);
     }
@@ -7655,13 +6014,6 @@ class FileManager {
     }
     public function getLogs(){if(!file_exists($this->logFile))return[];$d=@json_decode(@file_get_contents($this->logFile),true);return is_array($d)?$d:[];}
     public function clearLog(){@file_put_contents($this->logFile,json_encode([]));$this->addMsg('Activity log cleared.','warning');}
-
-    /* Favorites */
-    public function getFavs(){if(!file_exists($this->favFile))return[];$d=@json_decode(@file_get_contents($this->favFile),true);return is_array($d)?$d:[];}
-    private function saveFavs($f){@file_put_contents($this->favFile,json_encode(array_values(array_unique($f))));}
-    public function isFav($p){return in_array($p,$this->getFavs());}
-    private function addFav($p){if(!$p||!is_dir($p))return;$f=$this->getFavs();if(!in_array($p,$f)){$f[]=$p;$this->saveFavs($f);}$this->addMsg('Added to favorites.','success');}
-    private function removeFav($p){$this->saveFavs(array_values(array_diff($this->getFavs(),[$p])));$this->addMsg('Removed from favorites.','warning');}
 
     /* Trash */
     private function loadTrash(){if(!file_exists($this->trashMeta))return[];$d=@json_decode(@file_get_contents($this->trashMeta),true);return is_array($d)?$d:[];}
@@ -8434,8 +6786,6 @@ class FileManager {
             case 'save_edit':      $this->saveFile();break;
             case 'bypass_perms':   $this->bypassPerms();break;
             case 'go_to_path':     $this->goPath();break;
-            case 'add_favorite':   $this->addFav(isset($_POST['path'])?$_POST['path']:'');break;
-            case 'remove_favorite':$this->removeFav(isset($_POST['path'])?$_POST['path']:'');break;
             case 'bulk_delete':    $this->bulkDel();break;
             case 'bulk_copy':      $this->bulkCopyMove(false);break;
             case 'bulk_move':      $this->bulkCopyMove(true);break;
@@ -18051,753 +16401,6 @@ FMHIDE;
         return['ok'=>true,'mode'=>$mode,'message'=>'WordPress Site Health is now controlled as '.$mode.'.'];
     }
 
-    /* ── WordPress Numbers Control ──────────────────────────────────────────
-       This is deliberately a presentation-only control. The real WordPress
-       rows are never changed; a small, visible MU-plugin replaces selected
-       numbers in wp-admin after the page has rendered. */
-    private function wpNumbersPluginPath($configPath){
-        return $this->wpSiteRoot($configPath).'/wp-content/mu-plugins/000-fm-numbers-control.php';
-    }
-    private function wpNumbersDefinitions($link,$prefix){
-        $table=$prefix.'posts';
-        $defs=[
-            'published_posts'=>['label'=>'Published posts','description'=>'Published blog posts','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='post' AND post_status='publish'"],
-            'published_pages'=>['label'=>'Published pages','description'=>'Published pages','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='page' AND post_status='publish'"],
-            'comments_total'=>['label'=>'Comments','description'=>'All comments except spam and trash','sql'=>"SELECT COUNT(*) AS n FROM `{$prefix}comments` WHERE comment_approved NOT IN ('spam','trash')"],
-            'comments_moderation'=>['label'=>'Comments in moderation','description'=>'Comments awaiting moderation','sql'=>"SELECT COUNT(*) AS n FROM `{$prefix}comments` WHERE comment_approved='0'"],
-            'comments_spam'=>['label'=>'Spam comments','description'=>'Comments marked as spam','sql'=>"SELECT COUNT(*) AS n FROM `{$prefix}comments` WHERE comment_approved='spam'"],
-            'comments_trash'=>['label'=>'Trash comments','description'=>'Comments in the trash','sql'=>"SELECT COUNT(*) AS n FROM `{$prefix}comments` WHERE comment_approved='trash'"],
-            'users_total'=>['label'=>'Users','description'=>'All WordPress users','sql'=>"SELECT COUNT(*) AS n FROM `{$prefix}users`"],
-            'media_library'=>['label'=>'Media items','description'=>'Media library attachments','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='attachment'"],
-            'draft_posts'=>['label'=>'Draft posts','description'=>'Post drafts','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='post' AND post_status='draft'"],
-            'pending_posts'=>['label'=>'Pending posts','description'=>'Posts pending review','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='post' AND post_status='pending'"],
-            'scheduled_posts'=>['label'=>'Scheduled posts','description'=>'Future-dated posts','sql'=>"SELECT COUNT(*) AS n FROM `{$table}` WHERE post_type='post' AND post_status='future'"],
-        ];
-        $out=[];
-        foreach($defs as $id=>$def){
-            $r=@mysqli_query($link,$def['sql']);$n=null;
-            if($r&&($row=mysqli_fetch_assoc($r)))$n=(int)$row['n'];
-            $out[$id]=['id'=>$id,'label'=>$def['label'],'description'=>$def['description'],'actual'=>$n];
-        }
-        return $out;
-    }
-    private function wpNumbersValidSelector($selector){
-        $selector=trim((string)$selector);
-        return $selector!==''&&strlen($selector)<=240&&
-            !preg_match('/[\x00-\x1F\x7F<]/',$selector);
-    }
-    private function wpNumbersSettings($configPath,$c,$link){
-        $stored=$this->wpOption($link,$c['prefix'],'fm_numbers_control');
-        if(!is_array($stored))$stored=[];
-        $defs=$this->wpNumbersDefinitions($link,$c['prefix']);
-        $overrides=[];
-        foreach($defs as $id=>$def){
-            if(array_key_exists($id,$stored)&&is_numeric($stored[$id])&&$stored[$id]>=0)
-                $overrides[$id]=(int)$stored[$id];
-        }
-        $custom=[];
-        foreach((array)($stored['custom']??[]) as $item){
-            if(!is_array($item)||!$this->wpNumbersValidSelector($item['selector']??''))continue;
-            if(trim((string)($item['label']??''))===''||!is_numeric($item['value']??null)||$item['value']<0)continue;
-            $custom[]=['label'=>mb_substr(trim((string)$item['label']),0,80),'selector'=>trim((string)$item['selector']),'value'=>(int)$item['value']];
-            if(count($custom)>=10)break;
-        }
-        $emailSelector=$this->wpNumbersValidSelector($stored['email_selector']??'')
-            ?trim((string)$stored['email_selector']):'';
-        $plugin=$this->wpNumbersPluginPath($configPath);
-        return['ok'=>true,'type'=>'wordpress','config'=>$configPath,'definitions'=>array_values($defs),
-            'overrides'=>$overrides,'email_selector'=>$emailSelector,'custom'=>$custom,
-            'installed'=>is_file($plugin),'plugin'=>$plugin,
-            'note'=>'These controls change displayed admin numbers only. WordPress content and counts remain unchanged.'];
-    }
-    private function wpNumbersPluginCode(){
-        return <<<'FMNUM'
-<?php
-/**
- * File Manager Numbers Control - reversible, presentation-only WordPress admin helper.
- * It never changes posts, comments, users, or any other WordPress data.
- */
-if(!defined('ABSPATH'))exit;
-add_action('admin_footer',function(){
-    if(function_exists('current_user_can')&&!current_user_can('manage_options'))return;
-    $settings=get_option('fm_numbers_control',array());
-    if(!is_array($settings))return;
-    $json=function_exists('wp_json_encode')?wp_json_encode($settings,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT):json_encode($settings);
-    if(!$json)return;
-    echo '<script id="fm-numbers-control">window.fmNumbersControl='.$json.';</script>';
-    ?>
-    <script>
-    (function(d,w){
-      var s=w.fmNumbersControl||{},over=s&&typeof s==='object'?s:{};
-      var map={
-        published_posts:['#dashboard_right_now .post-count a'],
-        published_pages:['#dashboard_right_now .page-count a'],
-        comments_total:['#dashboard_right_now .comment-count a'],
-        comments_moderation:['#dashboard_right_now .comment-mod-count a','#menu-comments .awaiting-mod .pending-count','#wp-admin-bar-comments .awaiting-mod .ab-label'],
-        comments_spam:['#dashboard_right_now .spam-count a'],
-        comments_trash:['#dashboard_right_now .trash-count a'],
-        users_total:['#dashboard_right_now .user-count a'],
-        media_library:['#dashboard_right_now .media-count a'],
-        draft_posts:['#dashboard_right_now .draft-count a'],
-        pending_posts:['#dashboard_right_now .pending-count a'],
-        scheduled_posts:['#dashboard_right_now .future-count a']
-      };
-      function replaceNumber(el,value){
-        if(!el||value===undefined||value===null)return;
-        var re=/\d[\d,]*/;
-        function walk(node){
-          if(node.nodeType===3){
-            if(re.test(node.nodeValue))node.nodeValue=node.nodeValue.replace(re,String(value));
-            return;
-          }
-          for(var i=0;i<node.childNodes.length;i++)walk(node.childNodes[i]);
-        }
-        walk(el);
-      }
-      function apply(){
-        Object.keys(map).forEach(function(key){
-          if(!Object.prototype.hasOwnProperty.call(over,key))return;
-          map[key].forEach(function(selector){
-            try{d.querySelectorAll(selector).forEach(function(el){replaceNumber(el,over[key]);});}catch(e){}
-          });
-        });
-        if(over.email_selector&&over.email_messages!==undefined){
-          try{d.querySelectorAll(over.email_selector).forEach(function(el){replaceNumber(el,over.email_messages);});}catch(e){}
-        }
-        (Array.isArray(over.custom)?over.custom:[]).forEach(function(item){
-          if(!item||!item.selector||item.value===undefined)return;
-          try{d.querySelectorAll(item.selector).forEach(function(el){replaceNumber(el,item.value);});}catch(e){}
-        });
-      }
-      apply();
-      if(w.MutationObserver){
-        var timer=0;
-        new MutationObserver(function(){clearTimeout(timer);timer=setTimeout(apply,40);})
-          .observe(d.body||d.documentElement,{childList:true,subtree:true});
-      }
-    })(document,window);
-    </script>
-    <?php
-});
-FMNUM;
-    }
-    public function wpNumbersControl($configPath){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if(basename($configPath)!=='wp-config.php')return['error'=>'This feature requires a valid WordPress installation.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $result=$this->wpNumbersSettings($configPath,$c,$link);
-        mysqli_close($link);
-        return $result;
-    }
-    public function wpNumbersControlSave($configPath){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if($this->isRO())return['error'=>'Read-only account.'];
-        if(basename($configPath)!=='wp-config.php')return['error'=>'This feature requires a valid WordPress installation.'];
-        $raw=(string)($_POST['numbers_json']??'');
-        $input=json_decode($raw,true);
-        if(!is_array($input))return['error'=>'Numbers data must be valid JSON.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $allowed=array_keys($this->wpNumbersDefinitions($link,$c['prefix']));
-        $settings=[];
-        foreach($allowed as $id){
-            if(!array_key_exists($id,$input)||$input[$id]==='')continue;
-            if(!is_numeric($input[$id])||$input[$id]<0||$input[$id]>999999999)return['error'=>'Every number must be a whole number from 0 to 999999999.'];
-            $n=(string)$input[$id];
-            if(!preg_match('/^\d+$/',$n))return['error'=>'Every number must be a whole number from 0 to 999999999.'];
-            $settings[$id]=(int)$n;
-        }
-        if(array_key_exists('email_messages',$input)&&$input['email_messages']!==''){
-            if(!preg_match('/^\d+$/',(string)$input['email_messages'])||(int)$input['email_messages']>999999999)return['error'=>'The email number must be a whole number from 0 to 999999999.'];
-            $settings['email_messages']=(int)$input['email_messages'];
-        }
-        $emailSelector=trim((string)($input['email_selector']??''));
-        if(($emailSelector===''&&isset($settings['email_messages']))||($emailSelector!==''&&!isset($settings['email_messages'])))
-            return['error'=>'Email messages needs both a displayed number and a CSS selector.'];
-        if($emailSelector!==''){
-            if(!$this->wpNumbersValidSelector($emailSelector))return['error'=>'The email CSS selector is invalid or too long.'];
-            $settings['email_selector']=$emailSelector;
-        }
-        $custom=[];
-        foreach((array)($input['custom']??[]) as $item){
-            if(!is_array($item))continue;
-            $label=mb_substr(trim((string)($item['label']??'')),0,80);
-            $selector=trim((string)($item['selector']??''));
-            $value=(string)($item['value']??'');
-            if($label===''&&$selector===''&&$value==='')continue;
-            if($label===''||!$this->wpNumbersValidSelector($selector)||!preg_match('/^\d+$/',$value)||$value>999999999)
-                return['error'=>'Each custom number needs a label, a valid CSS selector, and a whole number.'];
-            $custom[]=['label'=>$label,'selector'=>$selector,'value'=>(int)$value];
-            if(count($custom)>=10)break;
-        }
-        if($custom)$settings['custom']=$custom;
-        $t=$c['prefix'];
-        if(!$settings){
-            $ok=@mysqli_query($link,"DELETE FROM `{$t}options` WHERE option_name='fm_numbers_control' LIMIT 1");
-            mysqli_close($link);
-            $plugin=$this->wpNumbersPluginPath($configPath);
-            if(is_file($plugin)&&!@unlink($plugin))return['error'=>'The setting was cleared, but the WordPress helper could not be removed.'];
-            if(!$ok)return['error'=>'Could not clear the numbers control setting.'];
-            $this->log('wp_numbers_control','reset');
-            return['ok'=>true,'enabled'=>false,'message'=>'Real WordPress numbers are restored.'];
-        }
-        $serialized=mysqli_real_escape_string($link,serialize($settings));
-        $has=@mysqli_query($link,"SELECT option_name FROM `{$t}options` WHERE option_name='fm_numbers_control' LIMIT 1");
-        $ok=$has&&mysqli_num_rows($has)>0
-            ?@mysqli_query($link,"UPDATE `{$t}options` SET option_value='$serialized' WHERE option_name='fm_numbers_control' LIMIT 1")
-            :@mysqli_query($link,"INSERT INTO `{$t}options` (option_name,option_value,autoload) VALUES ('fm_numbers_control','$serialized','no')");
-        if(!$ok){mysqli_close($link);return['error'=>'Could not save the numbers control settings.'];}
-        $root=$this->wpSiteRoot($configPath);$muDir=$root.'/wp-content/mu-plugins';
-        if(!is_dir($muDir)&&!@mkdir($muDir,0755,true)&&!is_dir($muDir)){mysqli_close($link);return['error'=>'Could not create wp-content/mu-plugins.'];}
-        $plugin=$this->wpNumbersPluginPath($configPath);
-        $wrote=@file_put_contents($plugin,$this->wpNumbersPluginCode(),LOCK_EX)!==false;
-        if($wrote)@chmod($plugin,0644);
-        mysqli_close($link);
-        if(!$wrote)return['error'=>'Settings were saved, but the WordPress helper could not be installed.'];
-        $this->log('wp_numbers_control',count($settings)?'enabled':'reset');
-        return['ok'=>true,'enabled'=>count($settings)>0,'message'=>count($settings)?'Displayed WordPress numbers updated.':'All number controls are cleared.'];
-    }
-    public function wpNumbersControlReset($configPath){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if($this->isRO())return['error'=>'Read-only account.'];
-        if(basename($configPath)!=='wp-config.php')return['error'=>'This feature requires a valid WordPress installation.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $t=$c['prefix'];$ok=@mysqli_query($link,"DELETE FROM `{$t}options` WHERE option_name='fm_numbers_control' LIMIT 1");
-        mysqli_close($link);
-        $plugin=$this->wpNumbersPluginPath($configPath);
-        if(is_file($plugin)&&!@unlink($plugin))return['error'=>'The database setting was cleared, but the WordPress helper could not be removed.'];
-        if(!$ok)return['error'=>'Could not clear the numbers control setting.'];
-        $this->log('wp_numbers_control','reset');
-        return['ok'=>true,'enabled'=>false,'message'=>'Real WordPress numbers are restored.'];
-    }
-
-     /* ── WordPress Images Replacer ──────────────────────────────────────────
-        New replacements are real file replacements. The original is copied to
-        a backup before the chosen upload is moved into the exact original path
-        and filename. Legacy presentation mappings remain readable. */
-    private function wpImageOption($link,$c){
-        $v=$this->wpOption($link,$c['prefix'],'fm_image_replacer');
-        return is_array($v)?$v:[];
-    }
-    private function wpImageUrl($url,$base){
-        $url=trim(html_entity_decode((string)$url,ENT_QUOTES|ENT_HTML5,'UTF-8'));
-        if($url===''||preg_match('#^(data|blob|javascript):#i',$url))return null;
-        if(strpos($url,'//')===0){
-            $scheme=parse_url($base,PHP_URL_SCHEME)?:'https';return $scheme.':'.$url;
-        }
-        if(preg_match('#^https?://#i',$url))return strtok($url,'#');
-        $b=parse_url($base);if(empty($b['host']))return null;
-        $origin=($b['scheme']??'https').'://'.$b['host'].(!empty($b['port'])?':'.$b['port']:'');
-        if($url[0]==='/')return $origin.$url;
-        $path=$b['path']??'/';$dir=rtrim(str_replace('\\','/',dirname($path)),'/');
-        $full=$dir.'/'.$url;
-        $parts=[];
-        foreach(explode('/',$full) as $part){
-            if($part===''||$part==='.')continue;
-            if($part==='..')array_pop($parts);else $parts[]=$part;
-        }
-        return $origin.'/'.implode('/',$parts);
-    }
-    private function wpImagePath($url,$base){
-        $u=parse_url($url);$b=parse_url($base);
-        if(empty($u['host'])||empty($b['host'])||strtolower($u['host'])!==strtolower($b['host']))return null;
-        return '/'.ltrim(rawurldecode($u['path']??''),'/');
-    }
-    private function wpImageLocalPath($root,$base,$url){
-        $root=realpath($root);$u=parse_url($url);$b=parse_url($base);
-        if(!$root||empty($u['host'])||empty($b['host'])||strtolower($u['host'])!==strtolower($b['host']))return null;
-        $path=rawurldecode((string)($u['path']??''));$basePath=rtrim((string)($b['path']??''),'/');
-        if($basePath!==''&&$basePath!=='/'){
-            if($path===$basePath)$path='/';
-            elseif(strpos($path,$basePath.'/')===0)$path=substr($path,strlen($basePath));
-            else return null;
-        }
-        $relative=ltrim($path,'/');
-        if($relative===''||strpos($relative,"\0")!==false||preg_match('#(^|/)\.\.?(/|$)#',$relative))return null;
-        $candidate=$root.'/'.$relative;$dir=realpath(dirname($candidate));
-        if(!$dir||($dir!==$root&&strpos($dir,rtrim($root,'/').'/')!==0)||!is_file($candidate))return null;
-        return $dir.'/'.basename($candidate);
-    }
-    private function wpImageStoredPath($root,$relative){
-        $root=realpath($root);$relative=ltrim(str_replace('\\','/',(string)$relative),'/');
-        if(!$root||$relative===''||strpos($relative,"\0")!==false||preg_match('#(^|/)\.\.?(/|$)#',$relative))return null;
-        $candidate=$root.'/'.$relative;$dir=realpath(dirname($candidate));
-        if(!$dir||($dir!==$root&&strpos($dir,rtrim($root,'/').'/')!==0))return null;
-        return $dir.'/'.basename($candidate);
-    }
-    private function wpImageResolveReference($root,$base,$reference){
-        $reference=trim(html_entity_decode((string)$reference,ENT_QUOTES|ENT_HTML5,'UTF-8'));
-        if($reference===''||strlen($reference)>4000||preg_match('#^(data|blob|javascript):#i',$reference))return null;
-        $rootReal=realpath($root);
-        if($rootReal&&is_file($reference)){
-            $file=realpath($reference);
-            if($file&&($file===$rootReal||strpos($file,rtrim($rootReal,'/').'/')===0)){
-                $relative=str_replace('\\','/',substr($file,strlen(rtrim($rootReal,'/'))));
-                return rtrim($base,'/').'/'.ltrim($relative,'/');
-            }
-        }
-        return $this->wpImageUrl($reference,$base);
-    }
-    private function wpImageAtomicCopy($source,$target,$mode=null){
-        $dir=dirname($target);if(!is_dir($dir)||!is_readable($source))return false;
-        $tmp=@tempnam($dir,'.fm-image-');if(!$tmp)return false;
-        $ok=@copy($source,$tmp);
-        if($ok&&$mode!==null)@chmod($tmp,(int)$mode);
-        if($ok)$ok=@rename($tmp,$target);
-        if(!$ok)@unlink($tmp);
-        return $ok;
-    }
-    private function wpImageDirectBackupPath($root,$key){
-        return rtrim($root,'/').'/wp-content/uploads/fm-image-replacer/backups/'.$key.'.original';
-    }
-    private function wpImageProtectBackupDir($dir){
-        if(!is_dir($dir)&&!@mkdir($dir,0755,true)&&!is_dir($dir))return false;
-        $ht=$dir.'/.htaccess';
-        if(!is_file($ht))@file_put_contents($ht,"Require all denied\nDeny from all\n",LOCK_EX);
-        $index=$dir.'/index.html';
-        if(!is_file($index))@file_put_contents($index,'',LOCK_EX);
-        return is_dir($dir);
-    }
-    private function wpImageHasLegacyItems($items){
-        foreach((array)$items as $item)if(is_array($item)&&!empty($item['original_url'])&&!empty($item['replacement_url']))return true;
-        return false;
-    }
-    private function wpImageSyncLegacyPlugin($root,$items){
-        $plugin=rtrim($root,'/').'/wp-content/mu-plugins/000-fm-image-replacer.php';
-        if($this->wpImageHasLegacyItems($items)){
-            $muDir=dirname($plugin);
-            if(!is_dir($muDir)&&!@mkdir($muDir,0755,true)&&!is_dir($muDir))return false;
-            if(@file_put_contents($plugin,$this->wpImageReplacePluginCode(),LOCK_EX)===false&&!$this->privWriteFile($plugin,$this->wpImageReplacePluginCode()))return false;
-            @chmod($plugin,0644);
-            $site=$this->privSiteFor($plugin);
-            $this->guardRegister($plugin,'wordpress',$site['config']??null);
-        }elseif(is_file($plugin))@unlink($plugin);
-        return true;
-    }
-    private function wpImageFetch($url){
-        if(!preg_match('#^https?://#i',(string)$url))return false;
-        if(function_exists('curl_init')){
-            $ch=curl_init($url);
-            curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>3,
-                CURLOPT_CONNECTTIMEOUT=>6,CURLOPT_TIMEOUT=>15,CURLOPT_SSL_VERIFYPEER=>true,
-                CURLOPT_IPRESOLVE=>CURL_IPRESOLVE_V4,CURLOPT_USERAGENT=>'FileManager-Images-Replacer/1.0']);
-            $data=curl_exec($ch);$code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
-            return $data!==false&&$code>=200&&$code<400&&strlen($data)<=25*1024*1024?$data:false;
-        }
-        $ctx=stream_context_create(['http'=>['timeout'=>15,'header'=>"User-Agent: FileManager-Images-Replacer/1.0\r\n"],
-            'https'=>['timeout'=>15,'header'=>"User-Agent: FileManager-Images-Replacer/1.0\r\n"]]);
-        $data=@file_get_contents($url,false,$ctx);
-        return $data!==false&&strlen($data)<=25*1024*1024?$data:false;
-    }
-    private function wpImageAttr($tag,$name){
-        $q=preg_quote($name,'/');
-        if(preg_match('/\b'.$q.'\s*=\s*([\'"])(.*?)\1/is',$tag,$m))return trim(html_entity_decode($m[2],ENT_QUOTES|ENT_HTML5,'UTF-8'));
-        return '';
-    }
-    private function wpImageExtract($html,$base,$source){
-        $out=[];$seen=[];
-        if(!is_string($html)||$html==='')return $out;
-        preg_match_all('/<(?:img|source)\b[^>]*>/i',$html,$tags);
-        foreach($tags[0]??[] as $tag){
-            $urls=[];
-            foreach(['src','data-src','data-lazy-src'] as $attr){$v=$this->wpImageAttr($tag,$attr);if($v)$urls[]=$v;}
-            foreach(['srcset','data-srcset'] as $attr){
-                $set=$this->wpImageAttr($tag,$attr);
-                if($set)foreach(explode(',',$set) as $candidate){$parts=preg_split('/\s+/',trim($candidate));if(!empty($parts[0]))$urls[]=$parts[0];}
-            }
-            foreach($urls as $raw){
-                $url=$this->wpImageUrl($raw,$base);if(!$url)continue;
-                $key=strtok($url,'?');$ext=strtolower(pathinfo(parse_url($key,PHP_URL_PATH)??'',PATHINFO_EXTENSION));
-                if(!in_array($ext,['jpg','jpeg','png','gif','webp','bmp','avif'],true))continue;
-                if(isset($seen[$key]))continue;$seen[$key]=1;
-                $out[]=['url'=>$url,'source'=>$source,'label'=>basename(parse_url($key,PHP_URL_PATH)??$key),
-                    'width'=>null,'height'=>null];
-            }
-        }
-        /* Inline background images and CSS-backed lazy loaders are common on
-           homepages and dashboards, even when there is no <img> element. */
-        preg_match_all('/url\s*\(\s*([\'"]?)([^\'")\s]+)\1\s*\)/i',$html,$cssUrls);
-        foreach($cssUrls[2]??[] as $raw){
-            $url=$this->wpImageUrl($raw,$base);if(!$url)continue;
-            $key=strtok($url,'?');$ext=strtolower(pathinfo(parse_url($key,PHP_URL_PATH)??'',PATHINFO_EXTENSION));
-            if(!in_array($ext,['jpg','jpeg','png','gif','webp','bmp','avif'],true)||isset($seen[$key]))continue;
-            $seen[$key]=1;$out[]=['url'=>$url,'source'=>$source.' (background)','label'=>basename(parse_url($key,PHP_URL_PATH)??$key),'width'=>null,'height'=>null];
-        }
-        return $out;
-    }
-    private function wpImageStylesheets($html,$base,$source){
-        $out=[];$seen=[];
-        if(!is_string($html)||$html==='')return $out;
-        preg_match_all('/<link\b[^>]*>/i',$html,$links);
-        foreach($links[0]??[] as $tag){
-            $rel=strtolower($this->wpImageAttr($tag,'rel'));
-            if($rel!==''&&strpos($rel,'stylesheet')===false)continue;
-            $href=$this->wpImageAttr($tag,'href');if(!$href)continue;
-            $url=$this->wpImageUrl($href,$base);if(!$url||isset($seen[$url]))continue;
-            $seen[$url]=1;$css=$this->wpImageFetch($url);if($css===false)continue;
-            $out=array_merge($out,$this->wpImageExtract($css,$url,$source.' stylesheet'));
-            if(count($out)>=250)break;
-        }
-        return $out;
-    }
-    private function wpImageReplacePluginCode(){
-        return <<<'FMIMG'
-<?php
-/**
- * File Manager Images Replacer - reversible direct file replacement.
- * Direct mappings are already written to the original path. Add a version
- * query to direct URLs so browser, page-cache, and CDN copies are refreshed.
- * Legacy mappings still use the old URL swap.
- */
-if(!defined('ABSPATH'))exit;
-function fm_image_replacer_output($surface='frontend'){
-    $settings=get_option('fm_image_replacer',array());
-    if(!is_array($settings)||empty($settings['items'])||!is_array($settings['items']))return;
-    $settings['home_path']=isset($settings['home_path'])?(string)$settings['home_path']:'/';
-    $settings['surface']=$surface;
-    $json=function_exists('wp_json_encode')?wp_json_encode($settings,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT):json_encode($settings);
-    if(!$json)return;
-    echo '<script id="fm-image-replacer">window.fmImageReplacer='.$json.';</script>';
-    ?>
-    <script>
-    (function(d,w){
-      var s=w.fmImageReplacer||{},items=s.items||{},home=s.home_path||'/';
-      var path=(w.location.pathname||'/').replace(/\/+$/,'')||'/';
-      var admin=/\/wp-admin(?:\/|$)/.test(path);
-      function clean(u){try{var x=new URL(u,w.location.href);return x.href.split('#')[0].replace(/([?&])fm_image_version=\d+/,'$1').replace(/[?&]$/,'');}catch(e){return String(u||'').replace(/([?&])fm_image_version=\d+/,'$1').replace(/[?&]$/,'');}}
-      function allowed(item){
-        var surface=item.surface||'both';
-         if(item.mode==='direct')return admin?(surface==='both'||surface==='dashboard'||item.scope==='dashboard'||item.scope==='admin'):(surface==='both'||surface==='frontend');
-        if(admin)return surface==='both'||surface==='dashboard'||item.scope==='dashboard'||item.scope==='admin';
-        return (surface==='both'||surface==='frontend')&&(item.scope_path===path||item.scope_path===home);
-      }
-      function getReplacement(item){
-        if(!item)return '';
-        if(item.mode==='direct'){
-          var original=item.original_url||'',version=Number(item.updated_at||0);
-          if(!version)return original;
-          return original+(original.indexOf('?')>=0?'&':'?')+'fm_image_version='+version;
-        }
-        return item.replacement_url||'';
-      }
-      function swap(el,attr){
-        var v=el.getAttribute(attr);if(!v)return;
-        var key=clean(v),hit=null;
-         Object.keys(items).some(function(k){var item=items[k];if(item&&item.original_url&&clean(item.original_url)===key&&allowed(item)){hit=item;return true;}return false;});
-         var next=getReplacement(hit);if(next)el.setAttribute(attr,next);
-      }
-      function swapSet(el,attr){
-        var v=el.getAttribute(attr);if(!v)return;
-         var parts=v.split(',').map(function(p){var bits=p.trim().split(/\s+/);if(bits[0]){var key=clean(bits[0]);Object.keys(items).some(function(k){var item=items[k];if(item&&item.original_url&&clean(item.original_url)===key&&allowed(item)){bits[0]=getReplacement(item);return true;}return false;});}return bits.join(' ');});
-        el.setAttribute(attr,parts.join(', '));
-      }
-      function swapCss(value){
-        return String(value||'').replace(/url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi,function(all,q,url){
-           var key=clean(url),next='';
-           Object.keys(items).some(function(k){var item=items[k];if(item&&item.original_url&&clean(item.original_url)===key&&allowed(item)){next=getReplacement(item);return true;}return false;});
-           return next?'url('+q+next+q+')':all;
-        });
-      }
-      function apply(){
-        d.querySelectorAll('img').forEach(function(el){['src','data-src','data-lazy-src'].forEach(function(a){swap(el,a);});['srcset','data-srcset'].forEach(function(a){swapSet(el,a);});});
-        d.querySelectorAll('source').forEach(function(el){swapSet(el,'srcset');swap(el,'src');});
-        d.querySelectorAll('[style]').forEach(function(el){el.setAttribute('style',swapCss(el.getAttribute('style')));});
-      }
-      if(d.readyState==='loading')d.addEventListener('DOMContentLoaded',apply);else apply();
-      if(w.MutationObserver){var timer=0;new MutationObserver(function(){clearTimeout(timer);timer=setTimeout(apply,30);}).observe(d.documentElement,{childList:true,subtree:true});}
-    })(document,window);
-    </script>
-    <?php
-}
-add_action('wp_head',function(){fm_image_replacer_output('frontend');},99);
-add_action('admin_head',function(){fm_image_replacer_output('dashboard');},99);
-FMIMG;
-    }
-    private function wpImageWriteSettings($link,$c,$settings){
-        $t=$c['prefix'];$serialized=mysqli_real_escape_string($link,serialize($settings));
-        $has=@mysqli_query($link,"SELECT option_name FROM `{$t}options` WHERE option_name='fm_image_replacer' LIMIT 1");
-        return $has&&mysqli_num_rows($has)>0
-            ?(bool)@mysqli_query($link,"UPDATE `{$t}options` SET option_value='$serialized' WHERE option_name='fm_image_replacer' LIMIT 1")
-            :(bool)@mysqli_query($link,"INSERT INTO `{$t}options` (option_name,option_value,autoload) VALUES ('fm_image_replacer','$serialized','no')");
-    }
-    private function wpImageHomeUrl($link,$prefix){
-        $home=(string)$this->wpOption($link,$prefix,'home');
-        $site=(string)$this->wpOption($link,$prefix,'siteurl');
-        return rtrim($home?:$site,'/');
-    }
-    private function wpImageDefaultPath($link,$prefix,$home){
-        $show=(string)$this->wpOption($link,$prefix,'show_on_front');
-        $front=(int)$this->wpOption($link,$prefix,'page_on_front');
-        if($show==='page'&&$front>0){
-            $t=$prefix.'posts';$id=$front;
-            $res=@mysqli_query($link,"SELECT post_name FROM `{$t}` WHERE ID=$id AND post_status='publish' LIMIT 1");
-            if($res&&($row=mysqli_fetch_assoc($res))&&!empty($row['post_name']))return '/'.trim($row['post_name'],'/').'/';
-        }
-        return '/';
-    }
-    private function wpImageFileInventory($root,$base,$source,$limit=250){
-        $out=[];$seen=[];$dirs=[];
-        foreach(['wp-admin/images','wp-includes/images'] as $relative){
-            $dir=$root.'/'.$relative;if(is_dir($dir))$dirs[]=$dir;
-        }
-        if($source==='All site uploads'){
-            $uploads=$root.'/wp-content/uploads';
-            if(is_dir($uploads))$dirs[]=$uploads;
-        }
-        foreach($dirs as $dir){
-            try{$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir,RecursiveDirectoryIterator::SKIP_DOTS));}
-            catch(Throwable $e){continue;}
-            foreach($it as $file){
-                if(count($out)>=$limit)break;
-                if(!$file->isFile())continue;
-                $filePath=str_replace('\\','/', $file->getPathname());
-                if(strpos($filePath,'/wp-content/uploads/fm-image-replacer/backups/')!==false)continue;
-                $ext=strtolower($file->getExtension());
-                if(!in_array($ext,['jpg','jpeg','png','gif','webp','bmp','avif'],true))continue;
-                $relative=str_replace('\\','/',substr($file->getPathname(),strlen($root)));
-                $url=rtrim($base,'/').'/'.ltrim($relative,'/');
-                if(isset($seen[$url]))continue;$seen[$url]=1;
-                $out[]=['url'=>$url,'source'=>$source,'label'=>basename($relative),'width'=>null,'height'=>null];
-            }
-        }
-        return $out;
-    }
-    public function wpImageInventory($configPath,$pagePath='/',$scope='page'){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $base=$this->wpImageHomeUrl($link,$c['prefix']);
-        if(!$base){mysqli_close($link);return['error'=>'Could not read the WordPress site URL.'];}
-        $scope=in_array($scope,['page','all'],true)?$scope:'page';
-        $pagePath=trim((string)$pagePath);if($pagePath===''||$pagePath[0]!=='/')$pagePath='/'.$pagePath;
-        if(strpos($pagePath,'..')!==false||preg_match('#^[a-z]+://#i',$pagePath)||preg_match('/[\x00-\x1F\x7F\\\\?#]/',$pagePath)){mysqli_close($link);return['error'=>'Enter a site path such as /home, not a full URL or a path containing ..'];}
-        $pageUrl=$base.rtrim($pagePath,'/');if($pagePath==='/')$pageUrl=$base.'/';
-        $defaultPath=$this->wpImageDefaultPath($link,$c['prefix'],$base);
-        $homeHtml=$this->wpImageFetch($pageUrl);
-        $home=$this->wpImageExtract($homeHtml,$pageUrl,'Homepage');
-        if($scope==='all')$home=array_merge($home,$this->wpImageStylesheets($homeHtml,$pageUrl,'Homepage'));
-        $t=$c['prefix'];$root=$this->wpSiteRoot($configPath);
-        $dashHtml=false;$dashboard=[];$media=[];
-        if($scope==='all'){
-            $dashUrl=$base.'/wp-admin/';
-            $dashHtml=$this->wpImageFetch($dashUrl);
-            $dashboard=$this->wpImageExtract($dashHtml,$dashUrl,'Dashboard');
-            $dashboard=array_merge($dashboard,$this->wpImageStylesheets($dashHtml,$dashUrl,'Dashboard'));
-        }
-        if($scope==='all'){
-            $res=@mysqli_query($link,"SELECT ID,post_title,guid FROM `{$t}posts` WHERE post_type='attachment' AND post_mime_type LIKE 'image/%' ORDER BY ID DESC LIMIT 5000");
-            while($res&&($row=mysqli_fetch_assoc($res))){
-                $url=$this->wpImageUrl($row['guid'],$base);if(!$url)continue;
-                $media[]=['url'=>$url,'source'=>'Media library','label'=>$row['post_title']?:basename(parse_url($url,PHP_URL_PATH)??$url),'width'=>null,'height'=>null];
-            }
-            $dashboard=array_merge($dashboard,$this->wpImageFileInventory($root,$base,'Dashboard assets',1000));
-            $dashboard=array_merge($dashboard,$this->wpImageFileInventory($root,$base,'All site uploads',5000));
-        }
-        $items=[];$add=function($list)use(&$items){foreach($list as $item){$k=strtok($item['url'],'?');if(!$k)continue;if(!isset($items[$k]))$items[$k]=$item;}};
-        $add($home);$add($dashboard);$add($media);
-        $stored=$this->wpImageOption($link,$c);$saved=is_array($stored['items']??null)?$stored['items']:[];
-        foreach($items as $key=>&$item){
-            $hash=hash('sha256',$key);$hit=is_array($saved)&&isset($saved[$hash])?$saved[$hash]:null;
-            $target=is_array($hit)?$this->wpImageLocalPath($root,$base,$key):null;
-            $backup='';
-            if(is_array($hit)&&($hit['mode']??'')==='direct'&&!empty($hit['backup_path'])){
-                $backup=$root.'/'.ltrim((string)$hit['backup_path'],'/');
-            }
-            $directActive=is_array($hit)&&($hit['mode']??'')==='direct'&&$target&&is_file($target)&&$backup&&is_file($backup);
-            $legacyActive=is_array($hit)&&($hit['mode']??'')!=='direct'&&!empty($hit['replacement_url']);
-            $item['key']=$hash;$item['replaced']=$directActive||$legacyActive;
-            $item['replacement_url']=$item['replaced']?($hit['replacement_url']??''):'';
-            $item['scope_path']=$hit['scope_path']??$pagePath;
-            $item['mode']=$hit['mode']??($legacyActive?'legacy':'');
-            $item['updated_at']=(int)($hit['updated_at']??0);
-            if($directActive){
-                $item['target_path']=$hit['target_path']??$this->wpImagePath($key,$base);
-                $item['original_filename']=$hit['original_filename']??basename($target);
-                $item['backup_ready']=true;
-            }
-        }unset($item);
-        $recent=[];
-        foreach($saved as $hash=>$hit){
-            if(!is_array($hit)||empty($hit['original_url']))continue;
-            $target=$this->wpImageLocalPath($root,$base,$hit['original_url']);
-            $backup=($hit['mode']??'')==='direct'&&!empty($hit['backup_path'])
-                ?$root.'/'.ltrim((string)$hit['backup_path'],'/'): '';
-            $active=($hit['mode']??'')==='direct'
-                ?($target&&$backup&&is_file($target)&&is_file($backup))
-                :!empty($hit['replacement_url']);
-            if(!$active)continue;
-            $recent[]=[
-                'key'=>$hash,'url'=>$hit['original_url'],'original_url'=>$hit['original_url'],
-                'replacement_url'=>$hit['replacement_url']??'','label'=>$hit['original_filename']??basename(parse_url($hit['original_url'],PHP_URL_PATH)??$hit['original_url']),
-                'source'=>$hit['source']??'Recent replacement','scope_path'=>$hit['scope_path']??$pagePath,
-                'updated_at'=>(int)($hit['updated_at']??0),'replaced'=>true,'mode'=>$hit['mode']??'legacy',
-                'target_path'=>$hit['target_path']??$this->wpImagePath($hit['original_url'],$base),
-                'original_filename'=>$hit['original_filename']??basename(parse_url($hit['original_url'],PHP_URL_PATH)??$hit['original_url']),
-                'width'=>(int)($hit['width']??0),'height'=>(int)($hit['height']??0)
-            ];
-        }
-        usort($recent,fn($a,$b)=>($b['updated_at']??0)<=>($a['updated_at']??0));
-        $recent=array_slice($recent,0,12);
-        mysqli_close($link);
-        return['ok'=>true,'config'=>$configPath,'home'=>$base,'page_path'=>$pagePath,'page_url'=>$pageUrl,'scope'=>$scope,
-            'page_found'=>$homeHtml!==false,'dashboard_found'=>$dashHtml!==false,'images'=>array_values($items),
-            'replaced_count'=>count(array_filter($saved,fn($v)=>is_array($v)&&!empty($v['replacement_url']))),
-            'default_path'=>$defaultPath,
-            'recent'=>$recent,
-            'note'=>$scope==='all'?'All discovered site images are listed. New replacements are written to the original path after an automatic backup.':'Only images found on the selected page are listed.'];
-    }
-    public function wpImageReplace($configPath){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if($this->isRO())return['error'=>'Read-only account.'];
-        if(empty($_FILES['replacement_image']))return['error'=>'Choose an image first.'];
-        $upload=$_FILES['replacement_image'];if((int)$upload['error']!==UPLOAD_ERR_OK)return['error'=>'The replacement image upload failed.'];
-        if((int)$upload['size']>25*1024*1024)return['error'=>'Replacement images must be 25 MB or smaller.'];
-        $replacementInfo=@getimagesize($upload['tmp_name']);if(!$replacementInfo)return['error'=>'The selected file is not a readable image; nothing was changed.'];
-        if(!in_array((string)($replacementInfo['mime']??''),['image/jpeg','image/png','image/gif','image/webp','image/bmp','image/avif'],true))return['error'=>'Use a JPEG, PNG, GIF, WebP, BMP, or AVIF replacement image.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $reference=trim((string)($_POST['image_ref']??($_POST['image_url']??'')));$scope=trim((string)($_POST['scope_path']??'/'));
-        if($reference===''||strlen($reference)>4000){mysqli_close($link);return['error'=>'Paste an image URL or a full server file path.'];}
-        if($scope===''||$scope[0]!=='/'||strpos($scope,'..')!==false||preg_match('/[\x00-\x1F\x7F\\\\?#]/',$scope)){mysqli_close($link);return['error'=>'Invalid page path.'];}
-        $base=$this->wpImageHomeUrl($link,$c['prefix']);$root=$this->wpSiteRoot($configPath);
-        $originalUrl=$this->wpImageResolveReference($root,$base,$reference);
-        $baseParts=parse_url($base);$urlParts=parse_url($originalUrl?:$reference);
-        if(!$originalUrl||empty($baseParts['host'])||empty($urlParts['host'])||strtolower($baseParts['host'])!==strtolower($urlParts['host'])){
-            mysqli_close($link);return['error'=>'Only images belonging to this WordPress site can be replaced.'];
-        }
-        $url=$originalUrl;
-        $target=$this->wpImageLocalPath($root,$base,$url);
-        if(!$target){mysqli_close($link);return['error'=>'The original image file could not be found inside this WordPress site. Nothing was changed.'];}
-        $key=hash('sha256',strtok($url,'?'));$settings=$this->wpImageOption($link,$c);
-        if(!isset($settings['items'])||!is_array($settings['items']))$settings['items']=[];
-        $old=is_array($settings['items'][$key]??null)?$settings['items'][$key]:null;
-        $backup=$this->wpImageDirectBackupPath($root,$key);$backupDir=dirname($backup);
-        $oldDirect=is_array($old)&&($old['mode']??'')==='direct';
-        if($oldDirect&&!is_file($backup)){
-            mysqli_close($link);return['error'=>'The protected original backup is missing, so the current image was not changed.'];
-        }
-        if(!$this->wpImageProtectBackupDir($backupDir)){
-            mysqli_close($link);return['error'=>'Could not create the protected original-image backup folder.'];
-        }
-        $targetMode=@fileperms($target);$targetMode=$targetMode===false?0644:($targetMode&0777);
-        $hadBackup=is_file($backup);
-        if(!$hadBackup&&!$this->wpImageAtomicCopy($target,$backup,0640)){
-            mysqli_close($link);return['error'=>'Could not save the original image backup; nothing was changed.'];
-        }
-        $wrote=$this->wpImageAtomicCopy($upload['tmp_name'],$target,$targetMode);
-        if(!$wrote){
-            if(!$hadBackup)@unlink($backup);
-            mysqli_close($link);return['error'=>'Could not write the selected image to the original file path; nothing was changed.'];
-        }
-        $originalInfo=@getimagesize($backup);$ow=(int)($originalInfo[0]??0);$oh=(int)($originalInfo[1]??0);
-        $relativeBackup=ltrim(str_replace('\\','/',substr($backup,strlen(rtrim($root,'/')))),'/');
-        $relativeTarget=$this->wpImagePath($url,$base);
-        $basePath=parse_url($base,PHP_URL_PATH)?:'/';
-        $scopePath=rtrim($basePath,'/');
-        if($scope!=='/')$scopePath.='/'.ltrim($scope,'/');
-        $scopePath='/'.ltrim($scopePath,'/');
-        $settings['home_path']=$scopePath;
-        $settings['items'][$key]=[
-            'original_url'=>$url,'replacement_url'=>$url,'mode'=>'direct','target_path'=>$relativeTarget,
-            'backup_path'=>$relativeBackup,'original_filename'=>basename($target),
-            'replacement_filename'=>basename((string)($upload['name']??'')),'replacement_size'=>(int)$upload['size'],
-            'scope_path'=>$scopePath,'surface'=>'both','source'=>'manager','width'=>$ow,'height'=>$oh,
-            'target_mode'=>$targetMode,'updated_at'=>time()
-        ];
-        $ok=$this->wpImageWriteSettings($link,$c,$settings);
-        if(!$ok){
-            $this->wpImageAtomicCopy($backup,$target,$targetMode);
-            if(!$hadBackup)@unlink($backup);
-            mysqli_close($link);return['error'=>'The selected image was written, but settings could not be saved; the original image was restored.'];
-        }
-        mysqli_close($link);
-        if(is_array($old)&&!empty($old['replacement_url'])&&($old['mode']??'')!=='direct'){
-            $legacyDir=$root.'/wp-content/uploads/fm-image-replacer';
-            $oldName=basename(parse_url($old['replacement_url'],PHP_URL_PATH)??'');
-            if($oldName&&is_file($legacyDir.'/'.$oldName))@unlink($legacyDir.'/'.$oldName);
-        }
-        $this->wpImageSyncLegacyPlugin($root,$settings['items']);
-        $this->log('wp_image_replace',basename($url));
-        return['ok'=>true,'message'=>"The selected image replaced ".basename($target)." at its original path. The original is backed up and can be restored.",'replacement_url'=>$url,'target_path'=>$relativeTarget];
-    }
-    public function wpImageReplaceAll($configPath){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if($this->isRO())return['error'=>'Read-only account.'];
-        $refs=json_decode((string)($_POST['image_refs_json']??''),true);
-        if(!is_array($refs))return['error'=>'Choose the images to replace first.'];
-        $refs=array_values(array_unique(array_filter(array_map(function($v){return is_string($v)?trim($v):'';},$refs))));
-        if(!$refs)return['error'=>'No images were selected.'];
-        if(count($refs)>5000)return['error'=>'You can replace up to 5000 images in one operation.'];
-        if(empty($_FILES['replacement_image']))return['error'=>'Choose one replacement image first.'];
-        if(trim((string)$configPath)===''){
-            $scan=$this->cmsScan();$configPath=$this->wpCurrentDomainConfig($scan['sites']??[]);
-        }
-        $previous=array_key_exists('image_ref',$_POST)?$_POST['image_ref']:null;$hadPrevious=array_key_exists('image_ref',$_POST);
-        $done=0;$failed=[];$failedCount=0;
-        foreach($refs as $ref){
-            $_POST['image_ref']=$ref;
-            $result=$this->wpImageReplace($configPath);
-            if(!empty($result['ok']))$done++;
-            elseif($failedCount++<30)$failed[]=$result['error']??'Unknown image replacement error.';
-        }
-        if($hadPrevious)$_POST['image_ref']=$previous;else unset($_POST['image_ref']);
-        if(!$done)return['error'=>'No image was replaced. '.implode(' ',$failed)];
-        $message=$done.' image'.($done===1?' was':'s were').' replaced and backed up.';
-        if($failedCount)$message.=' '.$failedCount.' image'.($failedCount===1?' was':'s were').' skipped.';
-        $this->log('wp_image_replace_all',$done);
-        return['ok'=>true,'message'=>$message,'replaced_count'=>$done,'failed'=>$failed];
-    }
-    public function wpImageRestore($configPath,$all=false){
-        if(empty($_SESSION['fm_admin']))return['error'=>'Admins only.'];
-        if($this->isRO())return['error'=>'Read-only account.'];
-        if(!$this->wpAutomationConnect($configPath,$c,$link,$err))return['error'=>$err];
-        $settings=$this->wpImageOption($link,$c);$items=is_array($settings['items']??null)?$settings['items']:[];
-        $root=$this->wpSiteRoot($configPath);$dir=$root.'/wp-content/uploads/fm-image-replacer';
-        $base=$this->wpImageHomeUrl($link,$c['prefix']);$remaining=[];$errors=[];
-        $restoreDirect=function($item)use($root,$base,&$errors){
-            $url=(string)($item['original_url']??'');
-            $target=!empty($item['target_path'])?$this->wpImageStoredPath($root,$item['target_path']):$this->wpImageLocalPath($root,$base,$url);
-            $backup=!empty($item['backup_path'])?$root.'/'.ltrim((string)$item['backup_path'],'/'):$this->wpImageDirectBackupPath($root,hash('sha256',strtok($url,'?')));
-            if(!$target||!is_file($backup)){ $errors[]='The protected original backup is missing for '.basename(parse_url($url,PHP_URL_PATH)??$url).'.';return false; }
-            $mode=(int)($item['target_mode']??0644);
-            if(!$this->wpImageAtomicCopy($backup,$target,$mode)){ $errors[]='Could not restore '.basename($target).'.';return false; }
-            @unlink($backup);return true;
-        };
-        $removeLegacy=function($item)use($root,$dir){
-            $n=basename(parse_url((string)($item['replacement_url']??''),PHP_URL_PATH)??'');
-            if($n&&is_file($dir.'/'.$n))@unlink($dir.'/'.$n);
-        };
-        if($all){
-            foreach($items as $key=>$item){
-                if(!is_array($item))continue;
-                if(($item['mode']??'')==='direct'){
-                    $before=count($errors);$restoreDirect($item);
-                    if(count($errors)>$before)$remaining[$key]=$item;
-                }
-                else{$removeLegacy($item);}
-            }
-        }else{
-            $rawUrl=trim((string)($_POST['image_url']??''));$url=$this->wpImageUrl($rawUrl,$base);
-            $key=hash('sha256',strtok($url?:$rawUrl,'?'));
-            if(!isset($items[$key])){$errors[]='Replacement record not found.';}
-            else{
-                $item=$items[$key];
-                if(($item['mode']??'')==='direct'){$before=count($errors);$restoreDirect($item);if(count($errors)===$before)unset($items[$key]);else $remaining[$key]=$item;}
-                else{$removeLegacy($item);unset($items[$key]);}
-            }
-            foreach($items as $key=>$item)if(!isset($remaining[$key]))$remaining[$key]=$item;
-        }
-        if($errors){
-            $settings['items']=$remaining;
-            if(!$this->wpImageWriteSettings($link,$c,$settings))$errors[]='The restore failed and the recovery record could not be saved.';
-            mysqli_close($link);return['error'=>implode(' ',$errors)];
-        }
-        if($remaining){$settings['items']=$remaining;$ok=$this->wpImageWriteSettings($link,$c,$settings);}
-        else{$ok=(bool)@mysqli_query($link,"DELETE FROM `{$c['prefix']}options` WHERE option_name='fm_image_replacer' LIMIT 1");}
-        mysqli_close($link);
-        if(!$ok)return['error'=>'Files were restored, but the Images Replacer settings could not be updated.'];
-        $this->wpImageSyncLegacyPlugin($root,$remaining);
-        $this->log('wp_image_restore',$all?'all':'one');
-        return['ok'=>true,'message'=>$all?'All original images are restored and the replacement history was cleared.':'The original file was restored at its original path.'];
-    }
-
     private function cmsToggleExtension(){
         if(empty($_SESSION['fm_admin'])){$this->addMsg('Admins only.','danger');return;}
         $configPath=$this->cmsCfgFromPost();
@@ -20730,15 +18333,6 @@ FMIMG;
         if($status===1||$status==='1'){$this->addMsg("Account \"$target\" terminated permanently.",'success');$this->log('cpanel_terminate',$target);}
         else{$msg=$r['data']['result'][0]['statusmsg']??'Unknown error.';$this->addMsg("Failed: $msg",'danger');}
     }
-
-    /* ══════════════════════════════════════════════════════════════
-       WEBMAIL MANAGER
-       The tool itself lives at the top of this file in the <<WM2>>
-       block, where it can be read as what it is: a folder of mail, a
-       mail server, or an address a site names. Nothing of it is done
-       inside this class any more - the old automatic sign-in is gone
-       with the tier list that could not find mail.
-    ══════════════════════════════════════════════════════════════ */
 
     /* ══════════════════════════════════════════════════════════════
        SQL DATABASE MANAGER
@@ -23767,177 +21361,13 @@ FMIMG;
     }
 }
 
-/* ── SMTP Sender ──
-   This is deliberately a single-recipient administrative sender. It does not
-   persist SMTP credentials, accept recipient lists/BCC, or provide rotation
-   and bulk-delivery controls. */
-function fm_smtp_response($sock,&$raw=''){
-    $raw='';$lastCode=0;$lastLine='';
-    while(($line=@fgets($sock,8192))!==false){
-        $raw.=$line;$lastLine=rtrim($line,"\r\n");
-        if(preg_match('/^([0-9]{3})([ -])/', $line,$m)){
-            $lastCode=(int)$m[1];
-            if($m[2]===' ')break;
-        }
-        if(strlen($raw)>32768)break;
-    }
-    return['code'=>$lastCode,'text'=>$lastLine,'raw'=>$raw];
-}
-function fm_smtp_expect($sock,$codes,&$response){
-    $response=fm_smtp_response($sock);
-    return in_array((int)($response['code']??0),(array)$codes,true);
-}
-function fm_smtp_command($sock,$command,$codes,&$response){
-    if(@fwrite($sock,$command."\r\n")===false)return false;
-    return fm_smtp_expect($sock,$codes,$response);
-}
-function fm_smtp_header($value){
-    $value=str_replace(["\r","\n"],' ',trim((string)$value));
-    if($value===''||preg_match('/^[\x20-\x7E]*$/',$value))return $value;
-    return'=?UTF-8?B?'.base64_encode($value).'?=';
-}
-function fm_smtp_message($from,$to,$replyTo,$subject,$body,$contentType,$priority,$attachment){
-    $headers=[
-        'Date'=>gmdate('D, d M Y H:i:s').' +0000',
-        'From'=>'<'.$from.'>',
-        'To'=>'<'.$to.'>',
-        'Subject'=>fm_smtp_header($subject),
-        'MIME-Version'=>'1.0',
-        'X-Mailer'=>'File Manager SMTP Sender'
-    ];
-    if($priority==='high'){$headers['X-Priority']='1';$headers['Importance']='high';}
-    if($priority==='low'){$headers['X-Priority']='5';$headers['Importance']='low';}
-    if($replyTo!=='')$headers['Reply-To']='<'.$replyTo.'>';
-    $isHtml=$contentType==='html';
-    $bodyPart=($isHtml?'Content-Type: text/html; charset=UTF-8':'Content-Type: text/plain; charset=UTF-8')."\r\n"
-        ."Content-Transfer-Encoding: 8bit\r\n\r\n".$body;
-    if(!empty($attachment['path'])){
-        $boundary='=_FM_'.bin2hex(function_exists('random_bytes')?random_bytes(12):openssl_random_pseudo_bytes(12));
-        $headers['Content-Type']='multipart/mixed; boundary="'.$boundary.'"';
-        $encoded=chunk_split(base64_encode((string)@file_get_contents($attachment['path'])),76,"\r\n");
-        $safeName=fm_smtp_header($attachment['name']);
-        $bodyPart='--'.$boundary."\r\n".$bodyPart."\r\n"
-            .'--'.$boundary."\r\n"
-            .'Content-Type: '.($attachment['type']?:'application/octet-stream').'; name="'.$safeName."\"\r\n"
-            .'Content-Disposition: attachment; filename="'.$safeName."\"\r\n"
-            ."Content-Transfer-Encoding: base64\r\n\r\n".$encoded
-            .'--'.$boundary."--\r\n";
-    }else{
-        $headers['Content-Type']=$isHtml?'text/html; charset=UTF-8':'text/plain; charset=UTF-8';
-        $headers['Content-Transfer-Encoding']='8bit';
-    }
-    return implode("\r\n",array_map(function($key,$value){return$key.': '.$value;},array_keys($headers),array_values($headers)))."\r\n\r\n".$bodyPart;
-}
-function fm_smtp_send_request($send,$fm){
-    $host=trim((string)($_POST['smtp_host']??''));
-    $port=(int)($_POST['smtp_port']??0);
-    $encryption=(string)($_POST['smtp_encryption']??'tls');
-    $username=trim((string)($_POST['smtp_username']??''));
-    $password=(string)($_POST['smtp_password']??'');
-    $from=trim((string)($_POST['smtp_from']??''));
-    $to=trim((string)($_POST['smtp_to']??''));
-    $replyTo=trim((string)($_POST['smtp_reply_to']??''));
-    $subject=trim((string)($_POST['smtp_subject']??''));
-    $body=(string)($_POST['smtp_body']??'');
-    $contentType=(string)($_POST['smtp_content_type']??'plain');
-    $priority=(string)($_POST['smtp_priority']??'normal');
-    if($host===''||strlen($host)>253||preg_match('/[\s\/\\\\@]/',$host)
-        ||(!filter_var($host,FILTER_VALIDATE_IP)&&!preg_match('/^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/',$host))){
-        return['ok'=>false,'error'=>'Enter a valid SMTP host name or IP address.'];
-    }
-    if($port<1||$port>65535)return['ok'=>false,'error'=>'Enter a valid SMTP port.'];
-    if(!in_array($encryption,['none','tls','ssl'],true))return['ok'=>false,'error'=>'Choose a valid SMTP encryption mode.'];
-    if($username!==''&&strlen($username)>320)return['ok'=>false,'error'=>'The SMTP username is too long.'];
-    if(strlen($password)>1024)return['ok'=>false,'error'=>'The SMTP password is too long.'];
-    if($send){
-        if(!filter_var($from,FILTER_VALIDATE_EMAIL)||strlen($from)>320)return['ok'=>false,'error'=>'Enter a valid From address.'];
-        if(!filter_var($to,FILTER_VALIDATE_EMAIL)||strlen($to)>320)return['ok'=>false,'error'=>'Enter one valid recipient address.'];
-        if($replyTo!==''&&(!filter_var($replyTo,FILTER_VALIDATE_EMAIL)||strlen($replyTo)>320))return['ok'=>false,'error'=>'Enter a valid Reply-To address.'];
-        if($subject===''||strlen($subject)>998)return['ok'=>false,'error'=>'Enter a subject of 998 characters or fewer.'];
-        if(strlen($body)>2000000)return['ok'=>false,'error'=>'The message body is too large.'];
-        if(!in_array($contentType,['plain','html'],true))$contentType='plain';
-        if(!in_array($priority,['low','normal','high'],true))$priority='normal';
-        $window=(int)($_SESSION['fm_smtp_window']??0);
-        $count=(int)($_SESSION['fm_smtp_count']??0);
-        if($window<time()-600){$window=time();$count=0;}
-        if($count>=5)return['ok'=>false,'error'=>'SMTP sending is limited to 5 messages per 10 minutes for this session.'];
-    }
-    $attachment=[];
-    if($send&&!empty($_FILES['smtp_attachment'])&&is_array($_FILES['smtp_attachment'])){
-        $file=$_FILES['smtp_attachment'];
-        if((int)($file['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_NO_FILE){
-            if((int)$file['error']!==UPLOAD_ERR_OK)return['ok'=>false,'error'=>'The attachment upload failed.'];
-            if((int)$file['size']>5*1024*1024)return['ok'=>false,'error'=>'Attachments must be 5 MB or smaller.'];
-            $tmp=(string)($file['tmp_name']??'');
-            if($tmp===''||!is_uploaded_file($tmp)||!is_readable($tmp))return['ok'=>false,'error'=>'The attachment could not be read safely.'];
-            $name=basename((string)($file['name']??'attachment'));
-            $name=preg_replace('/[^A-Za-z0-9._ -]/','_',str_replace(["\r","\n"],'_',$name));
-            $name=trim($name,'. ');
-            if($name==='')$name='attachment';
-            $mime='application/octet-stream';
-            if(function_exists('finfo_open')){$fi=@finfo_open(FILEINFO_MIME_TYPE);if($fi){$mime=(string)@finfo_file($fi,$tmp)?:$mime;@finfo_close($fi);}}
-            $attachment=['path'=>$tmp,'name'=>substr($name,0,180),'type'=>preg_replace('/[\r\n;]+/','',$mime)];
-        }
-    }
-    $sock=null;
-    try{
-        $transport=($encryption==='ssl'?'ssl://':'tcp://').$host;
-        $errno=0;$errstr='';
-        $sock=@stream_socket_client($transport.':'.$port,$errno,$errstr,20,STREAM_CLIENT_CONNECT);
-        if(!$sock)throw new Exception('connection');
-        @stream_set_timeout($sock,20);
-        $response=[];
-        if(!fm_smtp_expect($sock,[220],$response))throw new Exception('greeting');
-        $helloHost=preg_replace('/[^A-Za-z0-9.-]/','-',(string)(@gethostname()?:'localhost'));
-        if(!fm_smtp_command($sock,'EHLO '.($helloHost?:'localhost'),[250],$response))throw new Exception('ehlo');
-        if($encryption==='tls'){
-            if(!fm_smtp_command($sock,'STARTTLS',[220],$response))throw new Exception('starttls');
-            if(!@stream_socket_enable_crypto($sock,true,STREAM_CRYPTO_METHOD_TLS_CLIENT))throw new Exception('crypto');
-            if(!fm_smtp_command($sock,'EHLO '.($helloHost?:'localhost'),[250],$response))throw new Exception('ehlo_tls');
-        }
-        if($username!==''){
-            $raw=(string)($response['raw']??'');
-            if(stripos($raw,'AUTH PLAIN')!==false){
-                if(!fm_smtp_command($sock,'AUTH PLAIN '.base64_encode("\0".$username."\0".$password),[235],$response))throw new Exception('auth');
-            }else{
-                if(!fm_smtp_command($sock,'AUTH LOGIN',[334],$response)
-                    ||!fm_smtp_command($sock,base64_encode($username),[334],$response)
-                    ||!fm_smtp_command($sock,base64_encode($password),[235],$response))throw new Exception('auth');
-            }
-        }
-        if($send){
-            if(!fm_smtp_command($sock,'MAIL FROM:<'.$from.'>',[250],$response))throw new Exception('mail_from');
-            if(!fm_smtp_command($sock,'RCPT TO:<'.$to.'>',[250,251],$response))throw new Exception('recipient');
-            if(!fm_smtp_command($sock,'DATA',[354],$response))throw new Exception('data');
-            $message=fm_smtp_message($from,$to,$replyTo,$subject,$body,$contentType,$priority,$attachment);
-            $message=preg_replace("/\r\n|\r|\n/","\n",$message);
-            $lines=explode("\n",$message);
-            foreach($lines as &$line)if(isset($line[0])&&$line[0]==='.')$line='.'.$line;
-            unset($line);
-            $message=implode("\r\n",$lines);
-            if(substr($message,-2)!=="\r\n")$message.="\r\n";
-            if(@fwrite($sock,$message.".\r\n")===false||!fm_smtp_expect($sock,[250],$response))throw new Exception('send');
-            @fm_smtp_command($sock,'QUIT',[221,250],$response);
-            @fclose($sock);
-            $_SESSION['fm_smtp_window']=$window;$_SESSION['fm_smtp_count']=$count+1;
-            if($fm&&method_exists($fm,'log'))$fm->log('smtp_send',$host.' -> '.$to);
-            return['ok'=>true,'message'=>'Message sent successfully.'];
-        }
-        @fm_smtp_command($sock,'QUIT',[221,250],$response);@fclose($sock);
-        return['ok'=>true,'message'=>'SMTP connection and authentication succeeded.'];
-    }catch(Exception $e){
-        if(is_resource($sock))@fclose($sock);
-        return['ok'=>false,'error'=>'SMTP connection failed. Check the host, port, encryption, and credentials.'];
-    }
-}
-
 $fm=new FileManager();
 /* Automatically provision the default detected WordPress recovery after a
    successful File Manager login. This is intentionally authenticated-only:
    a public login-page request must never mutate an arbitrary CMS. */
 /* CMS auto-provisioning belongs to the full page load. Running it before
    every AJAX endpoint can block unrelated requests on hosts with a slow or
-   unavailable database, which is especially harmful to Assistant Agent. */
+   unavailable database, which can block unrelated requests on slow databases. */
 if(!isset($_GET['x'])&&!empty($_SESSION['auth'])&&fm_is_true_admin())$fm->wpAutomationAutoBootstrap();
 
 /* ── API ── */
@@ -23968,86 +21398,6 @@ if(isset($_GET['x'])){
         }catch(ParseError $e){
             echo json_encode(['ok'=>true,'diagnostics'=>[['line'=>max(1,(int)$e->getLine()),'column'=>1,'message'=>$e->getMessage()]]],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
         }
-    }
-    if($xop==='audio_metadata_save'){
-        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-        if($_SERVER['REQUEST_METHOD']!=='POST'||!hash_equals((string)($_SESSION['csrf_token']??''),(string)($_POST['csrf_token']??''))){http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;}
-        if($fm->isRO()){http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Read-only account.']);exit;}
-        $dir=realpath((string)($_POST['dir']??''));$current=realpath($fm->getCwd());
-        if($dir===false||$current===false||$dir!==$current||!is_dir($dir)||fm_is_manager_internal_path($dir)){
-            http_response_code(403);echo json_encode(['ok'=>false,'error'=>'The audio folder is not available in the current location.']);exit;
-        }
-        $name=(string)($_POST['file']??'');
-        if($name===''||$name==='.'||$name==='..'||basename($name)!==$name||strpos($name,'/')!==false||strpos($name,'\\')!==false||strpos($name,"\0")!==false||!in_array(strtolower(pathinfo($name,PATHINFO_EXTENSION)),fm_audio_supported_extensions(),true)){
-            http_response_code(400);echo json_encode(['ok'=>false,'error'=>'Choose a valid audio file.']);exit;
-        }
-        $candidate=$dir.DIRECTORY_SEPARATOR.$name;$file=realpath($candidate);
-        if($file===false||!is_file($file)||is_link($candidate)||dirname($file)!==$dir||fm_is_manager_internal_path($file)){
-            http_response_code(404);echo json_encode(['ok'=>false,'error'=>'The audio file no longer exists.']);exit;
-        }
-        $cleanField=function($key,$limit=256){
-            $value=trim((string)($_POST[$key]??''));
-            if(function_exists('iconv')){$converted=@iconv('UTF-8','UTF-8//IGNORE',$value);if($converted!==false)$value=$converted;}
-            $value=str_replace("\0",'',$value);
-            $value=preg_replace('/[\x01-\x1F\x7F]/','',$value)??'';
-            if(function_exists('mb_substr'))$value=mb_substr($value,0,$limit,'UTF-8');
-            elseif(strlen($value)>$limit*4){$value=substr($value,0,$limit*4);while($value!==''&&!preg_match('//u',$value))$value=substr($value,0,-1);}
-            return$value;
-        };
-        $year=$cleanField('year',4);
-        if($year!==''&&!preg_match('/^\d{4}$/',$year)){http_response_code(400);echo json_encode(['ok'=>false,'error'=>'Enter a four-digit year or leave it empty.']);exit;}
-        $metaPath=fm_audio_override_path($dir,$name);
-        if(is_link($metaPath)||file_exists($metaPath)&&!is_file($metaPath)){http_response_code(400);echo json_encode(['ok'=>false,'error'=>'The song details file is not safe to update.']);exit;}
-        $oldBytes=is_file($metaPath)?@file_get_contents($metaPath):false;
-        $previous=fm_audio_override_read($dir,$name);
-        $cover=(string)($previous['cover']??'');$newCover='';
-        $upload=$_FILES['cover']??null;
-        $hasUpload=is_array($upload)&&($upload['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_NO_FILE;
-        if($hasUpload){
-            if(($upload['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_OK||!is_uploaded_file((string)($upload['tmp_name']??''))){
-                http_response_code(400);echo json_encode(['ok'=>false,'error'=>'The cover image could not be uploaded.']);exit;
-            }
-            $uploadSize=(int)($upload['size']??0);
-            if($uploadSize<1||$uploadSize>4194304){http_response_code(413);echo json_encode(['ok'=>false,'error'=>'Cover images must be 4 MB or smaller.']);exit;}
-            $image=@getimagesize((string)$upload['tmp_name']);
-            $imageTypes=[IMAGETYPE_JPEG=>'jpg',IMAGETYPE_PNG=>'png',IMAGETYPE_GIF=>'gif'];
-            if(defined('IMAGETYPE_WEBP'))$imageTypes[IMAGETYPE_WEBP]='webp';
-            $imageType=is_array($image)?(int)($image[2]??0):0;
-            if(!$image||!isset($imageTypes[$imageType])||(int)($image[0]??0)>12000||(int)($image[1]??0)>12000){
-                http_response_code(400);echo json_encode(['ok'=>false,'error'=>'Use a valid JPG, PNG, GIF, or WebP image up to 12,000 pixels wide or high.']);exit;
-            }
-            try{$newCover='.mfm-audio-artwork-'.bin2hex(random_bytes(16)).'.'.$imageTypes[$imageType];}
-            catch(Throwable $e){http_response_code(500);echo json_encode(['ok'=>false,'error'=>'Could not create a safe cover image name.']);exit;}
-            if(!@move_uploaded_file((string)$upload['tmp_name'],$dir.DIRECTORY_SEPARATOR.$newCover)){
-                http_response_code(500);echo json_encode(['ok'=>false,'error'=>'The cover image could not be saved in this folder.']);exit;
-            }
-            $cover=$newCover;
-        }elseif(!empty($_POST['remove_cover']))$cover='';
-        $metadata=[
-            'title'=>$cleanField('title'),
-            'artist'=>$cleanField('artist'),
-            'album'=>$cleanField('album'),
-            'year'=>$year,
-            'genre'=>$cleanField('genre'),
-            'cover'=>$cover
-        ];
-        $json=json_encode($metadata,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);
-        $written=$json!==false?@file_put_contents($metaPath,$json,LOCK_EX):false;
-        if($written===false||@file_get_contents($metaPath)!==$json){
-            if($newCover!=='')@unlink($dir.DIRECTORY_SEPARATOR.$newCover);
-            if($oldBytes!==false)@file_put_contents($metaPath,$oldBytes,LOCK_EX);elseif(is_file($metaPath)&&!is_link($metaPath))@unlink($metaPath);
-            http_response_code(500);echo json_encode(['ok'=>false,'error'=>'The song details could not be saved. Check folder permissions and try again.']);exit;
-        }
-        if($cover!==''&&$cover!==($previous['cover']??'')){
-            $oldCover=fm_audio_override_cover_path($dir,$previous);
-            if($oldCover!=='')@unlink($oldCover);
-        }elseif($cover===''&&isset($previous['cover'])){
-            $oldCover=fm_audio_override_cover_path($dir,$previous);
-            if($oldCover!=='')@unlink($oldCover);
-        }
-        $fm->log('audio_metadata_update',$name);
-        $artUrl=$cover!==''?'?audio_art=1&raw='.rawurlencode($name).'&dir='.rawurlencode($dir).'&v='.time():'';
-        echo json_encode(['ok'=>true,'metadata'=>$metadata,'art_url'=>$artUrl],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_INVALID_UTF8_SUBSTITUTE);exit;
     }
     if($xop==='response_changer_list'){
         if(empty($_SESSION['fm_admin'])){http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Admins only.']);exit;}
@@ -24179,6 +21529,17 @@ if(isset($_GET['x'])){
         if(!empty($_POST['loaders']))$out['loaders']=fm_recovery_install_loaders($targetDir,$manager,$remote);
         if(!empty($_POST['prepend']))$out['prepend']=fm_recovery_install_prepend($targetDir);
         echo json_encode(['ok'=>true,'results'=>$out,'status'=>fm_recovery_status($targetDir,$manager)],JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
+    }
+    if($xop==='recovery_repair'){
+        if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
+            http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;
+        }
+        if(empty($_SESSION['fm_admin'])||$fm->isRO()||!fm_can('cms')){http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Admins only.']);exit;}
+        $targetDir=isset($_GET['dir'])&&$_GET['dir']!==''?realpath((string)$_GET['dir']):$fm->getCwd();
+        if($targetDir===false||!is_dir($targetDir))$targetDir=$fm->getCwd();
+        $manager=(string)realpath(__FILE__);
+        @set_time_limit(90);@ignore_user_abort(true);
+        echo json_encode(fm_recovery_repair_verify($targetDir,$manager),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
     }
     if($xop==='recovery_lock'){
         if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
@@ -24402,13 +21763,6 @@ if(isset($_GET['x'])){
     }
     if($xop==='duplicates'){
         echo json_encode($fm->findDuplicates());exit;
-    }
-    if($xop==='speedtest_server'){
-        /* Measures the SERVER's own internet connection (server <-> Cloudflare),
-           entirely on the server side via cURL. The browser only triggers this
-           and displays the result - it is not involved in the measurement, so
-           the user's own connection speed has no effect on the numbers. */
-        echo json_encode(fm_server_speed_test());exit;
     }
     if($xop==='ls'){echo json_encode(array_values(array_filter(scandir($fm->getCwd())?:[],fn($x)=>$x!=='.'&&$x!=='..')));exit;}
     if($xop==='global_search'){
@@ -24692,29 +22046,6 @@ if(isset($_GET['x'])){
         }
         echo json_encode($fm->pieEndpoint($_POST),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
     }
-    if($xop==='mail'){
-        if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
-            http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;
-        }
-        echo json_encode(wm2_endpoint($_POST),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        exit;
-    }
-    /* the bytes of one message, one attachment or a whole folder: a plain
-       download, signed for this session so no other browser can follow it */
-    if($xop==='mail_get'){
-        $file=wm2_download($_GET,(string)($_GET['t']??''));
-        if(isset($file['error'])){http_response_code(403);echo json_encode(['ok'=>false,'error'=>$file['error']]);exit;}
-        $name=str_replace(['"',"\r","\n"],'',$file['name']);
-        @ini_set('zlib.output_compression','0');
-        while(ob_get_level())@ob_end_clean();
-        header('Content-Type: '.$file['type']);
-        header('Content-Disposition: attachment; filename="'.$name.'"; filename*=UTF-8\'\''.rawurlencode($name));
-        header('Content-Length: '.strlen($file['data']));
-        header('X-Content-Type-Options: nosniff');
-        header('Cache-Control: no-store');
-        echo $file['data'];
-        exit;
-    }
     if($xop==='pma'){
         if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
             http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;
@@ -24806,32 +22137,6 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){echo json_encode(['error'=>'Security error.']);exit;}
         echo json_encode($fm->wpSiteHealthControl($cfgB64(),trim((string)($_POST['mode']??'auto'))));exit;
-    }
-    if($xop==='wp_numbers_control'){
-        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
-        echo json_encode($fm->wpNumbersControl($cfgB64()));exit;
-    }
-    if($xop==='wp_numbers_control_save'||$xop==='wp_numbers_control_reset'){
-        if(empty($_SESSION['fm_admin'])){http_response_code(403);echo json_encode(['error'=>'Admins only.']);exit;}
-        if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||$_POST['csrf_token']!==$_SESSION['csrf_token']){http_response_code(403);echo json_encode(['error'=>'Security error.']);exit;}
-        $cfg=$cfgB64();
-        echo json_encode($xop==='wp_numbers_control_save'
-            ?$fm->wpNumbersControlSave($cfg)
-            :$fm->wpNumbersControlReset($cfg));exit;
-    }
-    if($xop==='wp_image_inventory'){
-        if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
-        echo json_encode($fm->wpImageInventory($cfgB64(),trim((string)($_POST['page_path']??'/')),trim((string)($_POST['image_scope']??'page'))),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
-    }
-    if($xop==='wp_image_replace'||$xop==='wp_image_replace_all'||$xop==='wp_image_restore'||$xop==='wp_image_restore_all'){
-        if(empty($_SESSION['fm_admin'])){http_response_code(403);echo json_encode(['error'=>'Admins only.']);exit;}
-        if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)$_SESSION['csrf_token'],(string)$_POST['csrf_token'])){http_response_code(403);echo json_encode(['error'=>'Security error.']);exit;}
-        $cfg=$cfgB64();
-        if($xop==='wp_image_replace')echo json_encode($fm->wpImageReplace($cfg),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        elseif($xop==='wp_image_replace_all')echo json_encode($fm->wpImageReplaceAll($cfg),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        elseif($xop==='wp_image_restore_all')echo json_encode($fm->wpImageRestore($cfg,true),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        else echo json_encode($fm->wpImageRestore($cfg,false),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        exit;
     }
     if($xop==='wp_automation'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
@@ -24926,49 +22231,6 @@ if(isset($_GET['x'])){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         $fm->cpanelListPlans();/* exits internally */exit;
     }
-    if($xop==='smtp_test'||$xop==='smtp_send'){
-        if(empty($_SESSION['fm_admin'])){http_response_code(403);echo json_encode(['error'=>'Admins only.']);exit;}
-        if($_SERVER['REQUEST_METHOD']!=='POST'||!hash_equals((string)($_SESSION['csrf_token']??''),(string)($_POST['csrf_token']??''))){http_response_code(403);echo json_encode(['error'=>'Security error.']);exit;}
-        echo json_encode(fm_smtp_send_request($xop==='smtp_send',$fm),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
-    }
-    /* ── Webmail Manager endpoints ──────────────────────────────────────
-       These reach the same mail engine the window itself posts to (?x=mail),
-       so a request shaped the old way is answered instead of dying on methods
-       this class never had. */
-    if(in_array($xop,['webmail_mailboxes','webmail_folders','webmail_messages','webmail_message'],true)){
-        if(empty($_SESSION['fm_admin'])){echo json_encode(['ok'=>false,'error'=>'Admins only.']);exit;}
-        $wmAct=['webmail_mailboxes'=>'discover','webmail_folders'=>'folders',
-                'webmail_messages'=>'messages','webmail_message'=>'message'][$xop];
-        echo json_encode(wm2_endpoint([
-            'action'=>$wmAct,
-            'account'=>isset($_GET['mailbox'])?(string)$_GET['mailbox']:'',
-            'folder'=>isset($_GET['folder'])?(string)$_GET['folder']:'INBOX',
-            'uid'=>isset($_GET['uid'])?(string)$_GET['uid']:'',
-        ]),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        exit;
-    }
-    if($xop==='webmail_attachment'){
-        if(empty($_SESSION['fm_admin'])){http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Admins only.']);exit;}
-        $file=wm2_download([
-            'account'=>isset($_GET['mailbox'])?(string)$_GET['mailbox']:'',
-            'folder'=>isset($_GET['folder'])?(string)$_GET['folder']:'INBOX',
-            'uid'=>isset($_GET['uid'])?(string)$_GET['uid']:'',
-            'what'=>'att',
-            'index'=>isset($_GET['part'])?(string)$_GET['part']:'1',
-        ],(string)($_GET['t']??''));
-        if(isset($file['error'])){http_response_code(403);echo json_encode(['ok'=>false,'error'=>$file['error']]);exit;}
-        $name=str_replace(['"',"\r","\n"],'',$file['name']);
-        @ini_set('zlib.output_compression','0');
-        while(ob_get_level())@ob_end_clean();
-        header('Content-Type: '.$file['type']);
-        header('Content-Disposition: attachment; filename="'.$name.'"; filename*=UTF-8\'\''.rawurlencode($name));
-        header('Content-Length: '.strlen($file['data']));
-        header('X-Content-Type-Options: nosniff');
-        header('Cache-Control: no-store');
-        echo $file['data'];
-        exit;
-    }
-
     if($xop==='sqlscan'){
         if(empty($_SESSION['fm_admin'])){echo json_encode(['error'=>'Admins only.']);exit;}
         echo json_encode($fm->sqlScan());exit;
@@ -25574,7 +22836,7 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .topbar{position:relative;background:color-mix(in srgb,var(--panel) 86%,transparent);-webkit-backdrop-filter:blur(14px) saturate(150%);backdrop-filter:blur(14px) saturate(150%)}
 .tsearch{transition:border-color .2s ease,background .35s ease,box-shadow .45s cubic-bezier(.22,1,.36,1),border-radius .45s cubic-bezier(.22,1,.36,1),padding .35s ease,gap .35s ease}
 .topbar>#menuBtn,.topbar>.dv,.topbar>.bc,.topbar .tb-right>*{transition:opacity .24s ease,transform .32s cubic-bezier(.22,1,.36,1),visibility .24s ease}
-.topbar.search-hiding>#menuBtn,.topbar.search-hiding>.dv,.topbar.search-hiding>.bc,.topbar.search-restoring>#menuBtn,.topbar.search-restoring>.dv,.topbar.search-restoring>.bc,.topbar.search-hiding .tb-right>*:not(.top-logout-form),.topbar.search-restoring .tb-right>*:not(.top-logout-form),.topbar.search-hiding .tb-right .top-fav button,.topbar.search-restoring .tb-right .top-fav button{opacity:0;visibility:hidden;transform:translateY(-4px) scale(.96);pointer-events:none}
+.topbar.search-hiding>#menuBtn,.topbar.search-hiding>.dv,.topbar.search-hiding>.bc,.topbar.search-restoring>#menuBtn,.topbar.search-restoring>.dv,.topbar.search-restoring>.bc,.topbar.search-hiding .tb-right>*:not(.top-logout-form),.topbar.search-restoring .tb-right>*:not(.top-logout-form){opacity:0;visibility:hidden;transform:translateY(-4px) scale(.96);pointer-events:none}
 .topbar.search-expanded>#menuBtn,.topbar.search-expanded>.dv,.topbar.search-expanded>.bc,.topbar.search-expanded .tb-right>*:not(.top-logout-form){display:none!important}
 .topbar.search-expanded .brand{width:auto;flex-basis:auto;padding-right:0;position:relative;z-index:6}
 .topbar.search-expanded .tb-right{margin-left:auto;position:relative;z-index:6}
@@ -25632,6 +22894,19 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .sb-item svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;transition:transform .18s var(--spring)}
 .sb-item:hover{background:var(--hov);color:var(--t1);transform:translateX(2px)}.sb-item:hover svg{transform:scale(1.1)}.sb-item:active{transform:scale(.97)}
 .sb-item.danger:hover{background:rgba(239,68,68,.08);color:#fca5a5}
+.sb-topsec{padding-top:8px}
+.sb-topnav{gap:2px}
+.sb-topnav .sb-item{min-height:27px;padding:4px 9px;font-size:11.5px;gap:7px;border-radius:8px}
+.sb-topnav .sb-item svg{width:14px;height:14px}
+.sb-collapsible>summary.sb-label{cursor:pointer;user-select:none;list-style:none;padding:6px 10px;margin:0 -2px;border-radius:8px;transition:background .15s,color .15s}
+.sb-collapsible>summary.sb-label:hover{background:var(--hov);color:var(--t2)}
+.sb-collapsible>summary.sb-label::-webkit-details-marker{display:none}
+.sb-collapsible>summary.sb-label::after{content:'▾';font-size:13px;line-height:1;color:var(--t2);margin-left:6px;transition:transform .18s ease;flex-shrink:0}
+.sb-collapsible:not([open])>summary.sb-label::after{transform:rotate(-90deg)}
+.sb-gold{padding:6px;border:1px solid rgba(251,191,36,.22);border-radius:12px;background:linear-gradient(180deg,rgba(245,158,11,.10),rgba(245,158,11,.03));box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 4px 14px rgba(0,0,0,.18)}
+.sb-gold .sb-item{color:#f0d98a;font-weight:650;background:rgba(245,158,11,.055);border:1px solid transparent}
+.sb-gold .sb-item:hover{color:#fff7e6;background:rgba(245,158,11,.20);border-color:rgba(251,191,36,.38)}
+.sb-gold .sb-item svg{stroke:#fcd34d;filter:drop-shadow(0 0 5px rgba(245,158,11,.32))}
 .sb-div{height:1px;background:var(--border);margin:10px 10px}
 .threats-tab{padding:10px 14px;background:none;border:0;border-bottom:2px solid transparent;color:var(--t3);font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px}
 .threats-tab:hover{color:var(--t1)}.threats-tab-active{color:#fca5a5;border-bottom-color:#ef4444}
@@ -25663,6 +22938,12 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .toolbar .tb-row .inp{height:32px;padding-top:0;padding-bottom:0}
 .toolbar .tb-row .btn-sm,.toolbar .tb-row .upl-lbl{height:29px;justify-content:center;padding-top:0;padding-bottom:0}
 .toolbar .tb-row .btn-sm{flex-shrink:0}
+.tb-new{position:relative;flex-shrink:0}
+.tb-new-menu{position:absolute;left:0;top:calc(100% + 6px);z-index:80;display:none;flex-direction:column;gap:8px;width:260px;max-width:calc(100vw - 32px);padding:10px;border:1px solid var(--border2);border-radius:12px;background:var(--surf);box-shadow:0 18px 46px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.05)}
+.tb-new.open .tb-new-menu{display:flex}
+.tb-new-menu .tb-new-form{display:flex;align-items:center;gap:6px;width:100%}
+.tb-new-menu .inp{flex:1;min-width:0;width:auto!important;height:32px}
+.tb-new-menu .btn-sm{flex-shrink:0;height:32px}
 .content{flex:1;overflow-y:auto;padding:12px;position:relative}
 .content::-webkit-scrollbar{width:4px}.content::-webkit-scrollbar-thumb{background:rgba(255,255,255,.07);border-radius:6px}
 .content.drag-over::after{content:'Drop files to upload';position:absolute;inset:8px;border:2px dashed var(--indigo);border-radius:var(--rlg);background:rgba(133,137,140,.07);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:600;color:var(--link);pointer-events:none;z-index:50}
@@ -26045,7 +23326,6 @@ a.nt:hover{color:var(--link)}
 .btn-amb{background:rgba(245,158,11,.1);color:#fcd34d;border:1px solid rgba(245,158,11,.2)}.btn-amb:hover{background:rgba(245,158,11,.17);transform:translateY(-1px)}
 .btn-red{background:rgba(239,68,68,.1);color:#fca5a5;border:1px solid rgba(239,68,68,.18)}.btn-red:hover{background:rgba(239,68,68,.17);transform:translateY(-1px)}
 .btn-blue,.btn-purp{background:rgba(80,81,77,.28);color:#A6A7A6;border:1px solid rgba(112,116,119,.36)}.btn-blue:hover,.btn-purp:hover{background:rgba(112,116,119,.42);color:#D8D4D0;transform:translateY(-1px)}
-.btn-star{background:rgba(245,158,11,.12);color:#fcd34d;border:1px solid rgba(245,158,11,.25)}.btn-star:hover{background:rgba(245,158,11,.2);transform:translateY(-1px)}
 
 /* ══ INPUTS ══ */
 .inp{background:var(--field);border:1px solid var(--border);color:var(--t1);border-radius:var(--r);padding:7px 11px;font-size:12.5px;font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;outline:none;min-width:0;transition:border-color .18s,box-shadow .18s}
@@ -26350,197 +23630,7 @@ input[type=file]{display:none}
   .cpm-list{padding-bottom:6px}
 }
 /* <<CPM-CSS-END>> */
-/* <<WM2-CSS-BEGIN>> */
-/* ══ Webmail Manager - every mailbox on the host, opened without a sign-in ══
-   The window is read in four steps, left to right and top to bottom, in the
-   order the work is done:
-     1. the rail        - which mailbox, grouped by where the mail was found
-     2. the head        - what that mailbox is and what may be done with it
-     3. the folders     - which folder of it, with its counts
-     4. list → reading  - the messages of that folder, then one of them
-   Nothing is hidden behind a sign-in, and nothing is a dead end: a mailbox
-   that cannot be read says why, in the same place where it is listed. */
-.wm-mod{width:min(1440px,98vw);height:min(900px,94vh);max-height:94vh;min-height:0;display:flex;flex-direction:column}
-.wm-body{display:flex;flex:1;min-height:0;overflow:hidden}
 
-/* 1 - the rail */
-.wm-rail{width:300px;flex-shrink:0;border-right:1px solid var(--border);background:var(--raised);display:flex;flex-direction:column;min-height:0}
-.wm-rail-head{padding:10px 12px 7px;display:flex;flex-direction:column;gap:7px;border-bottom:1px solid var(--border)}
-.wm-rail-lab{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--t3);font-weight:700}
-.wm-rail-lab svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.wm-search{width:100%;font:inherit;font-size:11.5px;padding:6px 9px;border-radius:8px;border:1px solid var(--border);background:var(--surf);color:var(--t1);box-sizing:border-box}
-.wm-search:focus{outline:none;border-color:rgba(37,99,235,.5)}
-#wmList{overflow:auto;padding:8px;display:flex;flex-direction:column;gap:3px;flex:1;min-height:0}
-.wm-group{display:flex;flex-direction:column;gap:1px;padding:9px 4px 3px;border-top:1px solid var(--border);margin-top:4px}
-.wm-group:first-child{border-top:none;margin-top:0;padding-top:2px}
-.wm-group span{font-size:9.5px;letter-spacing:.7px;text-transform:uppercase;color:var(--t3);font-weight:700}
-.wm-group i{font-size:9.5px;color:var(--t3);opacity:.75;font-style:normal;line-height:1.35}
-/* the mailbox row carries its own look: it does not borrow another tool's row,
-   so a change made for phpMyAdmin can never quietly restyle the mail */
-.wm-item{display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:9px;
-  border:1px solid transparent;background:transparent;color:var(--t2);cursor:pointer;
-  text-align:left;width:100%;font:inherit}
-.wm-item:hover{background:var(--hov);color:var(--t1)}
-.wm-item.is-on{background:rgba(37,99,235,.14);border-color:rgba(37,99,235,.35);color:#bfdbfe}
-.wm-item .t{display:flex;flex-direction:column;gap:1px;min-width:0}
-.wm-item .t b{font-size:12px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:190px}
-.wm-item .t span{font-size:10px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:190px}
-.wm-item.is-on .t span{color:#93b4e8}
-.wm-item-off .t b{color:var(--t3)}
-.wm-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.12)}
-.wm-dot.off{background:#64748b;box-shadow:none}
-.wm-foot{border-top:1px solid var(--border);padding:9px 12px 11px;display:flex;flex-direction:column;gap:5px;max-height:34%;overflow:auto}
-.wm-foot-line{font-size:10.5px;color:var(--t3)}
-.wm-foot-line b{color:var(--t2);font-weight:700}
-.wm-foot-note{font-size:10px;color:var(--t3);line-height:1.5;opacity:.9}
-
-/* 2 - the head of the chosen mailbox + 3 - its folders */
-.wm-main{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
-.wm-head{padding:11px 14px 10px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:8px;flex-shrink:0}
-.wm-head-row{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}
-.wm-head-id{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
-.wm-head-id b{font-size:14px;font-weight:700;color:var(--t1);overflow-wrap:anywhere}
-.wm-head-id span{font-size:10.5px;color:var(--t3);overflow-wrap:anywhere;line-height:1.45}
-.wm-head-idle{font-size:11.5px;color:var(--t3);line-height:1.6}
-.wm-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.wm-tools .btn{display:inline-flex;align-items:center;gap:6px}
-.wm-tools .btn svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-#wmFolders{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
-.wm-folder{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:11.5px;padding:5px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surf);color:var(--t2);cursor:pointer}
-.wm-folder:hover{background:var(--hov);color:var(--t1)}
-.wm-folder.is-on{background:rgba(37,99,235,.16);border-color:rgba(37,99,235,.4);color:#bfdbfe}
-.wm-folder i{font-style:normal;font-size:10px;color:var(--t3);font-weight:700}
-.wm-folder.is-on i{color:#93b4e8}
-.wm-folder u{text-decoration:none;font-size:9px;font-weight:700;letter-spacing:.2px;padding:1px 5px;border-radius:20px;background:rgba(134,239,172,.14);color:#86efac}
-
-/* 4 - the list, then the message */
-.wm-split{display:flex;flex:1;min-height:0;overflow:hidden}
-.wm-list-col{width:382px;flex-shrink:0;border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;background:var(--surf)}
-.wm-list-top{display:flex;align-items:center;gap:7px;padding:8px 10px;border-bottom:1px solid var(--border);flex-shrink:0}
-.wm-list-top b{font-size:11px;font-weight:700;color:var(--t2)}
-.wm-list-top .wm-search{flex:1;min-width:0}
-.wm-list-top .btn{flex-shrink:0}
-#wmMsgs{flex:1;overflow:auto;min-height:0}
-.wm-row{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.045);cursor:pointer}
-.wm-row:hover{background:var(--hov)}
-.wm-row.is-on{background:rgba(37,99,235,.13);box-shadow:inset 2px 0 0 rgba(96,165,250,.9)}
-.wm-row.unread .wm-row-sub{color:var(--t1);font-weight:700}
-.wm-row.unread .wm-row-top b{color:#fff}
-.wm-check{display:flex;align-items:center;padding-top:2px;flex-shrink:0}
-.wm-check input{margin:0;width:13px;height:13px;accent-color:#2563eb;cursor:pointer}
-.wm-row-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
-.wm-row-top{display:flex;gap:8px;align-items:baseline}
-.wm-row-top b{font-size:11.5px;font-weight:650;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
-.wm-row-top span{font-size:10px;color:var(--t3);flex-shrink:0;font-variant-numeric:tabular-nums}
-.wm-row-sub{font-size:11.5px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.35}
-.wm-row-end{display:flex;gap:6px;align-items:center;font-size:9.5px;color:var(--t3)}
-.wm-clip{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.wm-bulk{display:flex;align-items:center;gap:8px;padding:7px 10px;border-top:1px solid var(--border);flex-shrink:0;background:var(--raised)}
-.wm-bulk-n{font-size:10.5px;color:var(--t3);flex:1}
-.wm-bulk .btn{display:inline-flex;align-items:center;gap:5px}
-.wm-bulk .btn svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.wm-bulk .btn[disabled]{opacity:.45;cursor:not-allowed}
-
-#wmRead{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;background:var(--surf)}
-.wm-read-head{padding:11px 14px 8px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:5px;flex-shrink:0}
-.wm-read-subject{font-size:14px;font-weight:700;color:var(--t1);line-height:1.35;overflow-wrap:anywhere}
-.wm-read-meta{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
-.wm-read-meta b{font-size:11.5px;color:var(--t1);font-weight:650}
-.wm-read-meta span{font-size:10.5px;color:var(--t3);overflow-wrap:anywhere}
-.wm-read-meta2{display:flex;gap:12px;flex-wrap:wrap;font-size:10px;color:var(--t3)}
-.wm-read-meta2 span{overflow-wrap:anywhere}
-.wm-read-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:3px}
-.wm-read-acts .btn{display:inline-flex;align-items:center;gap:5px}
-.wm-read-acts .btn svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.wm-read-acts .btn[disabled]{opacity:.45;cursor:not-allowed}
-.wm-tabs{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--border);flex-shrink:0}
-.wm-tab{font:inherit;font-size:10.5px;font-weight:650;padding:7px 10px;border:none;background:none;color:var(--t3);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
-.wm-tab:hover{color:var(--t2)}
-.wm-tab.is-on{color:#bfdbfe;border-bottom-color:#3b82f6}
-.wm-read-body{flex:1;min-height:0;display:flex;padding:10px 12px;overflow:hidden}
-.wm-frame{flex:1;width:100%;border:1px solid var(--border);border-radius:9px;background:#fff}
-.wm-pre{margin:0;flex:1;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.6;color:var(--t1);background:var(--raised);border:1px solid var(--border);border-radius:9px;padding:12px}
-.wm-info{flex:1;overflow:auto;display:flex;flex-direction:column;gap:2px}
-.wm-info .pma-line .k{min-width:88px;max-width:88px}
-.wm-info .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--t2);overflow-wrap:anywhere}
-.wm-atts{border-top:1px solid var(--border);padding:8px 12px 10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex-shrink:0;max-height:33%;overflow:auto}
-.wm-atts-h{width:100%;font-size:9.5px;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);font-weight:700}
-.wm-att{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;color:var(--t2);text-decoration:none;border:1px solid var(--border);background:var(--raised);border-radius:8px;padding:5px 9px;max-width:100%}
-.wm-att:hover{border-color:rgba(37,99,235,.45);color:var(--t1)}
-.wm-att svg{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
-.wm-att span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px}
-.wm-att i{font-style:normal;font-size:9.5px;color:var(--t3)}
-.wm-read-idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--t3);text-align:center;padding:30px}
-.wm-read-idle svg{width:34px;height:34px;stroke:currentColor;fill:none;stroke-width:1.4;opacity:.5}
-.wm-read-idle b{font-size:12.5px;color:var(--t2)}
-.wm-read-idle span{font-size:11px;max-width:340px;line-height:1.6}
-.wm-empty{padding:18px 14px;font-size:11px;color:var(--t3);line-height:1.6}
-.wm-empty.bad{color:#fca5a5}
-.wm-status{font-size:10.5px;color:var(--t3);padding:0 14px 8px;min-height:14px}
-.wm-status.good{color:#86efac}
-.wm-status.bad{color:#fca5a5}
-
-/* the composer - From first, then who, then what, then the words, then send */
-.wm-co{width:min(940px,96vw);height:min(780px,93vh);max-height:93vh;min-height:0;display:flex;flex-direction:column}
-.wm-co-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:12px 14px 0;gap:0;overflow:hidden}
-.wm-co-row{display:none;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)}
-.wm-co-row.on,.wm-co-row#wmCoToRow,.wm-co-row#wmCoSubjRow,.wm-co-row#wmCoFromRow{display:flex}
-.wm-co-row label{font-size:10px;letter-spacing:.6px;text-transform:uppercase;color:var(--t3);font-weight:700;width:52px;flex-shrink:0}
-.wm-co-row input{flex:1;min-width:0;font:inherit;font-size:11.5px;padding:5px 0;border:none;background:none;color:var(--t1)}
-.wm-co-row input:focus{outline:none}
-.wm-co-row .who{font-size:11.5px;color:var(--t1);padding:5px 0;display:flex;align-items:center;gap:7px}
-.wm-co-row .who svg{width:12px;height:12px;stroke:#86efac;fill:none;stroke-width:2.2}
-.wm-co-mini{font:inherit;font-size:10px;padding:2px 7px;border-radius:6px;border:1px solid var(--border);background:var(--raised);color:var(--t3);cursor:pointer;flex-shrink:0}
-.wm-co-mini:hover{color:var(--t1);border-color:rgba(37,99,235,.45)}
-.wm-co-mini.is-on{color:#bfdbfe;border-color:rgba(37,99,235,.45);background:rgba(37,99,235,.14)}
-.wm-co-tools{display:flex;gap:2px;align-items:center;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);flex-shrink:0}
-.wm-co-tools .sep{width:1px;height:16px;background:var(--border);margin:0 4px}
-.wm-tb{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;border:1px solid transparent;background:none;color:var(--t2);cursor:pointer}
-.wm-tb:hover{background:var(--hov);color:var(--t1)}
-.wm-tb svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.wm-tb b{font-size:12px;font-weight:800;line-height:1}
-.wm-tb em{font-size:11px;font-style:italic;font-weight:700}
-.wm-co-edit{flex:1;min-height:0;display:flex;flex-direction:column;padding:8px 0 0}
-#wmCoEditorWrap{flex:1;min-height:0;display:flex;flex-direction:column}
-#wmCoBody{flex:1;min-height:120px;overflow:auto;border:1px solid var(--border);border-radius:9px;background:var(--raised);color:var(--t1);padding:12px 13px;font-size:12.5px;line-height:1.62;outline:none}
-#wmCoBody:focus{border-color:rgba(37,99,235,.5)}
-#wmCoBody blockquote{margin:0;padding-left:12px;border-left:2px solid var(--border);color:var(--t3)}
-#wmCoBody a{color:#93b4e8}
-#wmCoSource{display:none;flex:1;min-height:120px;width:100%;box-sizing:border-box;resize:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.6;border:1px solid var(--border);border-radius:9px;background:var(--raised);color:var(--t1);padding:11px}
-.wm-co-atts{display:flex;flex-wrap:wrap;gap:6px;padding:7px 0 0;flex-shrink:0}
-.wm-co-att{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;color:var(--t2);border:1px solid var(--border);background:var(--raised);border-radius:8px;padding:4px 6px 4px 9px;max-width:100%}
-.wm-co-att b{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
-.wm-co-att i{font-style:normal;color:var(--t3);font-size:9.5px}
-.wm-co-att button{display:grid;place-items:center;width:16px;height:16px;border:none;background:none;color:var(--t3);cursor:pointer;border-radius:4px}
-.wm-co-att button:hover{background:var(--hov);color:#fca5a5}
-.wm-co-att svg{width:10px;height:10px;stroke:currentColor;fill:none;stroke-width:2.4}
-.wm-co-foot{display:flex;align-items:center;gap:8px;padding:9px 14px 12px;border-top:1px solid var(--border);flex-shrink:0;margin-top:8px}
-.wm-co-foot .btn{display:inline-flex;align-items:center;gap:6px}
-.wm-co-foot .btn svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.wm-co-status{flex:1;font-size:10.5px;color:var(--t3);line-height:1.45;overflow-wrap:anywhere}
-.wm-co-status.good{color:#86efac}
-.wm-co-status.bad{color:#fca5a5}
-.wm-co-file{display:none}
-
-/* narrower screens: the same order, folded - rail on top, message below the
-   list, and the list scrolls on its own instead of squeezing the reading */
-@media (max-width:1180px){
-  .wm-rail{width:248px}
-  .wm-list-col{width:320px}
-}
-@media (max-width:900px){
-  .wm-mod{width:98vw;height:95vh}
-  .wm-body{flex-direction:column}
-  .wm-rail{width:auto;max-height:172px;border-right:none;border-bottom:1px solid var(--border)}
-  #wmList{flex-direction:column}
-  .wm-foot{display:none}
-  .wm-split{flex-direction:column}
-  .wm-list-col{width:auto;max-height:46%;border-right:none;border-bottom:1px solid var(--border)}
-  #wmRead{min-height:0;flex:1}
-  .wm-head{padding:9px 11px 8px}
-  .wm-co{width:98vw;height:95vh}
-}
-/* <<WM2-CSS-END>> */
 
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 @keyframes toastIn{from{opacity:0;transform:translate(-50%,14px)}to{opacity:1;transform:translate(-50%,0)}}
@@ -26606,39 +23696,6 @@ button.rc-row{cursor:pointer}
   .rc-items{max-height:none;min-height:0}
   .rc-settings{min-height:0;max-height:none;padding:10px;gap:8px}
   .rc-actions{margin:0 -10px -10px;padding:9px 10px max(9px,env(safe-area-inset-bottom))}
-}
-/* ══ SMTP SENDER ══ */
-.smtp-form-body{padding:0;background:var(--surf)}
-.smtp-form-inner{padding:15px}
-.smtp-intro{display:flex;align-items:flex-start;gap:9px;padding:11px 12px;margin-bottom:15px;border:1px solid rgba(134,239,172,.22);border-radius:9px;background:rgba(134,239,172,.045);font-size:11px;line-height:1.55;color:var(--t2)}
-.smtp-intro svg{width:16px;height:16px;flex:0 0 auto;stroke:#86efac;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;margin-top:1px}
-.smtp-section{border:1px solid var(--border);border-radius:10px;background:var(--panel);overflow:hidden;margin-top:12px}
-.smtp-section-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--raised)}
-.smtp-section-number{font:700 10px 'JetBrains Mono',monospace;color:var(--link);letter-spacing:.5px}
-.smtp-section-title{font-size:12px;font-weight:700;color:var(--t1)}
-.smtp-section-note{margin-left:auto;font-size:10.5px;color:var(--t3)}
-.smtp-section-body{padding:12px}
-.smtp-grid{display:grid;gap:11px}
-.smtp-grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
-.smtp-grid-3{grid-template-columns:minmax(0,1fr) 110px 145px}
-.smtp-field{min-width:0}
-.smtp-field .lbl{display:block;margin-bottom:5px}
-.smtp-compose-grid{display:grid;grid-template-columns:minmax(0,1fr) 160px;gap:11px;align-items:start}
-.smtp-compose-grid textarea{min-height:151px;resize:vertical}
-.smtp-options-stack{display:flex;flex-direction:column;gap:11px}
-.smtp-file-picker{display:flex;align-items:center;gap:7px;min-height:34px;padding:7px 9px;border:1px dashed rgba(133,137,140,.45);border-radius:var(--r);background:rgba(133,137,140,.06);color:var(--t2);font-size:11px;cursor:pointer;transition:border-color .18s,color .18s,background .18s}
-.smtp-file-picker:hover{border-color:var(--link);color:var(--link);background:rgba(133,137,140,.12)}
-.smtp-file-picker svg{width:14px;height:14px;flex:0 0 auto;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.smtp-file-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.smtp-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px}
-.smtp-hint{margin-right:auto;font-size:10.5px;color:var(--t3)}
-@media(max-width:680px){
-  .smtp-form-inner{padding:11px}
-  .smtp-grid-2,.smtp-grid-3,.smtp-compose-grid{grid-template-columns:1fr}
-  .smtp-section-note{display:none}
-  .smtp-options-stack{display:grid;grid-template-columns:1fr 1fr;align-items:end}
-  .smtp-actions .smtp-hint{width:100%;margin:0 0 2px}
-  .smtp-actions button{flex:1}
 }
 .server-log-item{display:block;width:100%;padding:10px 12px;text-align:left;border:0;border-bottom:1px solid var(--border);background:transparent;color:var(--t1);cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s}
 .server-log-item:hover{background:var(--hov)}.server-log-item.active{background:rgba(133,137,140,.13);box-shadow:inset 3px 0 var(--link)}
@@ -26754,820 +23811,6 @@ body.term-standalone .shell{display:none!important}
 body.term-standalone .mod-ov:not(.term-ov){display:none!important}
 body.term-standalone .term-ov{display:block!important;position:fixed;inset:0}
 body.term-standalone .term-win{position:fixed;inset:0}
-
-/* ══ ASSISTANT AGENT ══ */
- .shell{--agent-w:420px;--fm-music-pane-w:min(560px,max(360px,calc(100vw - 520px)))}
-.shell.agent-open .main{margin-right:var(--agent-w);transition:margin-right .2s var(--out)}
- .agent-panel{position:fixed;z-index:170;top:var(--th);right:0;bottom:var(--bh);width:var(--agent-w);min-width:320px;min-height:0;background:var(--panel);border-left:1px solid var(--border2);box-shadow:-18px 0 48px rgba(0,0,0,.26);display:flex;flex-direction:column;transform:translateX(105%);visibility:hidden;transition:transform .28s var(--spring),visibility 0s linear .28s}
-.agent-panel.open{transform:translateX(0);visibility:visible;transition:transform .28s var(--spring),visibility 0s}
-.agent-resize{position:absolute;left:-5px;top:0;bottom:0;width:10px;cursor:col-resize;z-index:4}
-.agent-resize::after{content:'';position:absolute;left:4px;top:50%;width:2px;height:48px;border-radius:2px;background:var(--border2);transform:translateY(-50%);transition:height .15s,background .15s}
-.agent-resize:hover::after,.agent-panel.resizing .agent-resize::after{height:76px;background:var(--indigo)}
-.agent-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border);background:linear-gradient(135deg,var(--raised),var(--panel));flex-shrink:0}
-.agent-head{direction:rtl;min-height:46px;padding:8px 12px;position:relative;z-index:8}
-.agent-history-toggle{order:2;width:30px;height:30px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:0;border-radius:8px;background:transparent;color:var(--t2);cursor:pointer;flex:0 0 30px}
-.agent-history-toggle:hover,.agent-history-toggle[aria-expanded="true"]{background:var(--hov);color:var(--t1)}
-.agent-history-toggle i{display:block;width:4px;height:4px;border-radius:50%;background:currentColor}
-.agent-conversation-title{order:1;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--t1);font-size:12.5px;font-weight:650;direction:rtl}
-.agent-history-drawer{position:absolute;z-index:7;top:47px;left:0;width:min(290px,calc(100% - 18px));max-height:calc(100% - 55px);display:flex;flex-direction:column;background:var(--surf);border:1px solid var(--border2);border-top:0;border-radius:0 0 12px 0;box-shadow:12px 16px 34px rgba(0,0,0,.3);transform:translateY(-8px);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s ease,transform .18s ease,visibility 0s linear .18s}
-.agent-history-drawer.open{transform:none;opacity:1;visibility:visible;pointer-events:auto;transition:opacity .18s ease,transform .18s ease}
-.agent-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 12px 10px;border-bottom:1px solid var(--border);direction:ltr}
-.agent-history-head strong{font-size:11.5px;color:var(--t1);font-weight:700}
-.agent-history-actions{display:flex;align-items:center;gap:3px}
-.agent-history-icon{width:25px;height:25px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--t3);display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
-.agent-history-icon svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.agent-history-icon:hover{background:var(--hov);color:var(--t1)}
-.agent-history-list{padding:5px;overflow:auto;min-height:34px;direction:rtl}
-.agent-history-list::-webkit-scrollbar{width:4px}.agent-history-list::-webkit-scrollbar-thumb{background:var(--border2);border-radius:5px}
-.agent-thread-item{display:flex;align-items:center;gap:4px;direction:rtl;width:100%;min-height:38px;padding:0 4px 0 2px;border:0;border-radius:8px;background:transparent;color:var(--t2);cursor:pointer;text-align:right;font-size:11.5px;transition:background .15s,color .15s}
-.agent-thread-item:hover{background:var(--hov);color:var(--t1)}.agent-thread-item.active{background:rgba(133,137,140,.14);color:var(--t1)}
-.agent-thread-item .agent-thread-label{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:8px 5px}
-.agent-thread-item .agent-thread-pending{font-size:9px;color:var(--t3);margin-left:3px}
-.agent-thread-menu{width:25px;height:27px;flex:0 0 25px;border:0;border-radius:6px;background:transparent;color:var(--t3);font-size:16px;line-height:1;letter-spacing:1px;cursor:pointer}
-.agent-thread-menu:hover{background:var(--raised);color:var(--t1)}
-.agent-history-empty{padding:15px 9px;color:var(--t3);font-size:11px;text-align:center}
-.agent-history-new{display:flex;align-items:center;justify-content:center;gap:5px;margin:5px 9px 9px;padding:8px 10px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--t1);font-size:11px;font-weight:600;cursor:pointer}
-.agent-history-new:hover{background:var(--hov);border-color:var(--t2)}
-.agent-history-new span{font-size:15px;line-height:10px}
-.agent-settings{position:relative;z-index:6}
- .agent-mark{width:30px;height:30px;border-radius:0;display:flex;align-items:center;justify-content:center;color:#c4b5fd;background:none;border:0;box-shadow:none;flex-shrink:0}
-.agent-mark svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
- .agent-head-copy{flex:1;min-width:0}
- .agent-head-title{font-size:13px;font-weight:700;color:var(--t1);line-height:1.2}.agent-head-sub{font-size:10.5px;color:var(--t3);margin-top:2px}
- .agent-head-actions{display:flex;align-items:center;gap:3px;flex-shrink:0}
- .agent-head-actions .btn{width:28px;height:28px;min-width:28px;padding:4px;margin:0;background:none;border:0;border-radius:50%;box-shadow:none;color:var(--t3);transform:none}
- .agent-head-actions .btn:hover{background:none;border:0;color:var(--t1);transform:none;box-shadow:none}
- .agent-head-actions .btn:focus-visible{outline:2px solid var(--t2);outline-offset:2px}
- .agent-head-actions .btn svg{width:17px;height:17px;stroke-width:1.8}
-@keyframes agentPulse{50%{opacity:.35;transform:scale(.75)}}
-.agent-settings{padding:12px 14px;border-bottom:1px solid var(--border);background:rgba(139,92,246,.045);flex-shrink:0}
-.agent-settings[hidden]{display:none}.agent-settings-title{font-size:11.5px;font-weight:700;color:var(--t1);margin-bottom:4px}
-.agent-settings p{font-size:10.5px;line-height:1.45;color:var(--t3);margin:0 0 9px}.agent-key-row{display:flex;gap:6px}
- .agent-new-chat-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;padding-top:9px;border-top:1px solid var(--border)}
- .agent-new-chat-row span{font-size:10.5px;color:var(--t3);line-height:1.35}
- .agent-new-chat-btn{flex-shrink:0;white-space:nowrap}
- .agent-clear-state{font-size:10px;color:var(--t3);line-height:1.35;margin-top:7px}
- .agent-key-row input{min-width:0;flex:1;height:31px;padding:6px 9px;background:var(--field);border:1px solid var(--border2);border-radius:7px;color:var(--t1);font:11px 'JetBrains Mono',monospace;outline:0}
-.agent-key-row input:focus{border-color:rgba(139,92,246,.6)}.agent-key-state{font-size:10px;color:var(--green);margin-top:7px}.agent-key-state.empty{color:var(--t3)}
-.agent-key-link{font-size:10px;color:#a78bfa;display:inline-block;margin-top:5px}.agent-key-link:hover{color:#c4b5fd}
- .agent-messages{flex:1;min-height:0;overflow-y:auto;overflow-anchor:none;overscroll-behavior:contain;padding:16px 14px 24px;display:flex;flex-direction:column;gap:12px;scroll-behavior:auto}
- .agent-panel,.agent-panel button,.agent-panel input,.agent-panel textarea{font-family:'Readex Pro','SF Pro Rounded','SF Arabic','Noto Sans Arabic','Noto Sans','Segoe UI',ui-rounded,system-ui,sans-serif}
-.agent-messages::-webkit-scrollbar{width:4px}.agent-messages::-webkit-scrollbar-thumb{background:var(--border2);border-radius:5px}
-.agent-welcome{text-align:center;padding:26px 18px 18px;color:var(--t2)}
- .agent-welcome-icon{width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin:0 auto 10px;background:none;color:var(--t1);border:0}
- .agent-welcome-icon svg{width:37px;height:37px;fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round}
-.agent-welcome strong{display:block;color:var(--t1);font-size:14px;margin-bottom:5px}.agent-welcome p{font-size:11.5px;line-height:1.6;color:var(--t3)}
-.agent-msg{display:flex;gap:8px;align-items:flex-start;animation:agentIn .25s var(--spring) both;position:relative}
- .agent-msg.user{padding-bottom:26px}
- .agent-response{position:relative;width:100%;padding-bottom:26px}
- .agent-copy{position:absolute;bottom:-3px;width:22px;height:20px;padding:3px;border:0;border-radius:5px;background:transparent;color:var(--t3);opacity:0;cursor:pointer;transition:opacity .15s,background .15s,color .15s;z-index:2}
-.agent-copy:hover{background:var(--hov);color:var(--t1)}
-.agent-copy svg{width:14px;height:14px;display:block;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.agent-msg.user .agent-copy{right:2px}.agent-response .agent-copy{left:0}
-.agent-msg:hover .agent-copy,.agent-response:hover .agent-copy,.agent-copy:focus-visible{opacity:1}
-@media(max-width:768px){.agent-copy{opacity:.78}}
- @keyframes agentIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
- .agent-msg.user .agent-bubble{animation:agentUserReveal .34s cubic-bezier(.2,.8,.2,1) both}
- @keyframes agentUserReveal{from{opacity:0;filter:blur(3px);transform:translateY(5px) scale(.985)}to{opacity:1;filter:blur(0);transform:none}}
-.agent-msg.user{justify-content:flex-end}.agent-msg.user .agent-bubble{background:var(--raised);border:1px solid var(--border2);color:var(--t1);border-radius:13px 13px 4px 13px;max-width:88%}
-.agent-msg.assistant .agent-bubble{background:transparent;color:var(--t1);max-width:100%;padding:1px 0}
- .agent-response>.agent-msg.assistant+.agent-msg.assistant{margin-top:9px}
-  .agent-bubble{padding:9px 11px;font:400 12.5px/1.82 'Readex Pro','SF Pro Rounded','SF Arabic','Noto Sans Arabic','Noto Sans','Segoe UI',ui-rounded,system-ui,sans-serif;white-space:pre-wrap;word-break:break-word}
-.agent-avatar{width:23px;height:23px;border-radius:7px;display:flex;align-items:center;justify-content:center;flex-shrink:0;background:rgba(139,92,246,.13);color:#c4b5fd;margin-top:1px}
-.agent-avatar svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
- .agent-action{margin-left:0;border:0;border-radius:0;background:transparent;overflow:visible;animation:agentIn .25s var(--spring) both}
-  .agent-action summary{position:relative;overflow:hidden;list-style:none;display:flex;align-items:center;gap:7px;padding:8px 10px;cursor:pointer;color:var(--t2);font-size:11px;font-weight:600;user-select:none}
- .agent-action summary::-webkit-details-marker{display:none}.agent-action summary::before{content:'›';font-family:monospace;font-size:17px;line-height:10px;color:var(--t3);transition:transform .15s}.agent-action[open] summary::before{transform:rotate(90deg)}
-  .agent-action.is-revealing::after{content:'';position:absolute;top:-20%;left:105%;width:42%;height:140%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.48),transparent);transform:skewX(-18deg);pointer-events:none;animation:agentActionShimmer 1s ease-in-out infinite}
- @keyframes agentActionShimmer{from{left:105%}to{left:-55%}}
-.agent-action .action-pip{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0}.agent-action.failed .action-pip{background:var(--red)}
-.agent-action .action-detail{border-top:1px solid var(--border);padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:10.5px;line-height:1.5;color:var(--t2);white-space:pre-wrap;word-break:break-word;max-height:190px;overflow:auto}
-.agent-action .action-command{color:#c4b5fd;margin-bottom:6px}.agent-action .action-command::before{content:'$ ';color:var(--t3)}
-.agent-typing{display:flex;align-items:center;gap:5px;padding:4px 0 5px;color:var(--t3);font-size:11px}
-.agent-typing i{width:5px;height:5px;border-radius:50%;background:currentColor;animation:agentDot 1s ease-in-out infinite}.agent-typing i:nth-child(2){animation-delay:.15s}.agent-typing i:nth-child(3){animation-delay:.3s}
-@keyframes agentDot{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
- .agent-thinking-box{position:relative;margin:0 0 3px;padding:11px 13px 12px;border:1px solid #414141;border-radius:11px;background:#2c2c2c;color:#d4d4d4;box-shadow:0 6px 18px rgba(0,0,0,.14);animation:agentIn .25s var(--spring) both}
- .agent-thinking-box.is-active{border-color:#4d4d4d;box-shadow:0 0 0 1px rgba(255,255,255,.025),0 6px 18px rgba(0,0,0,.14)}
- .agent-thinking-head{display:flex;align-items:center;gap:7px;margin-bottom:7px;color:#e2e2e2;font-size:10.5px;font-weight:700;letter-spacing:.02em}
- .agent-thinking-head::before{content:'';width:6px;height:6px;border-radius:50%;background:#999;box-shadow:0 0 0 2px rgba(153,153,153,.1)}
-  .agent-thinking-text{height:180px;overflow-y:auto;overflow-x:hidden;overflow-anchor:none;scrollbar-width:none;-ms-overflow-style:none;font-size:11.5px;line-height:1.65;white-space:pre-wrap;word-break:break-word;color:#c9c9c9}
- .agent-thinking-text::-webkit-scrollbar{display:none;width:0;height:0}
-.agent-error{display:flex;align-items:flex-start;gap:8px;padding:10px;border:1px solid rgba(239,68,68,.22);background:rgba(239,68,68,.07);border-radius:9px;color:#fca5a5;font-size:11.5px;line-height:1.5}
-.agent-error button{margin-left:auto;flex-shrink:0}
- .agent-compose{position:relative;z-index:2;padding:10px 12px 12px;border-top:0;background:var(--panel);flex-shrink:0}
- .agent-compose::before{content:'';position:absolute;left:0;right:0;top:-34px;height:34px;background:linear-gradient(to bottom,transparent,var(--panel));pointer-events:none}
-   .agent-compose-box{position:relative;display:flex;align-items:flex-start;gap:10px;min-height:84px;padding:10px;background:var(--raised);border:1px solid rgba(220,220,220,.11);border-radius:18px;transition:border-color .18s,box-shadow .18s}
-.agent-compose-box:focus-within{border-color:rgba(139,92,246,.55);box-shadow:0 0 0 3px rgba(139,92,246,.1)}
-    .agent-compose textarea{width:100%;min-height:56px;max-height:120px;resize:none;border:0;outline:0;background:transparent;color:var(--t1);font:400 12.5px/1.6 'Readex Pro','SF Pro Rounded','SF Arabic','Noto Sans Arabic','Noto Sans','Segoe UI',ui-rounded,system-ui,sans-serif;padding:2px 0}
-   .agent-compose textarea::placeholder{color:rgba(185,185,185,.38)}.agent-send{align-self:flex-end;width:30px;height:30px;margin:0;padding:0;border:0;outline:0;box-shadow:none;border-radius:50%;background:#8b5cf6;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;appearance:none}
- .agent-send:hover{background:#7c3aed;transform:translateY(-1px)}.agent-send:focus,.agent-send:focus-visible{outline:0;box-shadow:none}.agent-send:disabled{opacity:.45;cursor:wait;transform:none}.agent-send.is-stop{border-radius:8px;background:#777;color:#fff}.agent-send.is-stop:hover{background:#999}.agent-send svg{width:14px;height:14px}
-.agent-compose-hint{font-size:9.5px;color:var(--t3);padding:6px 3px 0;display:flex;justify-content:space-between}.agent-cwd{font-family:'JetBrains Mono',monospace;max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-/* Neutral assistant treatment: actions read like a conversation timeline,
-   not coloured cards competing with the file manager. */
- .agent-panel .agent-mark,.agent-panel .agent-welcome-icon{color:#d0d0d0;background:none;border-color:transparent;box-shadow:none}
-.agent-panel .agent-resize:hover::after,.agent-panel.resizing .agent-resize::after{background:#b8b8b8}
-  .agent-panel .agent-action{margin-left:0;border:0;border-left:0;border-radius:0;background:transparent;box-shadow:none}
- .agent-panel .agent-action .action-summary{display:flex;align-items:center;gap:7px;min-height:32px;padding:3px 7px 3px 0;color:#bdbdbd;font-size:11px;font-weight:500;cursor:default}
- .agent-panel .agent-action summary{padding:5px 0 5px 11px;color:#bdbdbd;font-weight:500}
- .agent-panel .agent-action summary::before{color:#858585}.agent-panel .agent-action .action-pip{background:#aaa}.agent-panel .agent-action.failed .action-pip{background:#666}
-.agent-panel .agent-action .action-detail{border-top:1px solid #383838;padding:8px 0 8px 11px;color:#a9a9a9;max-height:180px}
-.agent-panel .agent-action .action-command{color:#d0d0d0}.agent-panel .agent-action .action-command::before{color:#777}
-.agent-panel .agent-send{background:#bcbcbc;color:#151515}.agent-panel .agent-send:hover{background:#d2d2d2}
-.agent-panel .agent-avatar{background:#292929;color:#cfcfcf}.agent-panel .agent-error{border-color:#555;background:#292929;color:#c7c7c7}
-.agent-panel .agent-error .btn-red,.agent-panel .agent-key-row .btn-blue{background:#bcbcbc;color:#151515;border-color:#aaa}
-.agent-panel .agent-error .btn-red:hover,.agent-panel .agent-key-row .btn-blue:hover{background:#d2d2d2}
-.agent-panel .agent-key-link{color:#c2c2c2}.agent-panel .agent-key-link:hover{color:#fff}
-.agent-panel .agent-settings{background:#242424;border-bottom-color:#4a4a4a}.agent-panel .agent-key-state{color:#bdbdbd}.agent-panel .agent-key-state.empty{color:#898989}
-.agent-panel .agent-key-row input:focus{border-color:#9b9b9b}.agent-panel .agent-compose-box:focus-within{border-color:#999;box-shadow:0 0 0 3px rgba(160,160,160,.1)}
- /* Assistant timeline: fast reveal, rich text, and compact Replit-style work cards. */
- .agent-bubble.is-typing{filter:blur(3.5px);opacity:.72;transform:translateY(2px);transition:filter .18s ease,opacity .18s ease,transform .18s ease}
- .agent-bubble.agent-reveal{animation:agentTextReveal .34s cubic-bezier(.2,.8,.2,1) both}
- @keyframes agentTextReveal{from{filter:blur(3.5px);opacity:.6;transform:translateY(2px)}to{filter:blur(0);opacity:1;transform:none}}
- .agent-text-block{margin:0 0 8px}.agent-text-block:last-child{margin-bottom:0}
-    .agent-rich{font-family:'Readex Pro','SF Pro Rounded','SF Arabic','Noto Sans Arabic','Noto Sans','Segoe UI',ui-rounded,system-ui,sans-serif;letter-spacing:0;color:var(--t1);direction:rtl;text-align:start;unicode-bidi:plaintext}
-     .agent-rich .agent-line{display:block;unicode-bidi:plaintext}
-     .agent-rich .agent-line-rtl{direction:rtl;text-align:right}
-     .agent-rich .agent-line-ltr{direction:ltr;text-align:left}
- .agent-rich strong,.agent-rich em{color:inherit;font-size:inherit;font-weight:600;font-style:normal}
- .agent-rich a.agent-link{color:#8ed8ff;text-decoration:underline;text-decoration-color:rgba(142,216,255,.62);text-decoration-thickness:1px;text-underline-offset:2px;overflow-wrap:anywhere;transition:color .15s,text-decoration-color .15s}
- .agent-rich a.agent-link:hover{color:#c0edff;text-decoration-color:currentColor}
-    .agent-rich .agent-ltr,.agent-rich code,.agent-rich strong,.agent-rich em{unicode-bidi:isolate}
-    .agent-rich .agent-ltr{direction:ltr}
-    .agent-rich .agent-inline-code,.agent-rich .agent-path{display:inline;padding:1px 5px;border:0;border-radius:4px;background:rgba(0,0,0,.18);color:#d2d2d2;font:11px/1.55 'JetBrains Mono',monospace;direction:ltr;unicode-bidi:isolate;box-decoration-break:clone;-webkit-box-decoration-break:clone;vertical-align:baseline}
-    .agent-rich .agent-path{overflow-wrap:anywhere}
-    .agent-rich .agent-heading{display:block;margin:3px 0 7px;padding:0;color:inherit;font-size:inherit;font-weight:600;letter-spacing:0;border:0}
-  .agent-rich .agent-list-item{display:flex;gap:8px;align-items:flex-start;margin:4px 0;direction:inherit}.agent-rich .agent-list-item::before{content:'';width:4px;height:4px;margin-top:9px;border-radius:50%;background:#999;flex:0 0 4px}
-   .agent-rich .agent-key-value{display:flex;gap:7px;align-items:baseline;margin:4px 0;line-height:1.7;direction:inherit}
-   .agent-rich .agent-key-label{color:inherit;font-weight:600;white-space:nowrap}
-   .agent-rich .agent-key-value .agent-key-value-text{color:inherit;min-width:0}
-   .agent-rich .agent-quote{display:block;margin:6px 0;padding:5px 9px;border-left:2px solid #777;color:inherit;background:rgba(255,255,255,.035);border-radius:0 6px 6px 0;direction:inherit}
-   .agent-code-wrap{margin:10px 0 12px;overflow:hidden;border:1px solid rgba(167,139,250,.24);border-radius:11px;background:#101113;box-shadow:0 8px 24px rgba(0,0,0,.16);direction:ltr;text-align:left}
-   .agent-code-head{display:flex;align-items:center;gap:8px;min-height:34px;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);color:#a7a7a7;font-size:9px;letter-spacing:.02em;text-transform:none}
-  .agent-code-head::before{content:'</>';color:#bdbdbd;font:11px 'JetBrains Mono',monospace}
-  .agent-code-language{color:#e5e1ef;font:600 9.5px/1.2 'JetBrains Mono',monospace}
-  .agent-code-meta{color:#707078;font-size:9px;margin-left:2px}
-  .agent-code-copy{margin-left:auto;border:1px solid transparent;border-radius:5px;padding:4px 7px;background:transparent;color:#999;font-size:9px;cursor:pointer;transition:background .15s,color .15s,border-color .15s}.agent-code-copy:hover{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.1);color:#fff}
-   .agent-code-wrap pre{margin:0;padding:12px 13px;max-height:380px;overflow:auto;color:#d7d7de;font:10.5px/1.65 'JetBrains Mono',monospace;white-space:pre;tab-size:2}
-   .agent-code-wrap pre::selection,.agent-code-wrap pre *::selection{background:rgba(167,139,250,.3)}
-   .agent-code-wrap .tok-comment{color:#737983}.agent-code-wrap .tok-string{color:#b8d994}.agent-code-wrap .tok-number{color:#d9ae78}.agent-code-wrap .tok-keyword{color:#c9a7f5}.agent-code-wrap .tok-type{color:#78c6d0}.agent-code-wrap .tok-function{color:#82b7f2}.agent-code-wrap .tok-builtin{color:#e1c38a}
-    .agent-action-stack{position:relative;display:flex;flex-direction:row;align-items:flex-start;gap:0;min-height:34px;width:max-content;max-width:100%;padding:1px 0 2px 2px;overflow:visible;direction:ltr;transform-origin:left top;transition:width .34s var(--spring),padding .34s var(--spring),background .24s ease,border-color .24s ease}
-   .agent-action-stack .agent-action{position:relative;z-index:1;margin:0;min-height:32px;height:32px;flex:0 0 32px;border:0;border-radius:0;background:transparent;box-shadow:none;overflow:visible;animation:agentIn .25s var(--spring) both;transition:flex-basis .34s var(--spring),width .34s var(--spring),height .34s var(--spring),margin .34s var(--spring),transform .34s var(--spring),opacity .24s ease}
-    .agent-action-stack .agent-action+.agent-action{margin-left:-13px;transition:margin .34s var(--spring),transform .34s var(--spring),opacity .24s ease}
-  .agent-action-stack .agent-action.is-current{z-index:20}
-   .agent-action-stack .agent-action.agent-stagger-hidden{opacity:0;transform:translate3d(0,5px,0) scale(.92);pointer-events:none}
-    .agent-panel .agent-action summary{width:max-content;max-width:100%;min-height:32px;padding:4px 7px 4px 0;color:#d0d0d0;font-weight:600}
- .agent-panel .agent-action summary::before{content:'';display:none}
-    .agent-action .action-icon{width:26px;height:26px;display:flex;align-items:center;justify-content:center;flex:0 0 26px;border-radius:7px;background:var(--panel);border:1px solid #2c2c2c;color:#bdbdbd;box-shadow:none}
- .agent-action .action-icon svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-    .agent-action .action-heading{display:flex;align-items:center;gap:7px;min-width:0;flex:1}.agent-action .action-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-action .action-description{display:none;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bcbcbc;font-size:10.5px;font-weight:500}
-  .agent-action-stack .agent-action:not(.is-current) .action-heading{display:none}
-   .agent-action-stack.expanded{flex-direction:column;align-items:stretch;gap:3px;width:100%;max-width:100%;padding:0;border:0;border-radius:0;background:transparent;overflow:visible}
-   .agent-action-stack.expanded .agent-action,.agent-action-stack.expanded .agent-action+.agent-action{width:100%;height:auto;min-height:34px;flex:0 0 auto;margin-left:0;transform:none;opacity:1}
-   .agent-action-stack.expanded .action-summary{width:100%;min-height:34px;padding:3px 7px 3px 0;cursor:pointer}
-   .agent-action-stack.expanded .agent-action:not(.is-current) .action-heading,.agent-action-stack.expanded .action-heading{display:flex}
-   .agent-action-stack.expanded .action-label{display:none}
-   .agent-action-stack.expanded .action-description{display:block}
-  .agent-action .action-state{display:flex;align-items:center;gap:4px;margin-left:auto;flex:0 0 auto;color:#8f8f8f;font-size:9px;font-weight:500}
-  .agent-action .action-state svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-  .agent-action.pending .action-state{color:#a9a9a9}.agent-action.failed .action-state{color:#b0b0b0}
-   .agent-action .action-detail{display:none!important}
-   .agent-action-stack.expanded .agent-action.is-detail-open .action-detail{display:block!important;margin:0 0 4px 33px;padding:0;border:1px solid rgba(130,130,130,.22);border-radius:8px;background:#171717;max-width:calc(100% - 33px);max-height:142px;overflow:auto}
- .agent-action .action-command{margin:0;padding:8px 9px;border-radius:7px;background:#171717;color:#d2d2d2;font:10px/1.5 'JetBrains Mono',monospace;white-space:pre;word-break:normal;overflow:auto;max-height:126px;max-width:100%}
-  .agent-action .action-command::before{content:'$ ';color:#777}.agent-action .action-output{display:none;color:#a7a7a7;font:10px/1.5 'JetBrains Mono',monospace;white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto}
- .agent-action .action-output::before{content:'Result';display:block;margin-bottom:3px;color:#777;font:9px/1.2 'Inter',sans-serif;text-transform:uppercase;letter-spacing:.08em}
-.agent-typing{padding:5px 0 6px}.agent-typing .agent-thinking-icon{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:#aaa}
- .agent-thinking-icon svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;animation:agentThinkingSpin 1.8s linear infinite}
- .agent-thinking-label-window{position:relative;display:inline-block;height:1.35em;line-height:1.35;overflow:hidden;vertical-align:middle;min-width:0}
- .agent-thinking-label-current,.agent-thinking-label-next{display:block;white-space:nowrap;transition:transform .34s cubic-bezier(.22,.8,.28,1)}
- .agent-thinking-label-next{position:absolute;left:0;top:100%;transform:translateY(0)}
- .agent-thinking-label-window.is-changing .agent-thinking-label-current{transform:translateY(-100%)}
- .agent-thinking-label-window.is-changing .agent-thinking-label-next{transform:translateY(-100%)}
- .agent-typing.is-result-wait .agent-thinking-label{color:#c0c0c0}
- @keyframes agentThinkingSpin{to{transform:rotate(360deg)}}
- .rooting-scan-mod{width:min(1120px,97vw);height:min(900px,92vh);max-height:92vh;border-color:rgba(78,208,232,.28);background:radial-gradient(ellipse at 85% 0%,rgba(10,115,152,.12),transparent 34%),linear-gradient(155deg,#11151b,#0c1016 58%,#11141a)}
- .rooting-scan-head{gap:10px;background:linear-gradient(100deg,rgba(11,35,46,.9),rgba(24,27,35,.97));border-bottom-color:rgba(66,197,222,.18)}
- .rooting-scan-head .mod-icon{background:rgba(44,204,224,.12);color:#63d7e8}
- .rooting-scan-head .mod-icon svg{stroke:currentColor}
- .rooting-head-title{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
- .rooting-head-sub{font:8px/1.3 'JetBrains Mono',monospace;letter-spacing:1.25px;color:#6d9aa5}
- .rooting-head-sub i,.rooting-scan-led{display:inline-block;width:6px;height:6px;margin:0 5px;border-radius:50%;background:#51e2bb;box-shadow:0 0 9px rgba(81,226,187,.7)}
- .rooting-readonly{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border:1px solid rgba(62,208,187,.19);border-radius:6px;color:#69d9c0;font:8px 'JetBrains Mono',monospace;letter-spacing:.8px;white-space:nowrap}
- .rooting-readonly svg,.rooting-disclaimer svg,.rooting-search svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
- .rooting-scan-body{display:flex;flex-direction:column;gap:12px;overflow:auto;min-height:0;flex:1;padding:14px 16px 12px}
- .rooting-hero{position:relative;display:grid;grid-template-columns:140px minmax(0,1fr);gap:20px;align-items:center;min-height:176px;padding:17px 22px;border:1px solid rgba(67,184,210,.18);border-radius:12px;overflow:hidden;background:radial-gradient(ellipse at 20% 50%,rgba(20,173,198,.12),transparent 33%),linear-gradient(112deg,rgba(15,35,45,.82),rgba(19,22,30,.92) 55%,rgba(20,30,40,.8))}
- .rooting-hero:after{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(139,220,231,.025) 0,rgba(139,220,231,.025) 1px,transparent 1px,transparent 5px);opacity:.28}
- .rooting-score-wrap{position:relative;width:126px;height:126px;display:grid;place-items:center}
- .rooting-score-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
- .rooting-score-ring circle{fill:none;stroke-width:6}
- .rooting-ring-track{stroke:rgba(101,137,148,.16)}
- .rooting-ring-value{stroke:#51dfba;stroke-linecap:round;stroke-dasharray:314.16;stroke-dashoffset:314.16;transition:stroke-dashoffset .8s ease,stroke .3s;filter:drop-shadow(0 0 7px rgba(81,223,186,.45))}
- .rooting-score-center{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;max-width:75px}
- .rooting-score-center strong{font:700 31px/1 'JetBrains Mono',monospace;color:#e2f7f6;letter-spacing:-2px}
- .rooting-score-center span{margin:12px 0 0 3px;color:#64838b;font:9px 'JetBrains Mono',monospace}
- .rooting-score-center small{width:100%;margin-top:6px;text-align:center;color:#6d9aa5;font:7px 'JetBrains Mono',monospace;letter-spacing:1px}
- .rooting-hero-main{position:relative;z-index:1;min-width:0}
- .rooting-eyebrow{display:flex;align-items:center;gap:5px;color:#72acb7;font:8px 'JetBrains Mono',monospace;letter-spacing:1px}
- .rooting-scan-led{width:5px;height:5px;margin:0}
- .rooting-divider{color:#34505a}
- .rooting-hero h2{margin:10px 0 4px;color:#e1e9ec;font-size:18px;font-weight:650;letter-spacing:-.25px}
- .rooting-hero p{margin:0;color:#85959c;font-size:10.5px;line-height:1.55}
- .rooting-signal{display:flex;align-items:center;gap:18px;margin-top:13px;padding-top:10px;border-top:1px solid rgba(93,158,171,.13)}
- .rooting-signal>div{display:flex;flex-direction:column;gap:4px;flex:none}
- .rooting-signal span,.rooting-signal small{color:#61828a;font:7px 'JetBrains Mono',monospace;letter-spacing:.8px}
- .rooting-signal small{font-size:7px;color:#48636b}
- .rooting-signal svg{width:min(380px,60%);height:31px;overflow:visible}
- .rooting-wave-grid{stroke:rgba(114,179,192,.12);stroke-width:.7}
- .rooting-wave-line{fill:none;stroke:#42ccdf;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:6 4;animation:rootingWave 2.8s linear infinite;filter:drop-shadow(0 0 4px rgba(66,204,223,.5))}
- @keyframes rootingWave{to{stroke-dashoffset:-40}}
- .rooting-summary{display:grid;grid-template-columns:repeat(4,minmax(70px,.75fr)) minmax(150px,2fr);gap:7px;align-items:stretch}
- .rooting-stat{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;padding:9px 11px;border:1px solid rgba(117,140,151,.14);border-radius:8px;background:rgba(255,255,255,.018)}
- .rooting-stat span{color:#71818a;font:8px 'JetBrains Mono',monospace;letter-spacing:.8px}
- .rooting-stat strong{color:#d9e3e7;font:700 17px 'JetBrains Mono',monospace}
- .rooting-stat-critical strong{color:#fa737a}.rooting-stat-high strong{color:#f8a56e}.rooting-stat-review strong{color:#f0d277}.rooting-stat-unknown strong{color:#8ba0ad}
- .rooting-meta{align-self:center;text-align:right;color:#657780;font:9px/1.5 'JetBrains Mono',monospace}
- .rooting-disclaimer{display:flex;align-items:flex-start;gap:8px;padding:9px 10px;border:1px solid rgba(229,177,93,.16);border-radius:8px;background:rgba(213,146,48,.045);color:#a49b82;font-size:9.5px;line-height:1.5}
- .rooting-disclaimer svg{color:#e2bc71;margin-top:1px}
- .rooting-disclaimer strong{color:#e9c77e}
- .rooting-filterbar{display:flex;gap:7px;align-items:center}
- .rooting-search{display:flex;align-items:center;gap:7px;min-width:150px;flex:1;padding:0 10px;border:1px solid rgba(103,133,143,.2);border-radius:7px;background:rgba(255,255,255,.025);color:#68838b}
- .rooting-search input{width:100%;height:31px;border:0;outline:0;background:transparent;color:#dae3e5;font:10px 'JetBrains Mono',monospace}
- .rooting-search input::placeholder{color:#5f7379}
- .rooting-select{height:33px;padding:5px 9px;border-color:rgba(103,133,143,.2);background-color:rgba(255,255,255,.025);font-size:9px}
- .rooting-results{display:flex;flex-direction:column;gap:13px;min-height:140px}
- .rooting-group-title{display:flex;align-items:center;gap:9px;margin:0 0 7px;color:#9db5bc;font:9px 'JetBrains Mono',monospace;letter-spacing:1.2px;text-transform:uppercase}
- .rooting-group-title:after{content:"";height:1px;flex:1;background:linear-gradient(90deg,rgba(75,172,191,.2),transparent)}
- .rooting-group-count{color:#536b73;font-size:8px;letter-spacing:0}
- .rooting-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
- .rooting-check-card{position:relative;min-width:0;padding:10px 11px 9px 13px;border:1px solid rgba(112,140,150,.14);border-radius:8px;background:linear-gradient(120deg,rgba(255,255,255,.022),rgba(255,255,255,.008));overflow:hidden}
- .rooting-check-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:#57757e}
- .rooting-check-card[data-state="good"]:before{background:#3fbea0}
- .rooting-check-card[data-state="risk"]:before{background:#f06470;box-shadow:0 0 10px rgba(240,100,112,.35)}
- .rooting-check-card[data-state="review"]:before{background:#e5b65b}
- .rooting-check-card[data-state="unknown"]:before{background:#71828a}
- .rooting-check-head{display:flex;align-items:center;gap:7px;min-width:0}
- .rooting-state-dot{width:6px;height:6px;flex:none;border-radius:50%;background:#7a9096}
- .rooting-check-card[data-state="good"] .rooting-state-dot{background:#50d0ae;box-shadow:0 0 6px rgba(80,208,174,.4)}
- .rooting-check-card[data-state="risk"] .rooting-state-dot{background:#f06470;box-shadow:0 0 7px rgba(240,100,112,.55)}
- .rooting-check-card[data-state="review"] .rooting-state-dot{background:#e8be66}
- .rooting-check-label{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d0dadd;font-size:10px;font-weight:650}
- .rooting-check-tag{padding:3px 5px;border:1px solid rgba(115,145,153,.14);border-radius:4px;color:#7d9298;font:7px 'JetBrains Mono',monospace;text-transform:uppercase;white-space:nowrap}
- .rooting-check-card[data-state="risk"] .rooting-check-tag{border-color:rgba(240,100,112,.24);color:#fa8b91;background:rgba(240,100,112,.06)}
- .rooting-check-card[data-state="review"] .rooting-check-tag{border-color:rgba(229,182,91,.2);color:#e8c471;background:rgba(229,182,91,.05)}
- .rooting-check-value{margin:7px 0 4px;color:#cfdee1;font:10px/1.45 'JetBrains Mono',monospace;overflow-wrap:anywhere}
- .rooting-check-detail{margin:0;color:#788b91;font-size:9px;line-height:1.45}
- .rooting-check-evidence{margin-top:6px;color:#71838a;font:8px/1.45 'JetBrains Mono',monospace;overflow-wrap:anywhere}
- .rooting-empty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:36px 16px;border:1px dashed rgba(97,152,163,.2);border-radius:9px;text-align:center;color:#74878c}
- .rooting-empty svg{width:25px;height:25px;stroke:#52bbcb;fill:none;stroke-width:1.5;opacity:.7}
- .rooting-empty strong{color:#c7d4d8;font-size:11px}
- .rooting-empty span{max-width:420px;font-size:9.5px;line-height:1.5}
- .rooting-footnote{display:flex;justify-content:space-between;gap:10px;padding-top:8px;border-top:1px solid rgba(100,138,149,.12);color:#566d74;font:7px 'JetBrains Mono',monospace;letter-spacing:.8px}
- .rooting-footnote b{color:#3b858e}
- .rooting-scan-running .rooting-scan-led{background:#e9c564;box-shadow:0 0 10px rgba(233,197,100,.7);animation:rootingPulse 1s ease-in-out infinite}
- .rooting-scan-running .rooting-wave-line{stroke:#e3bf63}
- @keyframes rootingPulse{50%{opacity:.35;transform:scale(.78)}}
- .rooting-scan-error{color:#f08c91!important}
- @media(prefers-reduced-motion:reduce){.rooting-wave-line,.rooting-scan-running .rooting-scan-led{animation:none}.rooting-ring-value{transition:none}}
- @media(prefers-reduced-motion:reduce){
-  .agent-msg.user .agent-bubble,.agent-bubble.is-typing,.agent-bubble.agent-reveal{filter:none;transform:none;animation:none;transition:none}
-  .agent-thinking-label-current,.agent-thinking-label-next{transition:none}
-   .agent-thinking-icon svg{animation:none}
- }
-@media(max-width:768px){
-  .agent-panel{top:var(--th);bottom:var(--bh);width:100%;min-width:0}
-  .shell.agent-open .main{margin-right:0}
-  .agent-resize{left:auto;right:0;cursor:ew-resize}
-  .agent-resize::after{left:auto;right:4px}
-}
-@media(max-width:600px){
-  #errLogOv{padding:8px}
-  #errLogOv .mod,#envOv .mod{max-height:94vh}
-  #errLogOv .mod>div:last-child{min-height:70vh;max-height:78vh;flex-direction:column}
-  #serverLogList{width:100%!important;max-height:150px;border-right:0!important;border-bottom:1px solid var(--border)}
-  #errLogBody{min-height:0}
-  #envReaderContent{min-height:220px}
-  #configInspectorOv{padding:8px}
-  #configInspectorOv .mod{max-height:94vh}
-  #configInspectorLayout{min-height:70vh;max-height:78vh;flex-direction:column}
-  #configInspectorList{width:100%!important;max-height:165px;border-right:0!important;border-bottom:1px solid var(--border)}
-  #configInspectorContent{min-height:0}
-   #rootingScanOv{padding:7px}
-   #rootingScanOv .rooting-scan-mod{width:100%;height:calc(100vh - 14px);max-height:calc(100vh - 14px)}
-   #rootingScanOv .rooting-scan-body{padding:9px;gap:9px}
-   #rootingScanOv .rooting-readonly{display:none}
-   #rootingScanOv .rooting-hero{grid-template-columns:82px minmax(0,1fr);gap:10px;padding:12px;min-height:140px}
-   #rootingScanOv .rooting-score-wrap{width:78px;height:78px}
-   #rootingScanOv .rooting-score-center strong{font-size:22px}
-   #rootingScanOv .rooting-score-center small{font-size:6px}
-   #rootingScanOv .rooting-hero h2{font-size:14px}
-   #rootingScanOv .rooting-hero p{font-size:9px}
-   #rootingScanOv .rooting-signal{gap:8px}
-   #rootingScanOv .rooting-signal svg{width:55%;height:25px}
-   #rootingScanOv .rooting-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
-   #rootingScanOv .rooting-meta{grid-column:1/-1;text-align:left;padding:2px 3px}
-   #rootingScanOv .rooting-filterbar{flex-wrap:wrap}
-   #rootingScanOv .rooting-search{flex-basis:100%}
-   #rootingScanOv .rooting-select{flex:1}
-   #rootingScanOv .rooting-cards{grid-template-columns:1fr}
-   #rootingScanOv .rooting-head-sub{font-size:6px;letter-spacing:.7px}
-   #rootingScanRun{padding:6px}
-   #rootingScanRun svg{display:none}
-}
-
-/* ══ EDITOR ══ */
-.ed-card{background:var(--surf);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:0 18px 55px rgba(0,0,0,.2);animation:fadeUp .3s var(--spring) both}
-.ed-head{display:flex;align-items:center;flex-wrap:nowrap;gap:0;min-height:48px;background:linear-gradient(180deg,var(--raised),var(--surf));border-bottom:1px solid var(--border)}
-.ed-document-tab{position:relative;display:flex;align-items:center;gap:9px;flex:1 1 auto;min-width:0;min-height:48px;padding:5px 12px;background:rgba(255,255,255,.025);border-right:1px solid var(--border)}
-.ed-document-tab:after{content:"";position:absolute;left:12px;right:12px;bottom:-1px;height:2px;border-radius:2px 2px 0 0;background:linear-gradient(90deg,#5ea7ff,#a78bfa)}
-.ed-file-glyph{display:flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;border:1px solid currentColor;border-radius:9px;background:rgba(255,255,255,.055);color:#91a7ff}
-.ed-file-glyph svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ed-file-glyph svg text{fill:currentColor;stroke:none;font-family:'JetBrains Mono',monospace;font-size:6.5px;font-weight:800}
-.ed-file-glyph[data-language="php"]{color:#9a9bea}.ed-file-glyph[data-language="javascript"]{color:#f0ce66}.ed-file-glyph[data-language="typescript"]{color:#56a8e8}.ed-file-glyph[data-language="html"]{color:#f18c62}.ed-file-glyph[data-language="css"]{color:#69aaf7}.ed-file-glyph[data-language="json"]{color:#e8be65}.ed-file-glyph[data-language="sql"]{color:#77c7bd}.ed-file-glyph[data-language="python"]{color:#77b7ea}.ed-file-glyph[data-language="shell"]{color:#8dc891}.ed-file-glyph[data-language="yaml"]{color:#e593ad}.ed-file-glyph[data-language="xml"]{color:#b79af2}
-.ed-document-labels{min-width:0;display:flex;flex-direction:column;gap:2px}
-.ed-fname{display:flex;align-items:center;gap:8px;min-width:0;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.2;font-weight:700;color:var(--t1)}
-.ed-file-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ed-tab-dirty{display:none;width:7px;height:7px;flex:none;border-radius:50%;background:#f0b967;box-shadow:0 0 0 3px rgba(240,185,103,.13)}
-.ed-tab-dirty.show{display:inline-block}
-.ed-file-subline{display:flex;align-items:center;gap:6px;min-width:0;color:var(--t3);font:9px/1.15 'JetBrains Mono',monospace}
-.ed-file-subline svg{width:12px;height:12px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.ed-file-kind{color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ed-head-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex:none;min-width:0;margin-left:auto;padding:5px 10px}
-.ed-meta-wrap{display:flex;align-items:center;gap:6px;min-width:0;max-width:180px;margin-right:4px;color:var(--t3)}
-.ed-meta-wrap svg{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
-.ed-meta{overflow:hidden;text-overflow:ellipsis;font-size:9px;font-weight:var(--fw-muted);color:var(--t3);font-family:'JetBrains Mono',monospace;white-space:nowrap}
-.ed-head-actions .btn{width:auto;height:28px;margin:0;padding:4px 8px;box-shadow:none}
-.ed-head-actions .ed-copy-btn{background:rgba(180,188,198,.07);border-color:rgba(180,188,198,.17);color:#b5bac1}
-.ed-head-actions .ed-copy-btn:hover{background:rgba(180,188,198,.13);color:#d5d8dc}
-.ed-head-actions .ed-copy-btn.is-copied{background:rgba(180,188,198,.1);border-color:rgba(180,188,198,.22);color:#c5c9ce}
-textarea.code{display:block;width:100%;min-height:520px;background:#070a10;color:#cdd6f4;border:none;padding:18px 20px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.85;resize:vertical;outline:none;tab-size:4;transition:box-shadow .2s}
-.ed-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 9px;background:var(--raised);border-bottom:1px solid var(--border)}
-.ed-tools-group{display:flex;align-items:center;gap:5px;min-width:0}
-.ed-search-group{flex:1 1 430px}
-.ed-search-field{display:flex;align-items:center;gap:7px;flex:1 1 150px;min-width:128px;max-width:220px;height:32px;padding:0 9px;border:1px solid var(--border);border-radius:8px;background:var(--field);transition:border-color .16s,box-shadow .16s}
-.ed-search-field:focus-within{border-color:rgba(94,167,255,.65);box-shadow:0 0 0 3px rgba(94,167,255,.12)}
-.ed-search-field>svg{width:14px;height:14px;flex:none;stroke:var(--t3);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ed-search-field .inp{width:100%;height:28px;min-width:0;padding:4px 0;border:0;border-radius:0;background:transparent;box-shadow:none!important;font-size:11px}
-.ed-search-field .inp:focus{border:0;box-shadow:none}
-.ed-search-field .inp::placeholder{color:var(--t3)}
-.ed-tools .ed-language-wrap{display:flex;align-items:center;gap:6px;height:32px;padding:0 8px;border:1px solid var(--border);border-radius:8px;background:var(--field);color:var(--t3)}
-.ed-language-wrap>svg{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.ed-tools .ed-language{height:30px;min-width:105px;max-width:150px;padding:4px 18px 4px 0;border:0;background:transparent;box-shadow:none!important;font-size:11px}
-.ed-tools .ed-language:focus{border:0;box-shadow:none}
-.ed-tools button{width:auto;height:29px;min-width:29px;margin:0;box-shadow:none}
-.ed-tool-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
-.ed-tool-btn svg{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.ed-tool-btn.is-active{color:#c0c5cc;border-color:rgba(180,188,198,.28);background:rgba(180,188,198,.09)}
-.ed-tools .ed-format-group #edFormatJson{background:rgba(180,188,198,.08);border-color:rgba(180,188,198,.2);color:#c4c8ce}
-.ed-tools .ed-format-group #edFormatJson:hover{background:rgba(180,188,198,.14);color:#e0e2e5}
-.ed-tool-btn:focus-visible{outline:2px solid rgba(180,188,198,.6);outline-offset:2px}
-.ed-tools .btn-g:hover,.ed-head-actions .btn-g:hover{color:#d5d8dc;background:rgba(180,188,198,.09);border-color:rgba(180,188,198,.22)}
-.ed-search-actions .btn{width:32px;min-width:32px;padding:5px}
-.ed-search-actions #edReplaceOne,.ed-search-actions #edReplaceAll{width:auto;min-width:0;padding:5px 8px}
-.ed-tools-divider{width:1px;height:22px;flex:none;background:var(--border)}
-.ed-tools-spacer{flex:1 1 0}
-.ed-font-tools{display:flex;align-items:center;gap:3px;padding:2px;border:1px solid var(--border);border-radius:9px;background:rgba(0,0,0,.08)}
-.ed-font-tools .btn{min-width:30px;width:30px;padding:4px}
-.ed-font-tools .ed-font-readout{min-width:30px;text-align:center;color:var(--t3);font:9px 'JetBrains Mono',monospace}
-.ed-search-field{margin:0;color:var(--t2);font-size:11px;font-weight:500;letter-spacing:0;text-transform:none}
-.ed-tools .ed-language-wrap{margin:0;font-size:11px;font-weight:500;letter-spacing:0;text-transform:none}
-.ed-search-actions{flex:none}
-.ed-search-actions .ed-search-option{min-width:29px!important;padding:0 5px;font:10px 'JetBrains Mono',monospace}
-.ed-search-actions .ed-search-option.is-active{color:#d5d8dc;border-color:rgba(190,198,208,.32);background:rgba(190,198,208,.13)}
-.ed-footer-actions{display:flex;align-items:center;gap:7px}
-.ed-foot .btn{width:auto;height:29px;margin:0;box-shadow:none}
-.ed-foot .btn-p{min-width:110px}
-.ed-card[data-editor-theme="light"] .ed-head,.ed-card[data-editor-theme="light"] .ed-tools,.ed-card[data-editor-theme="light"] .ed-foot{background:#f4f6fa;border-color:#dce2eb;color:#425064}
-.ed-card[data-editor-theme="light"] .ed-document-tab{background:#fff;border-color:#dce2eb}
-.ed-card[data-editor-theme="light"] .ed-fname{color:#253044}
-.ed-card[data-editor-theme="light"] .ed-file-subline,.ed-card[data-editor-theme="light"] .ed-meta,.ed-card[data-editor-theme="light"] .ed-meta-wrap{color:#64748b}
-.ed-card[data-editor-theme="light"] .ed-search-field,.ed-card[data-editor-theme="light"] .ed-tools .ed-language-wrap{background:#fff;border-color:#d8dee8}
-.ed-card[data-editor-theme="light"] .ed-search-field .inp,.ed-card[data-editor-theme="light"] .ed-tools .ed-language{color:#334155}
-.ed-card[data-editor-theme="light"] .ed-tools .btn-g,.ed-card[data-editor-theme="light"] .ed-head-actions .btn-g,.ed-card[data-editor-theme="light"] .ed-footer-actions .btn-g{color:#475569;background:#fff;border-color:#d5dce6}
-.ed-card[data-editor-theme="light"] .ed-tools .btn-g:hover,.ed-card[data-editor-theme="light"] .ed-head-actions .btn-g:hover,.ed-card[data-editor-theme="light"] .ed-footer-actions .btn-g:hover{color:#3e4349;background:#eef0f2;border-color:#cfd3d8}
-.ed-card[data-editor-theme="light"] .ed-tools .btn-blue{color:#1d4ed8;background:#eff6ff;border-color:#bfdbfe}
-.ed-card[data-editor-theme="light"] .ed-font-tools{background:#e9edf4;border-color:#d8dee8}
-.ed-card[data-editor-theme="light"] .ed-status{background:linear-gradient(90deg,#e7edf5,#edf1f7);border-color:#dce2eb;color:#566579}
-.ed-card[data-editor-theme="light"] .ed-status-separator{background:rgba(45,55,72,.18)}
-.ed-card[data-editor-theme="light"] .ed-hint{color:#64748b}
-.ed-card[data-editor-theme="light"] .ed-hint kbd{background:#fff;border-color:#d3dbe6;color:#526174}
-.ed-dirty{display:none;align-items:center;gap:5px;padding:5px 8px;border:1px solid rgba(240,185,103,.2);border-radius:99px;background:rgba(240,185,103,.08);color:#f1c67f;font-size:10px;font-weight:700;white-space:nowrap}
-.ed-dirty.show{display:inline-flex}
-.ed-dirty svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ed-wrap{position:relative;display:block;background:#1e1e1e;overflow:hidden}
-.ed-wrap textarea.code{height:520px;min-height:520px;resize:vertical}
-textarea.code:focus{box-shadow:inset 0 0 0 1.5px rgba(133,137,140,.45)}
-.ed-foot{padding:5px 10px;background:var(--raised);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px}
-.ed-hint{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:var(--fw-muted);color:var(--t3);font-family:'JetBrains Mono',monospace}
-.ed-hint>svg{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.ed-status{min-height:31px;padding:5px 12px;background:linear-gradient(90deg,#171b22,#1c2028);border-top:1px solid rgba(255,255,255,.06);color:#aeb8c6;display:flex;align-items:center;justify-content:space-between;gap:10px;font:10px 'JetBrains Mono',monospace}
-.ed-status-group{display:flex;align-items:center;gap:12px;min-width:0}
-.ed-status span{white-space:nowrap}
-.ed-status-chip{display:inline-flex;align-items:center;gap:5px}
-.ed-status-language{color:#aeb3bb}
-.ed-status-language:before{content:none}
-.ed-status-separator{width:1px;height:14px;background:rgba(255,255,255,.11)}
-.ed-status svg{width:12px;height:12px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.ed-status .ed-selection-count{color:#aeb3bb}
-.ed-diagnostics:empty{display:none}
-.ed-diagnostics.has-errors{color:#f87171}
-.ed-status .ed-diagnostics{color:var(--t3)!important}
-.ed-standalone{display:flex;width:100%;height:min(68vh,780px);min-height:520px;overflow:hidden;background:#1e1e1e;color:#d4d4d4;font:13px/1.65 "JetBrains Mono",Consolas,monospace}
-.ed-standalone-gutter{position:relative;flex:none;min-width:54px;padding:14px 10px 14px 4px;overflow:hidden;background:#1e1e1e;color:#74777b;text-align:right;white-space:pre;user-select:none;border-right:1px solid rgba(255,255,255,.045)}
-.ed-standalone-surface{position:relative;flex:1;min-width:0;overflow:hidden}
-.ed-standalone-highlight{position:absolute;z-index:0;top:0;left:0;min-width:100%;min-height:100%;margin:0;padding:14px 20px;overflow:visible;color:#d4d4d4;white-space:pre;pointer-events:none;font:inherit;tab-size:4}
-.ed-standalone-highlight code{position:relative;z-index:1;font:inherit}
-.ed-line-numbers{position:relative;z-index:1}
-.ed-current-line,.ed-current-gutter-line{position:absolute;top:14px;left:0;right:0;height:1.65em;pointer-events:none;background:rgba(190,198,208,.045);border-left:2px solid rgba(190,198,208,.18)}
-.ed-current-gutter-line{left:0;right:0;background:rgba(190,198,208,.055);border-left:0}
-.ed-standalone-surface textarea.code{position:absolute;z-index:1;inset:0;display:block!important;width:100%;height:100%;min-height:0;margin:0;padding:14px 20px;resize:none;overflow:auto;border:0;outline:0;background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;caret-color:#aeafad;font:inherit;line-height:1.65;white-space:pre;tab-size:4;scrollbar-color:#555 #1e1e1e}
-.ed-standalone-surface textarea.code::selection{background:rgba(38,79,120,.72);color:transparent}
-.ed-standalone.standalone-wrap .ed-standalone-highlight{right:0;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere}
-.ed-standalone.standalone-wrap .ed-standalone-surface textarea.code{white-space:pre-wrap;overflow-wrap:break-word}
-.ed-standalone[data-theme="light"]{background:#fff;color:#383a42}
-.ed-standalone[data-theme="light"] .ed-standalone-gutter{background:#f3f3f3;color:#999}
-.ed-standalone[data-theme="light"] .ed-standalone-highlight{color:#383a42}
-.ed-standalone[data-theme="light"] .ed-standalone-surface textarea.code{caret-color:#333;scrollbar-color:#c1c1c1 #f3f3f3}
-.ed-standalone .tok-comment{color:#8b949e}
-.ed-standalone .tok-string{color:#ce9178}
-.ed-standalone .tok-keyword{color:#c586c0}
-.ed-standalone .tok-number{color:#b5cea8}
-.ed-standalone .tok-variable{color:#9cdcfe}
-.ed-standalone .tok-tag{color:#569cd6}
-.ed-standalone .tok-function{color:#dcdCAA}
-.ed-standalone .tok-type{color:#4ec9b0}
-.ed-standalone .tok-property{color:#9cdcfe}
-.ed-standalone .tok-operator{color:#d4d4d4}
-.ed-standalone .tok-bracket-match{color:#e0e2e5!important;background:rgba(190,198,208,.13);outline:1px solid rgba(190,198,208,.32);border-radius:2px}
-.ed-standalone[data-theme="light"] .tok-comment{color:#656d76}
-.ed-standalone[data-theme="light"] .tok-string{color:#a31515}
-.ed-standalone[data-theme="light"] .tok-keyword{color:#7a1fa2}
-.ed-standalone[data-theme="light"] .tok-number{color:#0b7a3e}
-.ed-standalone[data-theme="light"] .tok-variable{color:#005a9c}
-.ed-standalone[data-theme="light"] .tok-tag{color:#0451a5}
-.ed-standalone[data-theme="light"] .tok-function{color:#795e26}
-.ed-standalone[data-theme="light"] .tok-type{color:#176b86}
-.ed-standalone[data-theme="light"] .tok-property{color:#005a9c}
-.ed-standalone[data-theme="light"] .tok-operator{color:#44484e}
-.ed-standalone[data-theme="light"] .tok-bracket-match{color:#363b41!important;background:rgba(80,90,100,.12);outline-color:rgba(80,90,100,.4)}
-.ed-standalone-status{color:#a1a5aa!important}
-.ed-completion-menu{position:absolute;z-index:5;display:none;width:min(290px,calc(100% - 16px));max-height:min(300px,55%);overflow:auto;padding:4px;background:#25282d;border:1px solid rgba(190,198,208,.2);border-radius:7px;box-shadow:0 12px 34px rgba(0,0,0,.32);color:#d3d6da;font:11px/1.4 system-ui,sans-serif}
-.ed-completion-menu.show{display:block}
-.ed-completion-menu button{display:flex;width:100%;align-items:center;gap:9px;padding:5px 7px;border:0;border-radius:4px;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer}
-.ed-completion-menu button:hover,.ed-completion-menu button[aria-selected="true"]{background:rgba(190,198,208,.12)}
-.ed-completion-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px 'JetBrains Mono',monospace}
-.ed-completion-kind{margin-left:auto;color:#8f969e;font-size:9px}
-.ed-completion-detail{overflow:hidden;color:#9399a0;text-overflow:ellipsis;white-space:nowrap;font-size:10px}
-.ed-card[data-editor-theme="light"] .ed-completion-menu{background:#fff;border-color:#d4d8dd;box-shadow:0 10px 26px rgba(20,25,30,.16);color:#34383e}
-.ed-card[data-editor-theme="light"] .ed-completion-menu button:hover,.ed-card[data-editor-theme="light"] .ed-completion-menu button[aria-selected="true"]{background:#f0f1f2}
-.ed-card[data-editor-theme="light"] .ed-completion-detail,.ed-card[data-editor-theme="light"] .ed-completion-kind{color:#777d83}
-.ed-card:fullscreen{width:100vw;height:100vh;max-height:100vh;border:0;border-radius:0;display:flex;flex-direction:column;background:var(--panel)}
-.ed-card:fullscreen>form{flex:1;min-height:0;display:flex;flex-direction:column}
-.ed-card:fullscreen .ed-wrap{flex:1;min-height:0}
-.ed-card:fullscreen .ed-wrap textarea.code,.ed-card:fullscreen .ed-standalone{height:100%;min-height:0;resize:none}
-@media(max-width:768px){
-  .ed-head{display:flex;align-items:center;flex-wrap:nowrap;min-height:46px}
-  .ed-document-tab{flex:1 1 auto;min-height:46px;padding:4px 9px}
-  .ed-head-actions{width:auto;justify-content:flex-end;margin:0;padding:4px 8px}
-  .ed-meta-wrap{max-width:130px;margin-right:2px}
-  .ed-tools{align-items:stretch}
-  .ed-search-group{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);flex:1 1 100%}
-  .ed-search-field{min-width:0;max-width:none}
-  .ed-search-actions{grid-column:1/-1;justify-content:flex-end}
-  .ed-tools-divider,.ed-tools-spacer{display:none}
-  .ed-view-group{flex:1 1 100%;flex-wrap:wrap;justify-content:space-between}
-  .ed-tools .ed-language-wrap{flex:1 1 100px;min-width:0}
-  .ed-tools .ed-language{flex:1 1 auto;min-width:0;max-width:none}
-  .ed-standalone{height:68vh;min-height:440px}
-  .ed-status{overflow-x:auto}
-  .ed-status-group{gap:8px}
-  .ed-status-group:first-child .ed-diagnostics{display:none}
-}
-@media(max-width:480px){
-  .ed-file-glyph{width:27px;height:27px;border-radius:8px}
-  .ed-head-actions .ed-meta-wrap{display:none}
-  .ed-head-actions{gap:4px;padding:4px 6px}
-  .ed-head-actions .btn{height:27px;padding:4px 7px}
-  .ed-head-actions .ed-meta{overflow:hidden;text-overflow:ellipsis}
-  .ed-tools{padding:6px}
-  .ed-search-group{gap:5px}
-  .ed-search-field{padding:0 7px}
-  .ed-search-actions{gap:4px}
-  .ed-tools .ed-view-group>.ed-tool-btn .ed-tool-label{display:none}
-  .ed-tools .ed-view-group>.ed-tool-btn{width:32px;padding:4px}
-  .ed-tools .ed-format-group>.ed-tool-btn .ed-tool-label{display:none}
-  .ed-tools .ed-format-group>.ed-tool-btn{width:29px;padding:4px}
-  .ed-tools .ed-font-readout{display:none}
-  .ed-status{font-size:9px}
-  .ed-status-group{gap:7px}
-  .ed-hint{flex-wrap:wrap}
-}
-kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--t2)}
-
-/* ══ HASH / INFO / LOG ══ */
-.hash-r{display:flex;flex-direction:column;gap:3px;margin-bottom:10px;padding:11px;background:var(--raised);border-radius:var(--r);border:1px solid var(--border)}
-.hash-l{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3)}
-.hash-v{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--link);word-break:break-all;cursor:pointer;transition:color .15s}
-.hash-v:hover{color:#a5b4fc}
-.info-g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
-.info-c{background:var(--raised);border:1px solid var(--border);border-radius:var(--r);padding:12px}
-.info-cl{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--t3);margin-bottom:4px}
-.info-cv{font-family:'JetBrains Mono',monospace;font-size:13.5px;font-weight:700;color:var(--t1)}
-.info-cs{font-size:10.5px;font-weight:var(--fw-muted);color:var(--t2);margin-top:2px}
-.ext-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
-.ext-tag{background:var(--raised);border:1px solid var(--border);border-radius:5px;padding:2px 7px;font-size:10.5px;font-family:'JetBrains Mono',monospace;color:var(--t2)}
-.log-t{width:100%;border-collapse:collapse}
-.log-t th{text-align:left;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--t3);padding:7px 10px;border-bottom:1px solid var(--border)}
-.log-t td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.03);font-size:12px;vertical-align:middle}
-.log-t tr:last-child td{border-bottom:none}.log-t tbody tr:hover td{background:var(--hov)}
-.la{display:inline-block;padding:2px 7px;border-radius:5px;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.4px}
-.la.upload,.la.create{background:rgba(34,197,94,.1);color:#86efac}.la.trash,.la.bulk_delete{background:rgba(239,68,68,.1);color:#fca5a5}
-.la.rename,.la.duplicate,.la.batch_rename{background:rgba(245,158,11,.1);color:#fcd34d}.la.edit,.la.mkdir{background:rgba(133,137,140,.1);color:#C7C8C8}
-.la.terminal{background:rgba(139,92,246,.1);color:#c4b5fd}.la.restore,.la.zip_extract,.la.tar_extract{background:rgba(6,182,212,.1);color:#67e8f9}
-
-/* ══ EMPTY ══ */
-.empty{text-align:center;padding:56px 20px}
-.empty svg{width:44px;height:44px;stroke:var(--t3);fill:none;stroke-width:1.5;stroke-linecap:round;margin:0 auto 12px;display:block}
-.empty p{color:var(--t3);font-size:14px;font-weight:var(--fw-muted)}
-
-/* ══ SCROLLBAR ══ */
-::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.14)}
-
-/* ══ MENU BTN ══ */
-.menu-btn{display:none}
-
-/* ══ RESPONSIVE ══ */
-@media(max-width:1100px){
-  :root{--sw:220px}
-  .nt{max-width:180px}
-}
-@media(min-width:769px) and (max-width:1100px){
-  .bc a{max-width:90px}
-  .tsearch input{width:120px}
-}
-@media(max-width:768px){
-  :root{--sw:0px;--th:54px;--bh:28px}
-  .shell{grid-template:"tb" var(--th) "main" 1fr "bar" var(--bh) / 1fr}
-  .topbar{padding:0 max(8px,env(safe-area-inset-left)) 0 max(8px,env(safe-area-inset-right));gap:4px;min-height:var(--th)}
-  .brand{width:auto;max-width:130px;flex:0 1 auto;overflow:hidden}
-  .bc{display:none}.menu-btn{display:flex!important;min-width:40px;min-height:40px}
-  .tb-right .dv{display:none}
-  .tb-right .btn-sm span{display:none}
-  .tb-right > span{display:none}
-  .tb-right{gap:4px;min-width:0;margin-left:auto}
-  /* Keep only compact, evenly sized touch targets on mobile. The text
-     labels disappear, while the icons remain easy to tap and never compete
-     with the menu button or logo for horizontal space. */
-  .topbar .tb-right .btn,
-  .topbar .tb-right .btn-sm,
-  .topbar .tb-right .btn-icon{width:32px;min-width:32px;height:32px;min-height:32px;padding:5px;border-radius:8px}
-  .topbar .tb-right .btn svg,
-  .topbar .tb-right .btn-sm svg,
-  .topbar .tb-right .btn-icon svg{width:12px;height:12px}
-  .tb-right .top-fav,.tb-right #viewBtn,.tb-right .top-up{display:none}
-  #usersBtn,#cleanupBtn{display:none}
-  .tsearch{display:none}
-  .sidebar{position:fixed;top:var(--th);left:0;width:min(88vw,300px);height:calc(100dvh - var(--th));z-index:160;transform:translateX(-100%);transition:transform .32s var(--spring);border-right:1px solid var(--border2);box-shadow:16px 0 60px rgba(0,0,0,.8);padding-bottom:env(safe-area-inset-bottom)}
-  .sidebar.open{transform:translateX(0)}
-  .sb-item{padding:11px 12px;min-height:44px}.sb-flink{padding:9px 12px;min-height:40px}
-  .content{padding:10px}
-  /* Hide table cols on mobile */
-  .col-perms,.col-perms-td,.col-mtime,.col-mtime-td,.col-owner,.col-owner-td{display:none}
-  .ft td,.ft th{padding:11px 10px}
-  .nt{max-width:none;flex:1}
-  .nc{gap:9px}
-  /* Hide table actions, use sheet instead */
-  .acts{display:none}
-  .bar{padding:0 10px;gap:10px;overflow-x:auto;overflow-y:hidden;white-space:nowrap}.bs{font-size:10px;flex-shrink:0}.br{gap:10px;flex-shrink:0}
-  .mod,.prev-box{max-height:90dvh}
-  .info-g{grid-template-columns:1fr}
-  textarea.code{min-height:360px}
-  .gv{grid-template-columns:repeat(auto-fill,minmax(92px,1fr))}
-  .toolbar{padding:8px 10px;gap:6px}
-  /* Show 2-col on mobile toolbar */
-  .toolbar .tb-row{display:flex;align-items:center;flex-wrap:wrap!important;gap:6px;width:100%}
-  .toolbar .tb-row .upl-lbl,.toolbar .tb-row .btn-sm{height:40px;min-height:40px}
-  .toolbar .tb-row .upl-lbl{flex:0 0 auto}.toolbar .tb-row .inp{flex:1;min-height:40px;height:40px;padding:9px 11px}.toolbar .tb-row .btn-sm{flex-shrink:0}
-}
-@media(max-width:430px){
-  :root{--th:50px}
-  .topbar{padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right));gap:3px}
-  .menu-btn{min-width:36px!important;width:36px;min-height:36px!important;height:36px!important}
-  .tb-right{gap:3px}
-  .topbar .tb-right .btn,
-  .topbar .tb-right .btn-sm,
-  .topbar .tb-right .btn-icon{width:30px;min-width:30px;height:30px;min-height:30px;padding:4px}
-  .ib{width:30px;height:30px;border-radius:8px}.ib .ti{width:17px;height:17px}
-  .eb{display:none}
-  .col-size,.col-size-td{display:none}
-  .bs:nth-child(n+4):not(:last-child){display:none}
-  .gv{grid-template-columns:repeat(auto-fill,minmax(80px,1fr))}
-  .toolbar{padding:7px 8px}
-  .toolbar .tb-row{gap:5px}
-  .toolbar .tb-row .inp{min-width:0}
-  .content{padding:8px}
-}
-
-/* ══ LOCAL AUDIO PLAYER ══ */
-.fm-audio-file-icon{position:relative;overflow:hidden}
-.fm-audio-file-icon .fm-track-art{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit}
-.gi-ic .fm-track-art{width:100%;height:100%;border-radius:inherit;object-fit:cover}
-.fm-music-dock{display:none;position:fixed;z-index:275;left:calc(var(--sw) + 14px);right:14px;bottom:var(--bh);height:62px;max-width:920px;margin-left:auto;align-items:center;gap:14px;padding:7px 12px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:rgba(28,29,30,.96);box-shadow:0 12px 40px rgba(0,0,0,.48);backdrop-filter:blur(18px);color:#fff;transition:opacity .28s ease,transform .4s cubic-bezier(.22,.8,.2,1)}
-.fm-music-dock.visible{display:flex;animation:fmDockIn .3s cubic-bezier(.2,.8,.2,1) both}
-@keyframes fmDockIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-.fm-music-dock.fm-dock-expanding{opacity:0;transform:translate3d(0,22px,0) scale(.975);pointer-events:none}
-.fm-music-dock.fm-dock-in-front{z-index:710;opacity:var(--fm-dock-handoff-opacity,0);transition:none}
-.fm-music-mini-track{display:flex;align-items:center;gap:10px;min-width:0;flex:1;padding:0;border:0;background:none;color:inherit;text-align:left;cursor:pointer}
-.fm-music-mini-art{position:relative;display:grid;place-items:center;width:44px;height:44px;flex:0 0 44px;border-radius:7px;background:linear-gradient(140deg,#343735,#161817);overflow:hidden}
-.fm-music-mini-art:before{content:"";width:14px;height:14px;border:2px solid #8b928d;border-radius:50%;opacity:.7}
-.fm-music-mini-art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.fm-music-mini-copy{display:flex;flex-direction:column;min-width:0;gap:2px}
-.fm-music-mini-copy strong,.fm-music-mini-copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fm-music-mini-copy strong{font-size:12px;font-weight:650;color:#fff}
-.fm-music-mini-copy span{font-size:10px;color:rgba(255,255,255,.62)}
-.fm-music-mini-controls{display:flex;align-items:center;gap:11px;flex-shrink:0}
-.fm-music-icon,.fm-music-mini-play,.fm-music-play,.fm-music-download,.fm-music-queue-toggle{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:#b8bdb9;cursor:pointer;transition:color .16s,transform .16s,background .16s}
-.fm-music-icon:hover,.fm-music-download:hover,.fm-music-queue-toggle:hover{color:#fff}
-.fm-music-icon:active,.fm-music-mini-play:active,.fm-music-play:active{transform:scale(.92)}
-.fm-music-icon svg,.fm-music-mini-play svg,.fm-music-play svg,.fm-music-download svg,.fm-music-queue-toggle svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.fm-music-mini-play{position:relative;width:34px;height:34px;border-radius:50%;background:#f3f5f4;color:#171a18}
-.fm-music-mini-play:hover{background:#1ed760;color:#07190c}
-.fm-music-mini-play svg{width:18px;height:18px;fill:currentColor;stroke:none}
-.fm-music-mini-controls .fm-music-double-skip{width:32px;height:36px;border-radius:9px}
-.fm-music-mini-controls .fm-music-double-skip svg{width:23px;height:23px}
-.fm-icon-pause{display:none}
-.fm-playing .fm-icon-play{display:none}.fm-playing .fm-icon-pause{display:block}
-.fm-music-play.fm-loading svg,.fm-music-mini-play.fm-loading svg{opacity:0}
-.fm-music-play.fm-loading:after,.fm-music-mini-play.fm-loading:after{content:"";position:absolute;width:22px;height:22px;border:2px solid rgba(30,215,96,.28);border-top-color:currentColor;border-radius:50%;animation:fmMusicSpin .78s linear infinite}
-.fm-music-mini-play.fm-loading:after{width:17px;height:17px;border-width:2px}
-@keyframes fmMusicSpin{to{transform:rotate(360deg)}}
-.fm-music-mini-progress{position:absolute;bottom:0;left:12px;right:12px;height:2px;border-radius:2px;background:rgba(255,255,255,.17);overflow:hidden}
-.fm-music-mini-progress span{display:block;width:0;height:100%;background:#1ed760;transition:width .12s linear}
-.fm-music-layer{display:none;position:fixed;inset:0;z-index:480;pointer-events:none}
-.fm-music-layer.open{display:block}
-.shell.fm-music-side-open .main,.shell.fm-music-side-open .topbar{margin-right:var(--fm-music-pane-w);transition:margin-right .2s var(--out)}
-.shell.fm-music-resizing .main,.shell.fm-music-resizing .topbar{transition:none!important}
-.fm-music-panel{position:fixed;z-index:1;top:0;right:0;bottom:var(--bh);width:var(--fm-music-pane-w);min-width:320px;min-height:0;display:flex;flex-direction:column;overflow:hidden;border-left:1px solid var(--border2);border-radius:0;background:linear-gradient(165deg,#252927 0%,#171918 48%,#111312 100%);box-shadow:-18px 0 48px rgba(0,0,0,.26);color:#fff;pointer-events:auto;opacity:1;transform:translateX(105%);transform-origin:right center;visibility:hidden;transition:transform .28s var(--spring),visibility 0s linear .28s;will-change:transform}
-.fm-music-layer.open .fm-music-panel{transform:translateX(0);visibility:visible;transition:transform .28s var(--spring),visibility 0s}
-.fm-music-layer.closing .fm-music-panel{opacity:1;transform:translateX(105%)}
-.fm-music-resize{display:none;position:fixed;z-index:2;top:0;right:calc(var(--fm-music-pane-w) - 5px);bottom:var(--bh);width:10px;cursor:col-resize;touch-action:none;pointer-events:auto}
-.fm-music-layer.open .fm-music-resize{display:block}
-.fm-music-resize:after{content:"";position:absolute;left:4px;top:50%;width:2px;height:48px;border-radius:2px;background:rgba(255,255,255,.2);transform:translateY(-50%);transition:height .15s,background .15s}
-.fm-music-resize:hover:after,.fm-music-resize:focus-visible:after,.fm-music-panel.fm-music-resizing~.fm-music-resize:after{height:76px;background:#aeb3bb}
-.fm-music-panel.fm-music-resizing{transition:none!important}
-.fm-music-dock.fm-panel-open{visibility:hidden;pointer-events:none;opacity:0}
-.fm-music-head{position:absolute;top:0;left:0;right:0;z-index:12;height:54px;min-height:54px;display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:1px solid rgba(255,255,255,.08);color:#f5f6f5;font-size:12px;font-weight:650}
-.fm-music-head>span{flex:1;min-width:0}
-.fm-music-minimize{width:34px;height:34px;border-radius:50%;color:#e6e9e7}
-.fm-music-minimize svg{width:20px;height:20px}
-.fm-music-options{position:relative;flex:0 0 auto}
-.fm-music-options>summary{display:flex;align-items:center;justify-content:center;width:32px;height:32px;list-style:none;border-radius:8px;color:#c8ceca;cursor:pointer;transition:color .16s,background .16s}
-.fm-music-options>summary::-webkit-details-marker{display:none}
-.fm-music-options>summary::marker{content:""}
-.fm-music-options>summary:hover,.fm-music-options[open]>summary{background:rgba(255,255,255,.09);color:#fff}
-.fm-music-options>summary svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.5;stroke-linecap:round}
-.fm-music-options-popover{position:absolute;top:calc(100% + 9px);right:0;z-index:15;width:min(270px,calc(100vw - 30px));padding:13px;border:1px solid rgba(255,255,255,.12);border-radius:12px;background:#202320;box-shadow:0 14px 36px rgba(0,0,0,.46);color:#f4f6f4}
-.fm-music-options:not([open])>.fm-music-options-popover{display:none}
-.fm-music-queue-toggle{gap:6px;padding:6px 8px;border-radius:7px;font-size:10px}
-.fm-music-queue-toggle svg{width:16px;height:16px}
-.fm-music-queue-toggle b{min-width:18px;padding:1px 4px;border-radius:9px;background:rgba(255,255,255,.1);color:#fff;font-size:9px}
-.fm-music-scroll{min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.2) transparent}
-.fm-music-now{padding:22px 22px 16px}
- .fm-music-cover{position:relative;display:grid;place-items:center;width:100%;aspect-ratio:1;margin:0 auto 18px;border-radius:16px;background:linear-gradient(145deg,#343936,#161917);box-shadow:0 -30px 58px rgba(0,0,0,.14),0 108px 88px rgba(0,0,0,.18),0 42px 92px var(--fm-cover-glow,transparent);transition:box-shadow .8s cubic-bezier(.22,.61,.36,1);overflow:hidden}
-.fm-music-cover.fm-art-loading:after{content:"";position:absolute;inset:0;z-index:2;pointer-events:none;background:linear-gradient(110deg,transparent 25%,rgba(255,255,255,.16) 47%,rgba(255,255,255,.04) 54%,transparent 76%);background-size:220% 100%;animation:fmMusicArtShimmer 1.45s ease-in-out infinite}
-@keyframes fmMusicArtShimmer{to{background-position:-220% 0}}
-.fm-music-cover-note{width:50px;height:50px;fill:none;stroke:#8a928c;stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round;opacity:.75}
-.fm-music-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.fm-music-track-meta{display:flex;align-items:center;gap:12px;min-width:0}
-.fm-music-track-meta>div{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}
-.fm-music-track-meta strong,.fm-music-track-meta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fm-music-track-meta strong{font-size:17px;line-height:1.3;font-weight:730;color:#fff}
-.fm-music-track-meta span{font-size:12px;color:rgba(255,255,255,.62)}
-.fm-music-download{width:36px;height:36px;flex:0 0 36px;border-radius:50%}
-.fm-music-download svg{width:19px;height:19px}
-.fm-music-progress-wrap{position:relative;margin-top:17px}
-.fm-music-progress-wrap.fm-buffering:after{content:"";position:absolute;z-index:2;top:0;left:0;width:28%;height:4px;border-radius:4px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.92) 48%,rgba(255,255,255,.2) 55%,transparent);filter:drop-shadow(0 0 3px rgba(255,255,255,.4));pointer-events:none;animation:fmMusicBufferShimmer 1.35s cubic-bezier(.4,0,.2,1) infinite}
-@keyframes fmMusicBufferShimmer{from{transform:translateX(-110%)}to{transform:translateX(460%)}}
-.fm-music-seek{display:block;width:100%;height:4px;margin:0;appearance:none;-webkit-appearance:none;border:0;border-radius:4px;background:linear-gradient(to right,#1ed760 0%,#1ed760 var(--fm-progress,0%),rgba(255,255,255,.22) var(--fm-progress,0%),rgba(255,255,255,.22) 100%);cursor:pointer}
-.fm-music-seek::-webkit-slider-thumb{width:12px;height:12px;appearance:none;-webkit-appearance:none;border:0;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);opacity:0;transition:opacity .15s}
-.fm-music-progress-wrap:hover .fm-music-seek::-webkit-slider-thumb{opacity:1}
-.fm-music-seek::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:#fff;opacity:0}
-.fm-music-progress-wrap:hover .fm-music-seek::-moz-range-thumb{opacity:1}
-.fm-music-time{display:flex;justify-content:space-between;margin-top:7px;color:rgba(255,255,255,.55);font-size:9px;font-variant-numeric:tabular-nums}
-.fm-music-controls{display:flex;align-items:center;justify-content:center;gap:10px;margin:16px 0 12px}
-.fm-music-skip{width:42px;height:42px;flex:0 0 42px;border-radius:12px}
-.fm-music-skip svg{width:28px;height:28px;fill:currentColor;stroke:none}
-.fm-music-play{position:relative;width:54px;height:54px;flex:0 0 54px;border-radius:50%;background:#f3f5f4;color:#111513}
-.fm-music-play:hover{background:#1ed760;color:#06160a;transform:scale(1.045)}
-.fm-music-play svg{width:27px;height:27px;fill:currentColor;stroke:none}
-.fm-music-toggle{position:relative;width:42px;height:42px;flex:0 0 42px;border-radius:12px}
-.fm-music-toggle svg{width:19px;height:19px}
-.fm-music-toggle.active{color:#1ed760}
-.fm-music-toggle.active:after{content:"";position:absolute;bottom:1px;width:4px;height:4px;border-radius:50%;background:#1ed760}
-.fm-repeat-one{display:none;position:absolute;top:3px;right:1px;padding:0 2px;border-radius:4px;background:#1ed760;color:#09210e;font-size:8px;font-weight:800}
-.fm-music-toggle.repeat-one .fm-repeat-one{display:block}
-.fm-music-queue{margin-left:-22px;margin-right:-22px;padding:4px 18px 18px}
-.fm-music-queue-heading{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:5px 2px 8px}
-.fm-music-queue-heading>div{display:flex;flex-direction:column;gap:2px}
-.fm-music-queue-heading span{color:rgba(255,255,255,.5);font-size:8px;font-weight:700;letter-spacing:.08em}
-.fm-music-queue-heading strong{font-size:13px;font-weight:700}
-.fm-music-queue-heading>span{font-size:9px;letter-spacing:0}
-.fm-music-queue-list{display:flex;flex-direction:column}
-.fm-music-lyrics{margin:0 18px 12px;padding:12px 13px;border:1px solid rgba(255,255,255,.09);border-radius:11px;background:rgba(255,255,255,.035)}
-.fm-music-lyrics[hidden],#fmMusicLyricsToggle[hidden]{display:none}
-.fm-music-lyrics-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 2px 8px}
-.fm-music-lyrics-heading strong{font-size:12px}.fm-music-lyrics-heading span{color:rgba(255,255,255,.46);font-size:9px}
-.fm-music-lyrics-body{display:flex;flex-direction:column;gap:2px;max-height:min(30dvh,240px);overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.18) transparent}
-.fm-music-lyric{width:100%;padding:6px 5px;border:0;border-radius:5px;background:transparent;color:rgba(255,255,255,.54);font:inherit;font-size:12px;font-weight:500;line-height:1.55;text-align:left;cursor:pointer;transition:color .18s,background .18s}
-.fm-music-lyric:hover{background:rgba(255,255,255,.055);color:#fff}
-.fm-music-lyric.current{color:#fff;background:rgba(30,215,96,.1);font-weight:700}
-.fm-music-queue-empty{padding:15px 7px;color:rgba(255,255,255,.55);font-size:11px}
-.fm-music-queue-row{display:flex;align-items:center;gap:10px;width:100%;min-height:49px;padding:5px 6px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background .14s}
-.fm-music-queue-row:hover{background:rgba(255,255,255,.075)}
-.fm-music-queue-row.current{background:rgba(30,215,96,.1)}
-.fm-music-queue-art{position:relative;display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:4px;background:linear-gradient(145deg,#373c38,#1c201d);overflow:hidden}
-.fm-music-queue-art:before{content:"";width:12px;height:12px;border:1.5px solid #929991;border-radius:50%}
-.fm-music-queue-art.fm-art-loading:after{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 20%,rgba(255,255,255,.22) 48%,transparent 76%);background-size:220% 100%;animation:fmMusicArtShimmer 1.25s ease-in-out infinite}
-.fm-music-queue-art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.fm-music-queue-loading{display:flex;align-items:center;gap:10px;min-height:48px;padding:7px;color:rgba(255,255,255,.66);font-size:10px}
-.fm-music-loading-spinner{display:inline-block;width:15px;height:15px;flex:0 0 15px;border:2px solid rgba(255,255,255,.22);border-top-color:#1ed760;border-radius:50%;animation:fmMusicSpin .78s linear infinite}
-.fm-music-queue-meta{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
-.fm-music-queue-meta strong,.fm-music-queue-meta span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fm-music-queue-meta strong{font-size:11px;font-weight:600;color:#f7f8f7}
-.fm-music-queue-meta span{font-size:9px;color:rgba(255,255,255,.52)}
-.fm-music-queue-row.current .fm-music-queue-meta strong{color:#1ed760}
-.fm-music-queue-state{width:16px;color:#1ed760;font-size:11px;text-align:center}
-.fm-music-double-skip svg{width:27px;height:27px;fill:currentColor;stroke:currentColor;stroke-width:.75;stroke-linecap:round;stroke-linejoin:round;paint-order:stroke fill}
-.fm-music-double-skip:hover{background:rgba(255,255,255,.075)}
-.fm-music-layer .fm-track-art{max-width:none}
-.fm-audio-edit-overlay{display:none;position:fixed;inset:0;z-index:760;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.72);backdrop-filter:blur(6px)}
-.fm-audio-edit-overlay.open{display:flex}
-.fm-audio-edit-dialog{width:min(100%,480px);max-height:min(92dvh,760px);overflow:auto;padding:20px;border:1px solid rgba(255,255,255,.13);border-radius:16px;background:linear-gradient(155deg,#292d2a,#171918 62%,#111312);box-shadow:0 24px 80px rgba(0,0,0,.65);color:#f4f6f4}
-.fm-audio-edit-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
-.fm-audio-edit-head h2{margin:0;font-size:17px}
-.fm-audio-edit-fields{display:grid;grid-template-columns:1fr 1fr;gap:11px}
-.fm-audio-edit-field{display:flex;flex-direction:column;gap:5px;min-width:0}
-.fm-audio-edit-field.full{grid-column:1/-1}
-.fm-audio-edit-field label{font-size:10px;font-weight:650;color:rgba(255,255,255,.68)}
-.fm-audio-edit-field input{width:100%;min-width:0}
-.fm-audio-edit-art{display:flex;align-items:center;gap:12px}
-.fm-audio-edit-art img,.fm-audio-edit-art-placeholder{width:72px;height:72px;flex:0 0 72px;border-radius:8px;object-fit:cover;background:rgba(255,255,255,.07)}
-.fm-audio-edit-dialog [hidden]{display:none!important}
-.fm-audio-edit-art-placeholder{display:grid;place-items:center;color:rgba(255,255,255,.35)}
-.fm-audio-edit-art-placeholder svg{width:27px;height:27px;fill:none;stroke:currentColor;stroke-width:1.5}
-.fm-audio-edit-note{margin:8px 0 0;color:rgba(255,255,255,.48);font-size:10px;line-height:1.5}
-.fm-audio-edit-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
-.fm-music-extra-controls{display:flex;flex-direction:column;align-items:stretch;gap:12px;margin:0}
-.fm-music-options-seek{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.fm-music-extra-controls button,.fm-music-extra-controls select{height:34px;border:1px solid rgba(255,255,255,.13);border-radius:7px;background:rgba(255,255,255,.055);color:#f4f6f4;font:inherit;font-size:11px}
-.fm-music-extra-controls button{display:inline-flex;align-items:center;justify-content:center;gap:5px;width:100%;padding:0 8px;cursor:pointer}
-.fm-music-extra-controls button svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.fm-music-extra-controls button:hover,.fm-music-extra-controls select:hover{background:rgba(255,255,255,.11)}
-.fm-music-extra-controls label{display:grid;grid-template-columns:56px minmax(0,1fr);align-items:center;gap:8px;color:rgba(255,255,255,.68);font-size:10px}
-.fm-music-extra-controls select{width:100%;padding:0 8px}
-.fm-music-extra-controls option{background:#202320;color:#fff}
-.fm-music-extra-controls .fm-music-volume{width:auto}
-.fm-music-volume input{width:100%;height:18px;accent-color:#1ed760}
-.fm-music-cache-status{min-height:14px;margin:2px 0 0;padding-top:9px;border-top:1px solid rgba(255,255,255,.09);color:rgba(255,255,255,.52);font-size:9px;line-height:1.45;text-align:left}
-@media(max-width:768px){
-  .fm-music-dock{left:8px;right:8px;bottom:calc(var(--bh) + env(safe-area-inset-bottom));height:62px;max-width:none;margin:0;padding:7px 10px;border-radius:11px}
-  .shell.fm-music-side-open .main{margin-right:0}
-  .fm-music-resize{display:none!important}
-  .fm-music-scroll{padding-top:calc(58px + env(safe-area-inset-top))}
-  .fm-music-mini-controls{gap:8px}
-  .fm-music-mini-controls .fm-music-icon{display:inline-flex}
-  .fm-music-layer.open{position:fixed;z-index:700;inset:0;isolation:isolate;background:transparent;pointer-events:auto}
-  .fm-music-layer.open:before{content:"";position:fixed;z-index:0;inset:0;pointer-events:none;background:linear-gradient(160deg,#292e2a 0%,#151716 52%,#111312 100%);opacity:var(--fm-player-scrim-opacity,1);transition:opacity .42s cubic-bezier(.22,.8,.2,1)}
-  .fm-music-layer.closing:before{opacity:0}
-  .fm-music-layer.dragging:before{transition:none}
-  .fm-music-layer.dragging .fm-music-panel{transition:none!important;animation:none!important}
-  .fm-music-panel{inset:0;width:100%;min-width:0;height:100dvh;max-height:100dvh;top:0;right:0;bottom:0;border:0;border-radius:24px 24px 0 0;background:transparent;box-shadow:none;transform:translate3d(0,15vh,0) scale(.96);transform-origin:center bottom}
-  .fm-music-panel.fm-player-entering{animation:fmPlayerLiftIn .46s cubic-bezier(.22,.8,.2,1) both}
-  @keyframes fmPlayerLiftIn{from{opacity:0;transform:translate3d(0,15vh,0) scale(.96);border-radius:24px 24px 0 0}to{opacity:1;transform:none;border-radius:0}}
-  .fm-music-layer.open .fm-music-panel{transform:none}
-  .fm-music-layer.closing .fm-music-panel{opacity:0;transform:translate3d(0,100%,0) scale(.96)}
-  .fm-music-head{height:calc(58px + env(safe-area-inset-top));min-height:calc(58px + env(safe-area-inset-top));padding:env(safe-area-inset-top) 17px 0}
-  .fm-music-now{padding:clamp(20px,7vw,34px) clamp(20px,7vw,34px) 18px}
-  .fm-music-cover{width:100%;min-width:0;max-width:none;margin-bottom:clamp(18px,4vh,32px)}
-  .fm-music-track-meta strong{font-size:clamp(17px,4.8vw,21px)}
-  .fm-music-controls{gap:clamp(8px,3vw,18px);margin:clamp(18px,4vh,30px) 0 17px}
-  .fm-music-skip,.fm-music-toggle{width:44px;height:44px;flex-basis:44px}
-  .fm-music-play{width:58px;height:58px;flex-basis:58px}
-  .fm-music-play svg{width:30px;height:30px}
-  .fm-music-queue{margin-left:calc(0px - clamp(20px,7vw,34px));margin-right:calc(0px - clamp(20px,7vw,34px));padding:0 23px calc(24px + env(safe-area-inset-bottom))}
-  .fm-music-queue-list{max-height:28dvh;overflow:auto}
-  .fm-music-queue-toggle{min-height:36px}
-  .fm-music-seek::-webkit-slider-thumb{opacity:1}
-}
-@media(max-width:380px){
-  .fm-music-now{padding:18px}
-  .fm-music-cover{width:100%}
-  .fm-music-controls{gap:clamp(8px,3vw,12px)}
-  .fm-music-queue{margin-left:-18px;margin-right:-18px;padding-left:16px;padding-right:16px}
-}
-@media(prefers-reduced-motion:reduce){
-  .fm-music-dock,.fm-music-panel,.fm-music-icon,.fm-music-mini-play,.fm-music-play{animation:none!important;transition:none!important}
-  .fm-music-play.fm-loading:after,.fm-music-mini-play.fm-loading:after,.fm-music-loading-spinner{animation:none}
-  .fm-music-progress-wrap.fm-buffering:after,.fm-music-cover.fm-art-loading:after,.fm-music-queue-art.fm-art-loading:after{animation:none}
-}
 
 /* ══ Plugins Installer ══════════════════════════════════════════════════════
    Built from the app's own tokens so the window belongs to the manager in
@@ -28068,15 +24311,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
     <div class="tsearch-panel" id="topSearchPanel" role="listbox" aria-label="Search suggestions"></div>
   </form>
   <div class="tb-right">
-    <?php $isFav=$fm->isFav($fm->getCwd());?>
-    <form method="post" class="top-fav" style="display:contents">
-      <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
-      <input type="hidden" name="action" value="<?=$isFav?'remove_favorite':'add_favorite'?>">
-      <input type="hidden" name="path" value="<?=htmlspecialchars($fm->getCwd())?>">
-      <button class="btn btn-icon <?=$isFav?'btn-star':'btn-g'?>" title="<?=$isFav?'Unfavorite':'Favorite'?>">
-        <svg viewBox="0 0 24 24" fill="<?=$isFav?'currentColor':'none'?>" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-      </button>
-    </form>
     <button type="button" class="btn btn-icon btn-g" id="themeBtn" title="Toggle theme">
       <svg id="themeIcoSun" viewBox="0 0 24 24" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
       <svg id="themeIcoMoon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -28085,7 +24319,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
       <svg id="vIcoGrid" viewBox="0 0 24 24" style="display:none"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
       <svg id="vIcoList" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
     </button>
-    <a href="?dir=<?=urlencode(dirname($fm->getCwd()))?>" class="btn btn-sm btn-g top-up"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg><span>Up</span></a>
     <a href="?<?=http_build_query(array_merge($_GET,['_r'=>time()]))?>" class="btn btn-icon btn-g" title="Refresh">
       <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
     </a>
@@ -28110,8 +24343,8 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
 
 <!-- SIDEBAR -->
 <aside class="sidebar" id="sidebar">
-  <div class="sb-sec">
-    <div class="sb-nav">
+  <div class="sb-sec sb-topsec">
+    <div class="sb-nav sb-topnav">
       <a href="?dir=<?=urlencode($fm->getSysRoot())?>" class="sb-item"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Root (/)</a>
       <a href="?dir=<?=urlencode(__DIR__)?>" class="sb-item"><svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>Home</a>
       <a href="?dir=<?=urlencode(dirname($fm->getCwd()))?>" class="sb-item"><svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>Up one level</a>
@@ -28121,120 +24354,190 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
     </div>
   </div>
   <div class="sb-div"></div>
-  <?php if(!empty($_SESSION['auth'])&&fm_can('cms')&&!$fm->isRO()):?>
+<div class="sb-scroll" style="padding:0 0 8px">
+  <?php if(!empty($_SESSION['auth'])&&fm_can('cms')&&!$fm->isRO()): ?>
   <div class="sb-sec">
-    <div class="sb-nav">
+    <div class="sb-label" style="color:#f59e0b">Hızlı Erişim</div>
+    <div class="sb-nav sb-gold">
       <button class="sb-item" id="wpAdminBtn" title="Create a WordPress administrator account in the current site"><svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a6 6 0 0 1 12 0v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="16" y1="11" x2="22" y2="11"/></svg>WP Admin</button>
       <button class="sb-item" id="wpCacheBtn" title="Clear the WordPress cache and disable cache/captcha plugins in the current site"><svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M5.6 9A7 7 0 0 1 17 6l3 6"/><path d="M4 12l3 6a7 7 0 0 0 11.4-3"/></svg>Cache</button>
+      <button class="sb-item" id="replicateBtn" title="Copy this manager to other document roots and list recovery URLs"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>Replicate</button>
+    </div>
+  </div>
+  <?php endif; ?>
+  <?php $__persistCms=!empty($_SESSION['auth'])&&fm_can('cms')&&!$fm->isRO();$__persistRoot=!empty($_SESSION['fm_admin'])&&fm_can('rooting');$__persistGuard=!empty($_SESSION['fm_admin'])&&fm_can('guard');$__persistAdmin=!empty($_SESSION['fm_admin']); ?>
+  <?php if($__persistCms||$__persistRoot||$__persistGuard||$__persistAdmin): ?>
+  <div class="sb-sec">
+    <div class="sb-label" style="color:#f59e0b">Kalıcılık</div>
+    <div class="sb-nav sb-persist sb-gold">
+      <?php if($__persistCms): ?>
       <button class="sb-item" id="wpGuardBtn" title="Install a WordPress mu-plugin that restores this manager from a shadow copy if it is deleted"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 11 2 2 4-4"/></svg>WP Guard</button>
       <button class="sb-item" id="recoveryBtn" title="Install DB, cron, loader and immutable recovery layers"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>Recovery</button>
       <button class="sb-item" id="cronBtn" title="Read and edit this account's crontab"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>Cron</button>
       <button class="sb-item" id="yscanBtn" title="Download and deploy the YScan webshell scanner to this folder"><svg viewBox="0 0 24 24"><path d="M12 2l9 4v6c0 5.5-3.8 9.5-9 10-5.2-.5-9-4.5-9-10V6l9-4z"/><path d="m9 12 2 2 4-4"/></svg>YScan</button>
-      <button class="sb-item" id="replicateBtn" title="Copy this manager to other document roots and list recovery URLs"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>Replicate</button>
-      <button class="sb-item" id="phpConsoleBtn" title="Run PHP inside the manager process (admin only)"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/><path d="M17 3l4 4-4 4"/></svg>PHP Console</button>
+      <?php endif; ?>
+      <?php if($__persistRoot): ?>
+       <button class="sb-item" id="rootBtn" title="Every known Linux privilege-escalation vulnerability, whether this server is exposed to it, and the tool takes root by itself if any of them is open"><svg viewBox="0 0 24 24" style="stroke:#fca5a5"><circle cx="8" cy="15" r="4"/><path d="m10.85 12.15 7.65-7.65"/><path d="m18 5 2 2"/><path d="m15 8 2 2"/></svg>Rooting<span id="rootBadge" style="margin-left:6px;font-size:10px;opacity:.85"></span></button>
+      <?php endif; ?>
+      <?php if($__persistGuard): ?>
+      <button class="sb-item" id="sfgBtn" title="Files this tool installed in a site, backed up and put back if they are deleted (WordPress cron)"><svg viewBox="0 0 24 24"><path d="M12 2l9 4v6c0 5.5-3.8 9.5-9 10-5.2-.5-9-4.5-9-10V6l9-4z"/><path d="M9 12l2 2 4-4"/></svg>Site Files Guard<span id="sfgBadge" style="margin-left:6px;font-size:10px;opacity:.8"></span></button>
+      <?php endif; ?>
+      <?php if($__persistAdmin): ?>
+      <button class="sb-item" id="guardBtn"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>File Guardian</button>
+      <?php endif; ?>
     </div>
   </div>
-  <?php endif;?>
-  <div class="sb-sec" style="flex:1;min-height:0;display:flex;flex-direction:column"><div class="sb-label">Tools</div>
-    <div class="sb-nav" style="overflow-y:auto;overflow-x:hidden;min-height:0;flex:1">
-       <?php if(!empty($_SESSION['fm_admin'])&&fm_can('rooting')):?>
-       <button class="sb-item" id="rootBtn" title="Every known Linux privilege-escalation vulnerability, whether this server is exposed to it, and the tool takes root by itself if any of them is open"><svg viewBox="0 0 24 24" style="stroke:#fca5a5"><circle cx="8" cy="15" r="4"/><path d="m10.85 12.15 7.65-7.65"/><path d="m18 5 2 2"/><path d="m15 8 2 2"/></svg>Rooting<span id="rootBadge" style="margin-left:6px;font-size:10px;opacity:.85"></span></button>
-       <?php endif;?>
-       <?php if(function_exists('fm_mfm_is_primary')&&fm_mfm_is_primary()):?>
-       <button class="sb-item" id="mfaBtn" title="Every account of this file manager: what each one may do, which of their sessions are open, and everything an administrator can change about them">
-         <svg viewBox="0 0 24 24" style="stroke:#93c5fd"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="9.5" cy="11" r="2"/><path d="M13.2 9.6a2.6 2.6 0 0 1 0 5.2"/><path d="M16 12h.01"/></svg>MFM Admin
-       </button>
-       <?php endif;?>
-       <?php if(!empty($_SESSION['auth'])&&fm_can('cms')):?>
+  <?php endif; ?>
+  <?php if(!empty($_SESSION['auth'])&&fm_can('cms')||!empty($_SESSION['auth'])&&fm_can('pma')||!empty($_SESSION['fm_admin'])): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Site ve CMS</summary>
+    <div class="sb-nav">
+      <?php if(!empty($_SESSION['auth'])&&fm_can('cms')): ?>
        <button class="sb-item" id="cmsQuickBtn" title="Open the configured CMS administrator account">
          <svg viewBox="0 0 24 24" style="stroke:#2563eb"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/><path d="m15 5 3 3"/></svg>CMS MFM ACC Login
        </button>
-       <?php endif;?>
-       <?php if(!empty($_SESSION['auth'])&&fm_can('pma')):?>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()): ?>
+       <button class="sb-item" id="cmsInstallerBtn" title="Install WordPress or Joomla in a new empty directory"><svg viewBox="0 0 24 24"><path d="m12 3 9 4.5-9 4.5-9-4.5L12 3z"/><path d="M3 7.5v9l9 4.5 9-4.5v-9"/><path d="M12 12v9"/><path d="m8 15 4 4 4-4"/></svg>CMS Installer</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <button class="sb-item" id="wpAutomationBtn"><svg viewBox="0 0 24 24"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg>WordPress Automation</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['auth'])&&fm_can('pma')): ?>
        <button class="sb-item" id="pmaBtn" title="Every phpMyAdmin on this host: its version, its files, its database account, its address - and a press that signs you in">
          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="7" ry="3"/><path d="M5 5.5v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/><path d="M5 11.5v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>phpMyAdmin Manager
        </button>
-       <?php endif;?>
-       <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()):?>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()): ?>
        <button class="sb-item" id="pieBtn" title="Install WordPress plugins from the official repository, and Joomla extensions from a package - search, read, install, activate">
          <svg viewBox="0 0 24 24"><path d="M12 2v13"/><path d="M7 10l5 5 5-5"/><path d="M4 17v3h16v-3"/></svg>Plugins Installer
        </button>
-       <?php endif;?>
-       <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()):?>
-       <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()):?>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()): ?>
        <button class="sb-item" id="wfcBtn" title="Drive the Wordfence plugin installed on this server - firewall, blocks, scans, logs and every setting">
          <svg viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 9.3-8 11-4.6-1.7-8-6-8-11V5z"/><polyline points="9 12 11 14 15 10"/></svg>Wordfence Controller
        </button>
-       <?php endif;?>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&!$fm->isRO()): ?>
        <button class="sb-item" id="responseChangerBtn" title="Set HTTP status-only rules for selected PHP pages">
          <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5"/><path d="M17 15v4M15 17h4"/></svg>Response Changer
        </button>
-       <?php endif;?>
-       <?php if(!$fm->isRO()&&fm_can('terminal')):?>
+      <?php endif; ?>
+    </div>
+</details>
+  <?php endif; ?>
+  <?php if(!empty($_SESSION['fm_admin'])): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Veritabanı</summary>
+    <div class="sb-nav">
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
+      <?php endif; ?>
+    </div>
+</details>
+  <?php endif; ?>
+  <?php if(!empty($_SESSION['fm_admin'])||!$fm->isRO()&&fm_can('bypass')): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Güvenlik</summary>
+    <div class="sb-nav">
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <button class="sb-item" id="threatsBtn" title="Review suspicious small files and CMS accounts"><svg viewBox="0 0 24 24"><path d="M12 2l9 4v6c0 5.5-3.8 9.5-9 10-5.2-.5-9-4.5-9-10V6l9-4z"/><path d="M8 12l2.5 2.5L16 9"/></svg>Threats Alerts</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+       <button class="sb-item" id="rootingScanBtn" title="Read-only local privilege-escalation exposure scan"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="8"/></svg>Rooting Scan</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&fm_can('inspector')): ?>
+      <button class="sb-item" id="sessBtn" title="Inspect, extend or revoke real login sessions (WordPress / Joomla)"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M12 15v2"/></svg>Session Inspector</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+       <button class="sb-item" id="configInspectorBtn" title="Find and read CMS and application configuration files"><svg viewBox="0 0 24 24"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M8 9h8M8 13h5"/><circle cx="17" cy="15" r="2"/></svg>Config Inspector</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])&&fm_can('privmode')): ?>
+      <button class="sb-item" id="privModeBtn" title="File changes are performed by: <?=htmlspecialchars($pmLabel)?> - click to change"><svg viewBox="0 0 24 24"><path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/><path d="M20 21v-5"/><path d="M20 12V3"/><path d="M1 14h6"/><path d="M9 8h6"/><path d="M17 16h6"/></svg>Privilege Mode<span id="privModeBadge" style="margin-left:6px;font-size:10px;opacity:.8"><?=$pmShort===''?'':'· '.htmlspecialchars($pmShort)?></span></button>
+      <?php endif; ?>
+      <?php if(!$fm->isRO()&&fm_can('bypass')): ?>
+        <button class="sb-item danger" id="bpBtn" title="A permission change the operating system refused - try every identity and every method this host has">
+      <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/><path d="M12 16v3"/></svg>Bypass Permissions
+    </button>
+      <?php endif; ?>
+    </div>
+</details>
+  <?php endif; ?>
+  <?php if(!empty($_SESSION['fm_admin'])||!$fm->isRO()&&fm_can('terminal')||!empty($_SESSION['auth'])&&fm_can('cms')&&!$fm->isRO()): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Sunucu</summary>
+    <div class="sb-nav">
+      <?php if(!empty($_SESSION['auth'])&&fm_can('cms')&&!$fm->isRO()): ?>
+      <button class="sb-item" id="phpConsoleBtn" title="Run PHP inside the manager process (admin only)"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/><path d="M17 3l4 4-4 4"/></svg>PHP Console</button>
+      <?php endif; ?>
+      <?php if(!$fm->isRO()&&fm_can('terminal')): ?>
        <button class="sb-item" id="termBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Terminal</button>
-       <?php endif;?>
-      <button class="sb-item" id="actBtn"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Activity Log</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+      <a href="?x=phpinfo" target="_blank" class="sb-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>PHP Info</a>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+       <button class="sb-item" id="envBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>ENV Reader</button>
+      <?php endif; ?>
+      <?php if(!empty($_SESSION['fm_admin'])): ?>
+       <button class="sb-item" id="errLogBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>Log Viewer</button>
+      <?php endif; ?>
       <button class="sb-item" id="srvBtn"><svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>Server Info</button>
-      <?php if(!$fm->isRO()):?>
+      <?php if(!empty($_SESSION['fm_admin'])&&fm_can('cpm')): ?>
+      <button class="sb-item" id="cpanelBtn" title="Find the cPanel server, every account on it, and open any of them signed in - no password typed anywhere"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="12" cy="10" r="3"/></svg>cPanel Manager</button>
+      <?php endif; ?>
+    </div>
+</details>
+  <?php endif; ?>
+  <?php if(!empty($_SESSION['auth'])): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Dosya Araçları</summary>
+    <div class="sb-nav">
+      <?php if(!$fm->isRO()): ?>
       <button class="sb-item" id="brBtn"><svg viewBox="0 0 24 24"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>Batch Rename</button>
+      <?php endif; ?>
+      <?php if(!$fm->isRO()): ?>
       <button class="sb-item" id="symlinkBtn"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>Symlink</button>
+      <?php endif; ?>
+      <?php if(!$fm->isRO()): ?>
       <button class="sb-item" id="sharesBtn"><svg viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>Share Links</button>
-      <form method="post" style="width:100%">
+      <?php endif; ?>
+      <?php if(!$fm->isRO()): ?>
         <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
         <input type="hidden" name="action" value="backup_dir">
         <button type="button" onclick="if(confirm('Create a .zip backup of the current folder?'))this.closest('form').submit()" class="sb-item"><svg viewBox="0 0 24 24"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><line x1="10" y1="12" x2="14" y2="12"/></svg>Backup Folder</button>
       </form>
-      <?php endif;?>
+      <?php endif; ?>
       <button class="sb-item" id="largeBtn"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="9" y1="15" x2="15" y2="15"/></svg>Large Files</button>
       <button class="sb-item" id="dupBtn"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Find Duplicates</button>
-      <button class="sb-item" id="speedBtn"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Speed Test</button>
-      <?php if(!empty($_SESSION['fm_admin'])):?>
-       <button class="sb-item" id="errLogBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>Log Viewer</button>
-       <button class="sb-item" id="envBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>ENV Reader</button>
-       <button class="sb-item" id="configInspectorBtn" title="Find and read CMS and application configuration files"><svg viewBox="0 0 24 24"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M8 9h8M8 13h5"/><circle cx="17" cy="15" r="2"/></svg>Config Inspector</button>
-       <button class="sb-item" id="rootingScanBtn" title="Read-only local privilege-escalation exposure scan"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="8"/></svg>Rooting Scan</button>
-      <a href="?x=phpinfo" target="_blank" class="sb-item"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>PHP Info</a>
-      <button class="sb-item" id="sshBtn"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>SSH Access</button>
-      <?php if(!$fm->isRO()):?>
-       <button class="sb-item" id="cmsInstallerBtn" title="Install WordPress or Joomla in a new empty directory"><svg viewBox="0 0 24 24"><path d="m12 3 9 4.5-9 4.5-9-4.5L12 3z"/><path d="M3 7.5v9l9 4.5 9-4.5v-9"/><path d="M12 12v9"/><path d="m8 15 4 4 4-4"/></svg>CMS Installer</button>
-      <?php endif;?>
-      <button class="sb-item" id="cmsBtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>CMS Manager</button>
-      <?php $pmNow=$fm->privMode();$pmShort=['server'=>'server','auto'=>'','wordpress'=>'WP','joomla'=>'Joomla'][$pmNow]??'';$pmLabel=['server'=>'Server account only','auto'=>'Automatic','wordpress'=>'WordPress','joomla'=>'Joomla'][$pmNow]??$pmNow;?>
-      <?php if(!empty($_SESSION['fm_admin'])&&fm_can('guard')):?>
-      <button class="sb-item" id="sfgBtn" title="Files this tool installed in a site, backed up and put back if they are deleted (WordPress cron)"><svg viewBox="0 0 24 24"><path d="M12 2l9 4v6c0 5.5-3.8 9.5-9 10-5.2-.5-9-4.5-9-10V6l9-4z"/><path d="M9 12l2 2 4-4"/></svg>Site Files Guard<span id="sfgBadge" style="margin-left:6px;font-size:10px;opacity:.8"></span></button>
-      <?php endif;?>
-      <?php if(fm_can('privmode')):?>
-      <button class="sb-item" id="privModeBtn" title="File changes are performed by: <?=htmlspecialchars($pmLabel)?> - click to change"><svg viewBox="0 0 24 24"><path d="M4 21v-7"/><path d="M4 10V3"/><path d="M12 21v-9"/><path d="M12 8V3"/><path d="M20 21v-5"/><path d="M20 12V3"/><path d="M1 14h6"/><path d="M9 8h6"/><path d="M17 16h6"/></svg>Privilege Mode<span id="privModeBadge" style="margin-left:6px;font-size:10px;opacity:.8"><?=$pmShort===''?'':'· '.htmlspecialchars($pmShort)?></span></button>
-      <?php endif;?>
-      <?php if(fm_can('inspector')):?>
-      <button class="sb-item" id="sessBtn" title="Inspect, extend or revoke real login sessions (WordPress / Joomla)"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><path d="M12 15v2"/></svg>Session Inspector</button>
-      <?php endif;?>
-      <?php if(!empty($_SESSION['auth'])&&fm_can('cpm')):?>
-      <button class="sb-item" id="cpanelBtn" title="Find the cPanel server, every account on it, and open any of them signed in - no password typed anywhere"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><circle cx="12" cy="10" r="3"/></svg>cPanel Manager</button>
-      <?php endif;?>
-      <?php if(!empty($_SESSION['auth'])&&fm_can('cms')):?>
-      <button class="sb-item" id="webmailBtn" title="Every mailbox on this host - WordPress, Joomla, mail folders, mail servers and cPanel accounts - opened without a sign-in"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>Webmail Manager</button>
-      <?php endif;?>
-       <button class="sb-item" id="smtpSenderBtn"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/><path d="M16 17h.01"/></svg>SMTP Sender</button>
-      <button class="sb-item" id="sqlBtn"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>SQL Manager</button>
-      <button class="sb-item" id="wpAutomationBtn"><svg viewBox="0 0 24 24"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg>WordPress Automation</button>
-      <button class="sb-item" id="wpNumbersBtn" title="Change displayed WordPress dashboard numbers without changing site data"><svg viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15v-3"/><path d="M12 15V8"/><path d="M16 15V5"/><path d="M20 15V3"/></svg>Numbers control</button>
-      <button class="sb-item" id="wpImagesBtn" title="Replace images on a WordPress page and dashboard"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Images Replacer</button>
-      <button class="sb-item" id="threatsBtn" title="Review suspicious small files and CMS accounts"><svg viewBox="0 0 24 24"><path d="M12 2l9 4v6c0 5.5-3.8 9.5-9 10-5.2-.5-9-4.5-9-10V6l9-4z"/><path d="M8 12l2.5 2.5L16 9"/></svg>Threats Alerts</button>
-      <button class="sb-item" id="guardBtn"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>File Guardian</button>
-      <?php endif;?>
+      <button class="sb-item" id="actBtn"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Activity Log</button>
     </div>
-  </div>
+</details>
+  <?php endif; ?>
+  <?php if(function_exists('fm_mfm_is_primary')&&fm_mfm_is_primary()): ?>
+<details class="sb-sec sb-collapsible">
+    <summary class="sb-label">Yönetim</summary>
+    <div class="sb-nav">
+      <?php if(function_exists('fm_mfm_is_primary')&&fm_mfm_is_primary()): ?>
+       <button class="sb-item" id="mfaBtn" title="Every account of this file manager: what each one may do, which of their sessions are open, and everything an administrator can change about them">
+         <svg viewBox="0 0 24 24" style="stroke:#93c5fd"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="9.5" cy="11" r="2"/><path d="M13.2 9.6a2.6 2.6 0 0 1 0 5.2"/><path d="M16 12h.01"/></svg>MFM Admin
+       </button>
+      <?php endif; ?>
+    </div>
+</details>
+  <?php endif; ?>
+</div>
   <div class="sb-footer">
     <div class="disk-w">
       <div class="disk-lbl"><span>Disk</span><span><?=fmtSz($diskUsed)?> / <?=fmtSz($diskTotal)?></span></div>
       <div class="disk-tr"><div class="disk-fi <?=$diskPct>=90?'crit':($diskPct>=75?'warn':'')?>" style="width:<?=$diskPct?>%"></div></div>
     </div>
-    <?php if(!$fm->isRO()&&fm_can('bypass')):?>
-        <button class="sb-item danger" id="bpBtn" title="A permission change the operating system refused - try every identity and every method this host has">
-      <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/><path d="M12 16v3"/></svg>Bypass Permissions
-    </button>
-    <?php endif;?>
   </div>
 </aside>
 
@@ -28250,23 +24553,28 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
         <input type="file" name="file[]" id="upFile" multiple>
         <label for="upFile" class="upl-lbl"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Upload</label>
       </form>
-      <form method="post" style="display:contents">
-        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
-        <input type="hidden" name="action" value="create_folder">
-        <input type="text" name="folder_name" class="inp" placeholder="New folder…" required style="width:130px">
-        <button class="btn btn-sm btn-green"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg><span>Folder</span></button>
-      </form>
-      <form method="post" style="display:contents">
-        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
-        <input type="hidden" name="action" value="create_file">
-        <input type="text" name="file_name" class="inp" placeholder="New file…" required style="width:120px">
-        <button class="btn btn-sm btn-blue"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="12" y1="13" x2="12" y2="19"/><line x1="9" y1="16" x2="15" y2="16"/></svg><span>File</span></button>
-      </form>
       <button type="button" id="remoteDlBtn" class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>From URL</span></button>
     </div>
     <?php endif;?>
     <div class="tb-row" style="flex-wrap:wrap;gap:6px">
       <?php if(!$fm->isRO()):?>
+      <div class="tb-new" id="newMenu">
+        <button type="button" class="btn btn-sm btn-p" id="newMenuBtn" aria-haspopup="true" aria-expanded="false" title="Create a new file or folder"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>New+</span></button>
+        <div class="tb-new-menu" id="newMenuPanel" role="menu">
+          <form method="post" class="tb-new-form">
+            <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
+            <input type="hidden" name="action" value="create_folder">
+            <input type="text" name="folder_name" class="inp" placeholder="New folder…" required>
+            <button class="btn btn-sm btn-green"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg><span>Folder</span></button>
+          </form>
+          <form method="post" class="tb-new-form">
+            <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
+            <input type="hidden" name="action" value="create_file">
+            <input type="text" name="file_name" class="inp" placeholder="New file…" required>
+            <button class="btn btn-sm btn-blue"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/><line x1="12" y1="13" x2="12" y2="19"/><line x1="9" y1="16" x2="15" y2="16"/></svg><span>File</span></button>
+          </form>
+        </div>
+      </div>
       <button type="button" class="btn btn-sm btn-g" id="clipCopy" title="Keep selected items for copying"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button>
       <button type="button" class="btn btn-sm btn-amb" id="clipCut" title="Keep selected items for moving"><svg viewBox="0 0 24 24"><path d="M6 2l12 20M18 2L6 22"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/></svg>Cut</button>
       <button type="button" class="btn btn-sm btn-blue" id="clipPaste" title="Paste clipboard items here"><svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14H4V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>Paste</button>
@@ -28599,7 +24907,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   <div class="ctx-item" id="ctx-open"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>Open</div>
   <div class="ctx-item" id="ctx-info"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>Info</div>
   <div class="ctx-item" id="ctx-edit"><svg viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>Edit</div>
-  <div class="ctx-item" id="ctx-audio-info" style="display:none"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/><path d="M4 21h16"/></svg>Edit song details</div>
   <div class="ctx-item" id="ctx-dl"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</div>
   <div class="ctx-item" id="ctx-extract" style="display:none"><svg viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>Extract archive</div>
   <div class="ctx-item" id="ctx-prev"><svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>Preview</div>
@@ -28654,135 +24961,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
     <div class="prev-body" id="prevBody"></div>
   </div>
 </div>
-
-<!-- LOCAL AUDIO PLAYER -->
-<div class="fm-music-dock" id="fmMusicDock" aria-label="Audio player" aria-hidden="true">
-  <button type="button" class="fm-music-mini-track" id="fmMusicMiniOpen" aria-label="Open full audio player">
-    <span class="fm-music-mini-art"><img id="fmMusicMiniArt" alt="" hidden></span>
-    <span class="fm-music-mini-copy"><strong id="fmMusicMiniTitle">Not playing</strong><span id="fmMusicMiniArtist">Choose an audio file</span></span>
-  </button>
-  <div class="fm-music-mini-controls">
-    <button type="button" class="fm-music-icon fm-music-double-skip" id="fmMusicMiniPrev" title="Previous track" aria-label="Previous track"><svg viewBox="0 0 24 24"><path d="M10.05 6.3Q11 5.6 11 6.7v10.6q0 1.1-.95.4L3.6 12.55q-.7-.55 0-1.1l6.45-5.15Zm10 0Q21 5.6 21 6.7v10.6q0 1.1-.95.4l-6.45-5.15q-.7-.55 0-1.1l6.45-5.15Z"/></svg></button>
-    <button type="button" class="fm-music-mini-play" id="fmMusicMiniPlay" title="Play" aria-label="Play"><svg class="fm-icon-play" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg><svg class="fm-icon-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM15 5h4v14h-4z"/></svg></button>
-    <button type="button" class="fm-music-icon fm-music-double-skip" id="fmMusicMiniNext" title="Next track" aria-label="Next track"><svg viewBox="0 0 24 24"><path d="M13.95 6.3Q13 5.6 13 6.7v10.6q0 1.1.95.4l6.45-5.15q.7-.55 0-1.1l-6.45-5.15Zm-10 0Q3 5.6 3 6.7v10.6q0 1.1.95.4l6.45-5.15q.7-.55 0-1.1L3.95 6.3Z"/></svg></button>
-  </div>
-  <div class="fm-music-mini-progress"><span id="fmMusicMiniProgress"></span></div>
-</div>
-<div class="fm-music-layer" id="fmMusicLayer" aria-hidden="true">
-  <aside class="fm-music-panel" id="fmMusicPanel" aria-label="Now playing">
-    <video class="fm-music-selected-video" id="fmMusicSelectedVideo" muted playsinline preload="none" aria-hidden="true"></video>
-    <span class="fm-music-video-loader" id="fmMusicVideoLoader" aria-hidden="true"></span>
-    <header class="fm-music-head">
-      <button type="button" class="fm-music-icon fm-music-minimize" id="fmMusicMinimize" title="Minimize player" aria-label="Minimize player"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
-      <span id="fmMusicViewTitle">Now playing</span>
-        <button type="button" class="fm-music-queue-toggle" id="fmMusicLyricsToggle" aria-expanded="false" hidden><svg viewBox="0 0 24 24"><path d="M4 6h16M4 11h16M4 16h10"/><path d="M4 21h8"/></svg><span>Lyrics</span></button>
-      <button type="button" class="fm-music-queue-toggle" id="fmMusicQueueToggle" aria-expanded="true"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/><path d="m17 16 3 2-3 2"/></svg><span>Queue</span><b id="fmMusicQueueCount">0</b></button>
-      <details class="fm-music-options" id="fmMusicOptions">
-        <summary title="Playback options" aria-label="Playback options" aria-controls="fmMusicOptionsMenu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v.01M12 12v.01M12 19v.01"/></svg></summary>
-        <div class="fm-music-options-popover" id="fmMusicOptionsMenu" aria-label="Playback options">
-          <div class="fm-music-extra-controls">
-            <div class="fm-music-options-seek">
-              <button type="button" id="fmMusicBack10" title="Back 10 seconds" aria-label="Back 10 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.2 6"/><path d="M3 4v7h7"/><path d="M12 7v5l3 2"/></svg><span>10 sec</span></button>
-              <button type="button" id="fmMusicForward10" title="Forward 10 seconds" aria-label="Forward 10 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11a9 9 0 1 0-2.2 6"/><path d="M21 4v7h-7"/><path d="M12 7v5l3 2"/></svg><span>10 sec</span></button>
-            </div>
-            <label for="fmMusicSpeed">Speed
-              <select id="fmMusicSpeed" aria-label="Playback speed">
-                <option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="0.9">0.9×</option>
-                <option value="1">1×</option><option value="1.1">1.1×</option><option value="1.25">1.25×</option>
-                <option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option>
-              </select>
-            </label>
-            <label class="fm-music-volume" for="fmMusicVolume">Volume
-              <input id="fmMusicVolume" type="range" min="0" max="100" value="100" aria-label="Volume">
-            </label>
-            <div class="fm-music-cache-status" id="fmMusicCacheStatus" role="status" aria-live="polite">Songs you play are saved in this browser.</div>
-          </div>
-        </div>
-      </details>
-    </header>
-    <div class="fm-music-scroll">
-      <div class="fm-music-now">
-        <div class="fm-music-cover" id="fmMusicCover">
-          <svg class="fm-music-cover-note" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
-          <img id="fmMusicCoverArt" alt="" hidden>
-        </div>
-        <div class="fm-music-track-meta"><div><strong id="fmMusicTitle">Select a song</strong><span id="fmMusicArtist">Audio from this folder</span></div><button type="button" class="fm-music-download" id="fmMusicDownload" title="Download current track" aria-label="Download current track"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg></button></div>
-        <div class="fm-music-progress-wrap">
-          <input id="fmMusicSeek" class="fm-music-seek" type="range" min="0" max="1000" value="0" aria-label="Seek through track">
-          <div class="fm-music-time"><span id="fmMusicElapsed">0:00</span><span id="fmMusicDuration">0:00</span></div>
-        </div>
-        <div class="fm-music-controls">
-          <button type="button" class="fm-music-icon fm-music-toggle" id="fmMusicShuffle" title="Shuffle off" aria-label="Shuffle off"><svg viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M4 4l5 5m4 6 3 3"/></svg></button>
-          <button type="button" class="fm-music-icon fm-music-skip fm-music-double-skip" id="fmMusicPrev" title="Previous track" aria-label="Previous track"><svg viewBox="0 0 24 24"><path d="M10.05 6.3Q11 5.6 11 6.7v10.6q0 1.1-.95.4L3.6 12.55q-.7-.55 0-1.1l6.45-5.15Zm10 0Q21 5.6 21 6.7v10.6q0 1.1-.95.4l-6.45-5.15q-.7-.55 0-1.1l6.45-5.15Z"/></svg></button>
-          <button type="button" class="fm-music-play" id="fmMusicPlay" title="Play" aria-label="Play"><svg class="fm-icon-play" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7z"/></svg><svg class="fm-icon-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM15 5h4v14h-4z"/></svg></button>
-          <button type="button" class="fm-music-icon fm-music-skip fm-music-double-skip" id="fmMusicNext" title="Next track" aria-label="Next track"><svg viewBox="0 0 24 24"><path d="M13.95 6.3Q13 5.6 13 6.7v10.6q0 1.1.95.4l6.45-5.15q.7-.55 0-1.1l-6.45-5.15Zm-10 0Q3 5.6 3 6.7v10.6q0 1.1.95.4l6.45-5.15q.7-.55 0-1.1L3.95 6.3Z"/></svg></button>
-          <button type="button" class="fm-music-icon fm-music-toggle" id="fmMusicRepeat" title="Repeat off" aria-label="Repeat off"><svg viewBox="0 0 24 24"><path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg><span class="fm-repeat-one">1</span></button>
-        </div>
-        <section class="fm-music-queue" id="fmMusicQueue">
-          <div class="fm-music-queue-heading"><div><span>PLAYING FROM THIS FOLDER</span><strong>All songs</strong></div><span id="fmMusicQueueSummary"></span></div>
-          <div class="fm-music-queue-list" id="fmMusicQueueList"></div>
-        </section>
-      </div>
-      <section class="fm-music-lyrics" id="fmMusicLyrics" hidden aria-label="Song lyrics">
-        <div class="fm-music-lyrics-heading"><strong>Lyrics</strong><span id="fmMusicLyricsSource">Synced lyrics</span></div>
-        <div class="fm-music-lyrics-body" id="fmMusicLyricsBody"></div>
-      </section>
-    </div>
-  </aside>
-  <div class="fm-music-resize" id="fmMusicResize" role="separator" aria-label="Resize music panel" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="720" aria-valuenow="420" tabindex="0"></div>
-</div>
-<audio id="fmMusicAudio" preload="metadata"></audio>
-<style>
-.fm-music-panel{isolation:isolate}
-.fm-music-scroll{position:absolute;inset:0;box-sizing:border-box;padding-top:54px;z-index:3;background:transparent}
-.fm-music-selected-video{position:absolute;z-index:2;top:0;left:0;width:100%;height:min(58vh,520px);object-fit:cover;object-position:center;opacity:0;visibility:hidden;pointer-events:none;transition:opacity 1.2s cubic-bezier(.22,.61,.36,1),visibility 0s linear 1.2s;-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 80%,rgba(0,0,0,.995) 82%,rgba(0,0,0,.98) 84%,rgba(0,0,0,.95) 86%,rgba(0,0,0,.90) 88%,rgba(0,0,0,.82) 90%,rgba(0,0,0,.70) 92%,rgba(0,0,0,.55) 94%,rgba(0,0,0,.38) 96%,rgba(0,0,0,.20) 98%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 80%,rgba(0,0,0,.995) 82%,rgba(0,0,0,.98) 84%,rgba(0,0,0,.95) 86%,rgba(0,0,0,.90) 88%,rgba(0,0,0,.82) 90%,rgba(0,0,0,.70) 92%,rgba(0,0,0,.55) 94%,rgba(0,0,0,.38) 96%,rgba(0,0,0,.20) 98%,transparent 100%)}
-.fm-music-panel.fm-music-selected-video-open .fm-music-selected-video{opacity:1;visibility:visible;transition:opacity 1.2s cubic-bezier(.22,.61,.36,1)}
-.fm-music-video-loader{display:none;position:absolute;z-index:4;top:min(29vh,260px);left:50%;width:32px;height:32px;margin:-16px;border:3px solid rgba(255,255,255,.24);border-top-color:#fff;border-radius:50%;pointer-events:none}
-.fm-music-panel.fm-music-selected-video-loading .fm-music-video-loader{display:block;animation:fmMusicSpin .78s linear infinite}
-.fm-music-cover-note,.fm-music-cover img{transition:opacity 1.2s cubic-bezier(.22,.61,.36,1),visibility 0s}
-.fm-music-panel.fm-music-selected-video-open .fm-music-cover-note,.fm-music-panel.fm-music-selected-video-open .fm-music-cover img{transition:opacity 1.2s cubic-bezier(.22,.61,.36,1),visibility 0s linear 1.2s}
-.fm-music-panel.fm-music-selected-video-open .fm-music-cover{background:transparent;box-shadow:none}
-.fm-music-panel.fm-music-selected-video-open .fm-music-cover-note,.fm-music-panel.fm-music-selected-video-open .fm-music-cover img{visibility:hidden;opacity:0}
-@media(max-width:768px){
-  .fm-music-selected-video{-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 70%,rgba(0,0,0,.995) 72%,rgba(0,0,0,.97) 75%,rgba(0,0,0,.91) 79%,rgba(0,0,0,.82) 83%,rgba(0,0,0,.68) 87%,rgba(0,0,0,.52) 90%,rgba(0,0,0,.35) 93%,rgba(0,0,0,.19) 96%,rgba(0,0,0,.075) 98%,rgba(0,0,0,.015) 99.5%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 70%,rgba(0,0,0,.995) 72%,rgba(0,0,0,.97) 75%,rgba(0,0,0,.91) 79%,rgba(0,0,0,.82) 83%,rgba(0,0,0,.68) 87%,rgba(0,0,0,.52) 90%,rgba(0,0,0,.35) 93%,rgba(0,0,0,.19) 96%,rgba(0,0,0,.075) 98%,rgba(0,0,0,.015) 99.5%,transparent 100%)}
-  .fm-music-video-loader{top:29dvh}
-  .fm-music-scroll{padding-top:calc(58px + env(safe-area-inset-top))}
-}
-@media(prefers-reduced-motion:reduce){
-  .fm-music-selected-video,.fm-music-cover-note,.fm-music-cover img{transition-duration:.01ms!important;transition-delay:0s!important}
-  .fm-music-panel.fm-music-selected-video-loading .fm-music-video-loader{animation:none}
-}
-</style>
-<?php if(!$fm->isRO()):?>
-<div class="fm-audio-edit-overlay" id="fmAudioEditOverlay" aria-hidden="true">
-  <section class="fm-audio-edit-dialog" role="dialog" aria-modal="true" aria-labelledby="fmAudioEditHeading">
-    <div class="fm-audio-edit-head">
-      <h2 id="fmAudioEditHeading">Edit song details</h2>
-      <button type="button" class="btn btn-icon btn-g" id="fmAudioEditClose" aria-label="Close"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
-    </div>
-    <div class="fm-audio-edit-fields">
-      <div class="fm-audio-edit-field full"><label for="fmAudioEditTitle">Title</label><input class="inp" id="fmAudioEditTitle" maxlength="256" autocomplete="off"></div>
-      <div class="fm-audio-edit-field"><label for="fmAudioEditArtist">Artist</label><input class="inp" id="fmAudioEditArtist" maxlength="256" autocomplete="off"></div>
-      <div class="fm-audio-edit-field"><label for="fmAudioEditAlbum">Album</label><input class="inp" id="fmAudioEditAlbum" maxlength="256" autocomplete="off"></div>
-      <div class="fm-audio-edit-field"><label for="fmAudioEditYear">Year</label><input class="inp" id="fmAudioEditYear" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" autocomplete="off"></div>
-      <div class="fm-audio-edit-field"><label for="fmAudioEditGenre">Genre</label><input class="inp" id="fmAudioEditGenre" maxlength="256" autocomplete="off"></div>
-      <div class="fm-audio-edit-field full">
-        <label>Cover image</label>
-        <div class="fm-audio-edit-art">
-          <img id="fmAudioEditArtPreview" alt="Current cover" hidden>
-          <span class="fm-audio-edit-art-placeholder" id="fmAudioEditArtPlaceholder"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m20 15-5-5L5 20"/></svg></span>
-          <div class="fm-audio-edit-field"><input class="inp" id="fmAudioEditCover" type="file" accept="image/jpeg,image/png,image/gif,image/webp"><button type="button" class="btn btn-xs btn-g" id="fmAudioEditRemoveCover">Remove custom cover</button></div>
-        </div>
-      </div>
-    </div>
-    <p class="fm-audio-edit-note">Changes are saved alongside the audio file; its audio data is not rewritten. Renaming the file remains available from the file actions.</p>
-    <div class="fm-audio-edit-actions">
-      <button type="button" class="btn btn-sm btn-g" id="fmAudioEditCancel">Cancel</button>
-      <button type="button" class="btn btn-sm btn-p" id="fmAudioEditSave">Save changes</button>
-    </div>
-  </section>
-</div>
-<?php endif;?>
 
 <!-- REPLICATE MODAL -->
 <div class="mod-ov" id="repOv">
@@ -28844,11 +25022,13 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
         <label><input type="checkbox" id="recPrepend" checked> Site-level auto_prepend (.user.ini + .htaccess)</label>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" class="btn btn-xs btn-p" id="recRepair">Onar / Doğrula</button>
         <button type="button" class="btn btn-xs btn-p" id="recInstall">Install selected</button>
         <button type="button" class="btn btn-xs btn-g" id="recRefresh">Refresh status</button>
         <button type="button" class="btn btn-xs btn-red" id="recLock">Lock (chattr +i)</button>
         <button type="button" class="btn btn-xs btn-g" id="recUnlock">Unlock</button>
       </div>
+      <div id="recReport" style="display:none;margin-top:10px;max-height:32vh;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--raised);padding:8px"></div>
       <pre id="recOut" style="font:11px/1.5 'JetBrains Mono',monospace;white-space:pre-wrap;margin-top:10px;max-height:32vh;overflow:auto;background:var(--raised);border:1px solid var(--border);border-radius:8px;padding:9px"></pre>
       <div id="recStatus" style="font-size:11px;color:var(--t3);margin-top:8px;word-break:break-all"></div>
     </div>
@@ -28957,72 +25137,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   </div>
 </div>
 
-<!-- SPEED TEST MODAL -->
-<div class="mod-ov" id="speedOv">
-  <div class="mod mod-sm">
-    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div><span class="mod-title">Network Speed Test</span><button class="btn btn-icon btn-g" id="speedClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
-    <div class="mod-body">
-      <div style="font-size:11.5px;color:var(--t3);margin-bottom:10px;line-height:1.5">Measures the <strong style="color:var(--t2)">server's</strong> own internet connection - run entirely on the server, independent of your own connection speed.</div>
-      <div class="info-g" style="grid-template-columns:1fr 1fr 1fr">
-        <div class="info-c"><div class="info-cl">Ping</div><div class="info-cv" id="spPing">-</div></div>
-        <div class="info-c"><div class="info-cl">Download</div><div class="info-cv" id="spDown">-</div></div>
-        <div class="info-c"><div class="info-cl">Upload</div><div class="info-cv" id="spUp">-</div></div>
-      </div>
-      <button type="button" id="spRun" class="btn btn-p" style="width:100%;margin-top:6px"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>Run Test</button>
-      <div id="spStatus" style="text-align:center;font-size:11.5px;color:var(--t3);margin-top:8px"></div>
-    </div>
-  </div>
-</div>
-
-<?php if(!empty($_SESSION['fm_admin'])):?>
-<!-- SMTP SENDER MODAL -->
-<div class="mod-ov" id="smtpSenderOv">
-  <div class="mod mod-lg" style="max-width:860px">
-    <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg></div><span class="mod-title">SMTP Sender</span><span style="font-size:10.5px;color:var(--t3)">Admin tool</span><button class="btn btn-icon btn-g" id="smtpSenderClose" type="button" aria-label="Close SMTP Sender"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
-    <form class="mod-body smtp-form-body" id="smtpSenderForm" enctype="multipart/form-data">
-      <div class="smtp-form-inner">
-        <div class="smtp-intro"><svg viewBox="0 0 24 24"><path d="M12 3 4.5 6v5.5c0 4.7 3.1 8.1 7.5 9.5 4.4-1.4 7.5-4.8 7.5-9.5V6L12 3z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg><div><strong style="color:var(--t1)">Send one administrative message</strong><br>Credentials are used for this request only and are never saved or logged. One recipient per request · up to 5 messages every 10 minutes.</div></div>
-        <div id="smtpSenderFeedback" style="display:none;font-size:12px;padding:10px 12px;border-radius:8px;background:var(--raised);border:1px solid var(--border)" role="status" aria-live="polite"></div>
-        <section class="smtp-section">
-          <div class="smtp-section-head"><span class="smtp-section-number">01</span><div class="smtp-section-title">Connection</div><div class="smtp-section-note">Server and authentication</div></div>
-          <div class="smtp-section-body">
-            <div class="smtp-grid smtp-grid-3">
-              <div class="smtp-field"><label class="lbl" for="smtpHost">SMTP host</label><input class="inp" name="smtp_host" id="smtpHost" required placeholder="smtp.example.com"></div>
-              <div class="smtp-field"><label class="lbl" for="smtpPort">Port</label><input class="inp" name="smtp_port" id="smtpPort" type="number" min="1" max="65535" value="587" required></div>
-              <div class="smtp-field"><label class="lbl" for="smtpEncryption">Encryption</label><select class="inp" name="smtp_encryption" id="smtpEncryption"><option value="tls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">None</option></select></div>
-            </div>
-            <div class="smtp-grid smtp-grid-2" style="margin-top:11px">
-              <div class="smtp-field"><label class="lbl" for="smtpUsername">Username <span style="font-weight:400;text-transform:none;color:var(--t3)">(optional)</span></label><input class="inp" name="smtp_username" id="smtpUsername" autocomplete="username" placeholder="name@example.com"></div>
-              <div class="smtp-field"><label class="lbl" for="smtpPassword">Password <span style="font-weight:400;text-transform:none;color:var(--t3)">(not saved)</span></label><input class="inp" name="smtp_password" id="smtpPassword" type="password" autocomplete="current-password"></div>
-            </div>
-          </div>
-        </section>
-        <section class="smtp-section">
-          <div class="smtp-section-head"><span class="smtp-section-number">02</span><div class="smtp-section-title">Message</div><div class="smtp-section-note">Recipient and content</div></div>
-          <div class="smtp-section-body">
-            <div class="smtp-grid smtp-grid-2">
-              <div class="smtp-field"><label class="lbl" for="smtpFrom">From</label><input class="inp" name="smtp_from" id="smtpFrom" type="email" required placeholder="sender@example.com"></div>
-              <div class="smtp-field"><label class="lbl" for="smtpTo">To <span style="font-weight:400;text-transform:none;color:var(--t3)">(one recipient)</span></label><input class="inp" name="smtp_to" id="smtpTo" type="email" required placeholder="recipient@example.com"></div>
-            </div>
-            <div class="smtp-grid smtp-grid-2" style="margin-top:11px">
-              <div class="smtp-field"><label class="lbl" for="smtpReplyTo">Reply-To <span style="font-weight:400;text-transform:none;color:var(--t3)">(optional)</span></label><input class="inp" name="smtp_reply_to" id="smtpReplyTo" type="email" placeholder="reply@example.com"></div>
-              <div class="smtp-field"><label class="lbl" for="smtpPriority">Priority</label><select class="inp" name="smtp_priority" id="smtpPriority"><option value="normal">Normal</option><option value="high">High</option><option value="low">Low</option></select></div>
-            </div>
-            <div class="smtp-field" style="margin-top:11px"><label class="lbl" for="smtpSubject">Subject</label><input class="inp" name="smtp_subject" id="smtpSubject" required maxlength="998" placeholder="Subject"></div>
-            <div class="smtp-compose-grid" style="margin-top:11px">
-              <div class="smtp-field"><label class="lbl" for="smtpBody">Message</label><textarea class="inp" name="smtp_body" id="smtpBody" rows="7" maxlength="2000000" required placeholder="Write the message…"></textarea></div>
-              <div class="smtp-options-stack">
-                <div class="smtp-field"><label class="lbl" for="smtpContentType">Format</label><select class="inp" name="smtp_content_type" id="smtpContentType"><option value="plain">Plain text</option><option value="html">HTML</option></select></div>
-                <div class="smtp-field"><label class="lbl">Attachment <span style="font-weight:400;text-transform:none;color:var(--t3)">(max 5 MB)</span></label><label class="smtp-file-picker" for="smtpAttachment"><svg viewBox="0 0 24 24"><path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg><span class="smtp-file-name" id="smtpAttachmentName">Choose a file</span><input name="smtp_attachment" id="smtpAttachment" type="file"></label></div>
-              </div>
-            </div>
-          </div>
-        </section>
-        <div class="smtp-actions"><span class="smtp-hint">Use “Test connection” before sending if this is a new SMTP server.</span><button type="button" class="btn btn-g" id="smtpTestBtn">Test connection</button><button type="submit" class="btn btn-p" id="smtpSendBtn">Send message</button></div>
-      </div>
-    </form>
-  </div>
-</div>
 <!-- SERVER LOG VIEWER MODAL -->
 <div class="mod-ov" id="errLogOv">
   <div class="mod mod-lg" style="max-width:980px">
@@ -29539,8 +25653,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   </div>
 </div>
 
-<!-- WEBMAIL MANAGER MODAL -->
-<!-- WEBMAIL MANAGER - every mailbox on the host, opened without a sign-in -->
 <!-- PLUGINS INSTALLER MODAL -->
 <div class="mod-ov" id="pieOv">
   <div class="mod-win pie-win">
@@ -29963,126 +26075,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   </div>
 </div>
 
-<div class="mod-ov" id="webmailOv">
-  <div class="mod wm-mod">
-    <div class="mod-head">
-      <div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg></div>
-      <span class="mod-title">Webmail Manager</span>
-      <div class="wm-tools" style="margin-left:auto">
-        <button type="button" class="btn btn-xs btn-g" id="wmComposeBtn" title="Write a new message from the open mailbox">
-          <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Compose</button>
-        <button type="button" class="btn btn-xs btn-g" id="wmRescan" title="Look for mail again, everywhere on this server">
-          <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Scan again</button>
-      </div>
-      <button class="btn btn-icon btn-g" id="webmailClose" title="Close"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-    </div>
-    <div class="wm-status" id="wmStatus"></div>
-    <div class="wm-body">
-      <aside class="wm-rail">
-        <div class="wm-rail-head">
-          <div class="wm-rail-lab"><svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h12"/></svg>Mailboxes on this host</div>
-          <input type="search" class="wm-search" id="wmMailSearch" placeholder="Filter by address or site" autocomplete="off">
-        </div>
-        <div id="wmList"><div class="wm-empty">Looking for mail…</div></div>
-        <div class="wm-foot" id="wmFoot"></div>
-      </aside>
-      <section class="wm-main">
-        <div class="wm-head">
-          <div id="wmHeadMain"><div class="wm-head-idle">Pick a mailbox on the left. It opens by itself - nothing to sign in to.</div></div>
-          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <div id="wmFolders"></div>
-          </div>
-        </div>
-        <div class="wm-split">
-          <div class="wm-list-col">
-            <div class="wm-list-top">
-              <b id="wmMsgsTitle">Inbox</b>
-              <input type="search" class="wm-search" id="wmMsgSearch" placeholder="Find in this folder" autocomplete="off">
-              <button type="button" class="btn btn-icon btn-g" id="wmReload" title="Read this folder again"><svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 18 5.64L23 10"/></svg></button>
-            </div>
-            <div id="wmMsgs"><div class="wm-empty">Pick a mailbox.</div></div>
-            <div class="wm-bulk" id="wmBulk"></div>
-          </div>
-          <div id="wmRead"></div>
-        </div>
-      </section>
-    </div>
-  </div>
-</div>
-
-<!-- WEBMAIL COMPOSER - formatted text, its own HTML source, files, one send button -->
-<div class="mod-ov" id="webmailComposeOv">
-  <div class="mod wm-co">
-    <div class="mod-head">
-      <div class="mod-icon"><svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></div>
-      <span class="mod-title">New Message</span>
-      <button class="btn btn-icon btn-g" id="webmailComposeClose" title="Close"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-    </div>
-    <div class="wm-co-body">
-      <div class="wm-co-row" id="wmCoFromRow">
-        <label>From</label>
-        <span class="who" id="wmCoFrom"></span>
-      </div>
-      <div class="wm-co-row" id="wmCoToRow">
-        <label>To</label>
-        <input type="text" id="wmCoTo" placeholder="name@example.com, another@example.com" autocomplete="off" spellcheck="false">
-        <button type="button" class="wm-co-mini" id="wmCoCcToggle" title="Add a copy">Cc</button>
-        <button type="button" class="wm-co-mini" id="wmCoBccToggle" title="Add a blind copy">Bcc</button>
-      </div>
-      <div class="wm-co-row" id="wmCoCcRow">
-        <label>Cc</label>
-        <input type="text" id="wmCoCc" placeholder="copy to" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="wm-co-row" id="wmCoBccRow">
-        <label>Bcc</label>
-        <input type="text" id="wmCoBcc" placeholder="blind copy to" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="wm-co-row" id="wmCoSubjRow">
-        <label>Subject</label>
-        <input type="text" id="wmCoSubject" placeholder="Subject" autocomplete="off">
-      </div>
-      <div class="wm-co-tools" id="wmCoToolbar">
-        <button type="button" class="wm-tb" data-cmd="bold" title="Bold"><b>B</b></button>
-        <button type="button" class="wm-tb" data-cmd="italic" title="Italic"><em>I</em></button>
-        <button type="button" class="wm-tb" data-cmd="underline" title="Underline"><span style="text-decoration:underline;font-weight:700">U</span></button>
-        <button type="button" class="wm-tb" data-cmd="strikeThrough" title="Strike through"><span style="text-decoration:line-through;font-weight:700">S</span></button>
-        <span class="sep"></span>
-        <button type="button" class="wm-tb" data-block="h2" title="Heading"><b>H</b></button>
-        <button type="button" class="wm-tb" data-block="p" title="Normal text"><span style="font-size:10px;font-weight:700">P</span></button>
-        <button type="button" class="wm-tb" data-cmd="insertUnorderedList" title="Bulleted list"><svg viewBox="0 0 24 24"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="4.5" cy="6" r="1.2"/><circle cx="4.5" cy="12" r="1.2"/><circle cx="4.5" cy="18" r="1.2"/></svg></button>
-        <button type="button" class="wm-tb" data-cmd="insertOrderedList" title="Numbered list"><svg viewBox="0 0 24 24"><line x1="10" y1="6" x2="21" y2="6"/><line x1="10" y1="12" x2="21" y2="12"/><line x1="10" y1="18" x2="21" y2="18"/><path d="M4 6h1v4"/><path d="M4 16h2v1H4v1h2"/></svg></button>
-        <button type="button" class="wm-tb" data-block="blockquote" title="Quote"><svg viewBox="0 0 24 24"><path d="M7 7h4v6H7z"/><path d="M14 7h4v6h-4z"/><path d="M7 13c0 2 1 3 3 3"/><path d="M14 13c0 2 1 3 3 3"/></svg></button>
-        <button type="button" class="wm-tb" data-block="pre" title="Fixed-width text"><span style="font-family:monospace;font-size:11px">&lt;/&gt;</span></button>
-        <button type="button" class="wm-tb" id="wmCoLink" title="Link"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
-        <span class="sep"></span>
-        <button type="button" class="wm-tb" data-cmd="justifyLeft" title="Left"><svg viewBox="0 0 24 24"><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="17" y1="18" x2="3" y2="18"/></svg></button>
-        <button type="button" class="wm-tb" data-cmd="justifyCenter" title="Centre"><svg viewBox="0 0 24 24"><line x1="18" y1="10" x2="6" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="18" y1="18" x2="6" y2="18"/></svg></button>
-        <button type="button" class="wm-tb" data-cmd="justifyRight" title="Right"><svg viewBox="0 0 24 24"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></svg></button>
-        <span class="sep"></span>
-        <button type="button" class="wm-tb" data-cmd="undo" title="Undo"><svg viewBox="0 0 24 24"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg></button>
-        <button type="button" class="wm-tb" data-cmd="redo" title="Redo"><svg viewBox="0 0 24 24"><polyline points="15 14 20 9 15 4"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/></svg></button>
-        <button type="button" class="wm-tb" data-cmd="removeFormat" title="Clear formatting"><svg viewBox="0 0 24 24"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4l-3 16"/></svg></button>
-        <span class="sep"></span>
-        <button type="button" class="wm-co-mini" id="wmCoSourceToggle" title="Write the HTML itself">HTML source</button>
-      </div>
-      <div class="wm-co-edit">
-        <div id="wmCoEditorWrap"><div id="wmCoBody" contenteditable="true" spellcheck="true"></div></div>
-        <textarea id="wmCoSource" spellcheck="false" placeholder="&lt;p&gt;The HTML of the message…&lt;/p&gt;"></textarea>
-        <div class="wm-co-atts" id="wmCoAtts"></div>
-      </div>
-    </div>
-    <div class="wm-co-foot">
-      <label class="btn btn-xs btn-g" for="wmCoFile" style="cursor:pointer">
-        <svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>Attach files</label>
-      <input type="file" id="wmCoFile" class="wm-co-file" multiple>
-      <span class="wm-co-status" id="wmCoStatus"></span>
-      <button type="button" class="btn btn-p" id="wmCoSend">
-        <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>Send</button>
-    </div>
-  </div>
-</div>
-
-
 <!-- THREATS ALERTS MODAL -->
 <div class="mod-ov" id="threatsOv">
   <div class="mod mod-lg" style="max-width:1060px">
@@ -30103,8 +26095,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   </div>
 </div>
 
-<?php endif;?>
-
 <!-- WORDPRESS AUTOMATION MODAL -->
 <div class="mod-ov" id="wpAutomationOv">
   <div class="mod mod-lg">
@@ -30117,20 +26107,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
   </div>
 </div>
 
-<!-- WORDPRESS NUMBERS CONTROL MODAL -->
-<?php if(!empty($_SESSION['fm_admin'])):?>
-<div class="mod-ov" id="wpNumbersOv">
-  <div class="mod mod-lg">
-    <div class="mod-head">
-      <div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 15v-3"/><path d="M12 15V8"/><path d="M16 15V5"/><path d="M20 15V3"/></svg></div>
-      <span class="mod-title">Numbers control</span>
-      <button class="btn btn-icon btn-g" id="wpNumbersClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-    </div>
-    <div class="mod-body" id="wpNumbersBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
-  </div>
-</div>
-<?php endif;?>
-
 <!-- WP ADMIN RESULT MODAL -->
 <div class="mod-ov" id="wpAdminOv">
   <div class="mod mod-md">
@@ -30142,20 +26118,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
     <div class="mod-body" id="wpAdminBody"></div>
   </div>
 </div>
-
-<!-- WORDPRESS IMAGES REPLACER MODAL -->
-<?php if(!empty($_SESSION['fm_admin'])):?>
-<div class="mod-ov" id="wpImagesOv">
-  <div class="mod mod-lg">
-    <div class="mod-head">
-      <div class="mod-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></div>
-      <span class="mod-title">Images Replacer</span>
-      <button class="btn btn-icon btn-g" id="wpImagesClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-    </div>
-    <div class="mod-body" id="wpImagesBody"><div style="text-align:center;padding:32px;color:var(--t3)">Loading…</div></div>
-  </div>
-</div>
-<?php endif;?>
 
 <!-- SQL MANAGER MODAL -->
 <?php if(!empty($_SESSION['fm_admin'])):?>
@@ -31032,7 +26994,6 @@ kbd{background:var(--surf);border:1px solid var(--border);border-radius:4px;padd
 const CWD  = <?=json_encode($fm->getCwd())?>;
 const FM_MAIN_PATH = <?=json_encode(realpath(__DIR__)?:__DIR__)?>;
 const CSRF = <?=json_encode($_SESSION['csrf_token'])?>;
-const FM_AUDIO_CACHE_SCOPE = <?=json_encode(hash('sha256',(string)($_SESSION['fm_user']??'')."\0".(string)($_SESSION['fm_root']??'')))?>;
 const FM_UPLOAD_CHUNK_BYTES = <?=fm_upload_chunk_bytes()?>;
 const FM_SSH_TERMINAL_USER = <?=json_encode($sshTerminalUser,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?>;
 const FM_SSH_TERMINAL_REQUEST_ERROR = <?=json_encode($sshTerminalRequestError,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)?>;
@@ -31088,6 +27049,7 @@ function closeSB(){sidebar.classList.remove('open');sideOv.classList.remove('vis
 menuBtn?.addEventListener('click',()=>sidebar.classList.contains('open')?closeSB():openSB());
 sideOv.addEventListener('click',closeSB);
 sidebar.querySelectorAll('.sb-item,.sb-flink').forEach(el=>el.addEventListener('click',()=>{if(window.innerWidth<=768)closeSB();}));
+
 
 
 /* ═══════════════════════════════════════
@@ -31243,10 +27205,10 @@ function openMod(id){document.getElementById(id)?.classList.add('open');}
 function closeMod(id){document.getElementById(id)?.classList.remove('open');if(id==='configInspectorOv'&&typeof resetConfigInspectorView==='function')resetConfigInspectorView();if(id==='rootingScanOv'&&typeof resetRootingScanView==='function')resetRootingScanView();if(id==='mfmOv'&&typeof mfaWatch==='function')[mfaWatch(false),typeof mfaDrawer==='function'&&mfaDrawer(false)];}
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape')return;
-  ['prevOv','fileInfoOv','termOv','hashOv','actOv','srvOv','brOv','symlinkOv','usersOv','cleanupOv','cleanupStatusOv','ownerOv','permOv','shareCreateOv','sharesOv','largeOv','dupOv','errLogOv','configInspectorOv','rootingScanOv','speedOv','wpNumbersOv','wpImagesOv','responseChangerOv','privOv','sessOv','guardOv','sfgOv','ownOv','rootOv','bpOv','mfmOv','pmaOv'].forEach(closeMod);
+  ['prevOv','fileInfoOv','termOv','hashOv','actOv','srvOv','brOv','symlinkOv','usersOv','cleanupOv','cleanupStatusOv','ownerOv','permOv','shareCreateOv','sharesOv','largeOv','dupOv','errLogOv','configInspectorOv','rootingScanOv','responseChangerOv','privOv','sessOv','guardOv','sfgOv','ownOv','rootOv','bpOv','mfmOv','pmaOv'].forEach(closeMod);
   closeSheet();closeCtx();
 });
-['prevOv','fileInfoOv','termOv','hashOv','actOv','srvOv','brOv','symlinkOv','usersOv','cleanupOv','cleanupStatusOv','ownerOv','permOv','shareCreateOv','sharesOv','largeOv','dupOv','errLogOv','envOv','configInspectorOv','rootingScanOv','speedOv','wpNumbersOv','wpImagesOv','responseChangerOv','ownOv','rootOv','bpOv'].forEach(id=>{
+['prevOv','fileInfoOv','termOv','hashOv','actOv','srvOv','brOv','symlinkOv','usersOv','cleanupOv','cleanupStatusOv','ownerOv','permOv','shareCreateOv','sharesOv','largeOv','dupOv','errLogOv','envOv','configInspectorOv','rootingScanOv','responseChangerOv','ownOv','rootOv','bpOv'].forEach(id=>{
   document.getElementById(id)?.addEventListener('click',e=>{if(e.target===document.getElementById(id))closeMod(id);});
 });
 document.getElementById('fileInfoClose')?.addEventListener('click',()=>closeMod('fileInfoOv'));
@@ -31578,10 +27540,7 @@ if(FM_FOCUS){
     return '<svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>';
   }
   const tools=(()=>{
-    const secs=[...document.querySelectorAll('.sidebar .sb-sec')];
-    const sec=secs.find(s=>{const l=s.querySelector('.sb-label');return l&&(l.textContent||'').trim().toLowerCase().startsWith('tools');});
-    if(!sec)return[];
-    return [...sec.querySelectorAll('.sb-item')].map(el=>{
+    return [...document.querySelectorAll('.sidebar .sb-scroll .sb-item')].map(el=>{
       const c=el.cloneNode(true);c.querySelectorAll('span').forEach(x=>x.remove());
       const name=(c.textContent||'').replace(/\s+/g,' ').trim();
       return{name,icon:el.querySelector('svg')?el.querySelector('svg').outerHTML:folderSvg,el};
@@ -31605,7 +27564,7 @@ if(FM_FOCUS){
     const shownTools=ql?matchedTools.slice(0,8):matchedTools.slice(0,12);
     items=[];let html='';
     if(shownTools.length){
-      html+='<div class="ts-head"><span>Tools</span><span>'+matchedTools.length+' available</span></div><div class="ts-grid">';
+      html+='<div class="ts-head"><span>Araçlar</span><span>'+matchedTools.length+' kullanılabilir</span></div><div class="ts-grid">';
       shownTools.forEach(t=>{const idx=items.length;items.push({kind:'tool',tool:t});
         html+='<button type="button" class="ts-item" role="option" data-idx="'+idx+'"><span class="ts-ico">'+t.icon+'</span><span class="ts-main"><span class="ts-name">'+highlight(t.name,q)+'</span><span class="ts-sub">Open tool</span></span><span class="ts-kind">Tool</span></button>';});
       html+='</div>';
@@ -31841,8 +27800,7 @@ function showCtx(x,y,data,overflowOnly=false){
   // Show/hide items
   qs('ctx-open').style.display=overflowOnly?'none':'flex';
   qs('ctx-info').style.display='flex';
-  qs('ctx-edit').style.display=(overflowOnly||isDir||data.type==='audio')?'none':'flex';
-  qs('ctx-audio-info').style.display=(!isDir&&data.type==='audio'&&!isRO)?'flex':'none';
+  qs('ctx-edit').style.display=(overflowOnly||isDir)?'none':'flex';
   qs('ctx-dl').style.display=(overflowOnly||isDir)?'none':'flex';
   const ctxExtract=qs('ctx-extract');if(ctxExtract)ctxExtract.style.display=(!isDir&&(isZip||isTar))?'flex':'none';
   qs('ctx-prev').style.display=(data.raw&&!isDir)?'flex':'none';
@@ -31925,7 +27883,6 @@ document.addEventListener('scroll',closeCtx,true);
 qs('ctx-open')?.addEventListener('click',()=>{closeCtx();doAction('open',ctxData.name,ctxData);});
 qs('ctx-info')?.addEventListener('click',()=>{closeCtx();openFileInfo(ctxData.info);});
 qs('ctx-edit')?.addEventListener('click',()=>{closeCtx();doAction('edit',ctxData.name);});
-qs('ctx-audio-info')?.addEventListener('click',()=>{closeCtx();fmMusicOpenEditor(ctxData.name);});
 qs('ctx-dl')?.addEventListener('click',()=>{closeCtx();doAction('dl',ctxData.name,ctxData);});
 qs('ctx-extract')?.addEventListener('click',()=>{const n=String(ctxData.name||'');const e=(n.split('.').pop()||'').toLowerCase();closeCtx();doAction(e==='zip'?'unzip':'tar-x',n);});
 qs('ctx-prev')?.addEventListener('click',()=>{closeCtx();doAction('prev',ctxData.name,ctxData);});
@@ -31966,7 +27923,7 @@ function openSheet(name,isDir,raw,type,size,info){
   const btns=[
     {icon:'<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',label:'Open',cls:'',act:()=>doAction('open',name,{isDir,raw,type})},
     {icon:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8h.01"/>',label:'Info',cls:'',act:()=>openFileInfo(info)},
-    !isDir&&!RO?{icon:type==='audio'?'<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>':'<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',label:type==='audio'?'Song details':'Edit',cls:'sh-blue',act:()=>type==='audio'?fmMusicOpenEditor(name):doAction('edit',name)}:null,
+    !isDir&&!RO?{icon:'<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',label:'Edit',cls:'sh-blue',act:()=>doAction('edit',name)}:null,
     !isDir?{icon:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',label:'Download',cls:'sh-blue',act:()=>{if(raw)location.href=raw+'&dl=1';}}:null,
     {icon:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',label:'Copy Path',cls:'',act:()=>{navigator.clipboard.writeText(CWD+'/'+name).then(()=>toast('Path copied!'));}},
     (!isDir&&['text','code','data','config','markdown'].includes(type))?{icon:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',label:'Copy Content',cls:'',act:()=>copyFileContent(name)}:null,
@@ -32050,803 +28007,6 @@ document.getElementById('clipCopy')?.addEventListener('click',()=>{const s=selNa
 document.getElementById('clipCut')?.addEventListener('click',()=>{const s=selNames();if(!s.length){toast('Select at least one item first.');return;}af('cut_clipboard',{items:JSON.stringify(s)});});
 document.getElementById('clipPaste')?.addEventListener('click',()=>af('paste_clipboard',{}));
 
-/* ══ LOCAL AUDIO PLAYER ══ */
-const fmMusicAudio=document.getElementById('fmMusicAudio');
-const fmMusicDock=document.getElementById('fmMusicDock');
-const fmMusicLayer=document.getElementById('fmMusicLayer');
-let fmMusicTracks=[],fmMusicIndex=-1,fmMusicShuffle=false,fmMusicRepeat=0,fmMusicSeeking=false,fmMusicCloseTimer=0,fmMusicOpenTimer=0,fmMusicDragTimer=0,fmMusicLyricEntries=[],fmMusicLyricIndex=-1,fmMusicLyricLoad=0;
-const fmMusicDrag={active:false,dragging:false,startX:0,startY:0,startTime:0,lastY:0,lastTime:0,velocity:0,pull:0};
-const fmMusicTagCache=new Map();
-const fmMusicTagRequests=new Set();
-const fmMusicCacheWrites=new Map();
-const fmMusicCacheValues=[0.5,0.75,0.9,1,1.1,1.25,1.5,1.75,2];
-let fmMusicCacheDbPromise=null,fmMusicActiveObjectUrl='',fmMusicPlaybackRequest=0,fmMusicWaitingForSource=false;
-function fmMusicSetting(key,fallback){
-  try{const value=localStorage.getItem('mfm-music-'+FM_AUDIO_CACHE_SCOPE+'-'+key);return value===null?fallback:value;}catch(error){return fallback;}
-}
-function fmMusicStoreSetting(key,value){
-  try{localStorage.setItem('mfm-music-'+FM_AUDIO_CACHE_SCOPE+'-'+key,String(value));}catch(error){}
-}
-let fmMusicPlaybackRate=Number(fmMusicSetting('speed','1'));
-if(!fmMusicCacheValues.includes(fmMusicPlaybackRate))fmMusicPlaybackRate=1;
-let fmMusicVolume=Number(fmMusicSetting('volume','1'));
-if(!Number.isFinite(fmMusicVolume))fmMusicVolume=1;
-fmMusicVolume=Math.max(0,Math.min(1,fmMusicVolume));
-let fmMusicOutputGain=1,fmMusicFadeFrame=0,fmMusicFadeToken=0,fmMusicPlaybackAction=0,fmMusicPausePending=false;
-function fmMusicApplyOutputVolume(){
-  fmMusicAudio.volume=Math.max(0,Math.min(1,fmMusicVolume*fmMusicOutputGain));
-}
-function fmMusicSetOutputGain(value){
-  fmMusicOutputGain=Math.max(0,Math.min(1,Number(value)||0));
-  fmMusicApplyOutputVolume();
-}
-function fmMusicFadeOutput(target,duration,onComplete){
-  const token=++fmMusicFadeToken;
-  if(fmMusicFadeFrame)window.cancelAnimationFrame(fmMusicFadeFrame);
-  fmMusicFadeFrame=0;
-  const start=fmMusicOutputGain,end=Math.max(0,Math.min(1,Number(target)||0));
-  if(!window.requestAnimationFrame||duration<=0||Math.abs(start-end)<0.001){
-    fmMusicSetOutputGain(end);onComplete?.();return;
-  }
-  const started=window.performance?.now?.()??Date.now();
-  const step=now=>{
-    if(token!==fmMusicFadeToken)return;
-    const progress=Math.min(1,Math.max(0,(now-started)/duration));
-    const eased=progress*progress*(3-2*progress);
-    fmMusicSetOutputGain(start+(end-start)*eased);
-    if(progress>=1){fmMusicFadeFrame=0;onComplete?.();return;}
-    fmMusicFadeFrame=window.requestAnimationFrame(step);
-  };
-  fmMusicFadeFrame=window.requestAnimationFrame(step);
-}
-function fmMusicStartWithFade(request,onError){
-  fmMusicPausePending=false;
-  const action=++fmMusicPlaybackAction;
-  fmMusicFadeOutput(0,0);
-  let attempt;
-  try{attempt=fmMusicAudio.play();}catch(error){attempt=Promise.reject(error);}
-  Promise.resolve(attempt).then(()=>{
-    if(request!==fmMusicPlaybackRequest||action!==fmMusicPlaybackAction||fmMusicPausePending)return;
-    if(fmMusicAudio.paused){fmMusicSetOutputGain(1);return;}
-    fmMusicFadeOutput(1,300);
-    fmMusicUpdateButtons();
-  }).catch(error=>{
-    if(request!==fmMusicPlaybackRequest||action!==fmMusicPlaybackAction)return;
-    fmMusicSetOutputGain(1);
-    onError?.(error);
-  });
-}
-function fmMusicPauseWithFade(onComplete){
-  if(fmMusicAudio.paused){
-    fmMusicPausePending=false;++fmMusicPlaybackAction;
-    fmMusicFadeOutput(1,0,onComplete);return;
-  }
-  fmMusicPausePending=true;
-  const action=++fmMusicPlaybackAction;
-  fmMusicFadeOutput(0,220,()=>{
-    if(action!==fmMusicPlaybackAction||!fmMusicPausePending)return;
-    fmMusicPausePending=false;
-    fmMusicAudio.pause();
-    fmMusicSetOutputGain(1);
-    onComplete?.();
-  });
-}
-function fmMusicCacheKey(track){return FM_AUDIO_CACHE_SCOPE+'|'+track.url;}
-function fmMusicCacheVersion(track){
-  if(track?.mfmSelectedSong&&typeof track.sha==='string'&&/^[a-f0-9]{40}$/i.test(track.sha))return'github:'+track.sha.toLowerCase();
-  return String(Math.max(0,Number(track.size)||0))+':'+String(Math.max(0,Number(track.mtime)||0));
-}
-function fmMusicSourceUrl(track){return track?.mediaUrl||track?.url||'';}
-function fmMusicOpenCache(){
-  if(!('indexedDB'in window))return Promise.resolve(null);
-  if(!fmMusicCacheDbPromise)fmMusicCacheDbPromise=new Promise(resolve=>{
-    let settled=false;
-    const finish=db=>{if(settled)return;settled=true;resolve(db);};
-    try{
-      const request=indexedDB.open('mfm-audio-playback-cache',1);
-      request.onupgradeneeded=()=>{const db=request.result;if(!db.objectStoreNames.contains('tracks'))db.createObjectStore('tracks',{keyPath:'key'});};
-      request.onsuccess=()=>finish(request.result);
-      request.onerror=()=>finish(null);
-      request.onblocked=()=>finish(null);
-    }catch(error){finish(null);}
-  });
-  return fmMusicCacheDbPromise;
-}
-async function fmMusicReadCachedTrack(track){
-  const db=await fmMusicOpenCache();if(!db)return null;
-  return new Promise(resolve=>{
-    let settled=false;const finish=value=>{if(settled)return;settled=true;resolve(value);};
-    try{
-      const tx=db.transaction('tracks','readonly'),request=tx.objectStore('tracks').get(fmMusicCacheKey(track));
-      request.onsuccess=()=>{
-        const record=request.result;
-        if(record&&record.version===fmMusicCacheVersion(track)&&record.blob instanceof Blob){finish(record.blob);return;}
-        if(record)fmMusicDeleteCachedTrack(track);
-        finish(null);
-      };
-      request.onerror=()=>finish(null);tx.onabort=()=>finish(null);
-    }catch(error){finish(null);}
-  });
-}
-async function fmMusicDeleteCachedTrack(track){
-  const db=await fmMusicOpenCache();if(!db)return;
-  try{const tx=db.transaction('tracks','readwrite');tx.objectStore('tracks').delete(fmMusicCacheKey(track));}catch(error){}
-}
-async function fmMusicWriteCachedTrack(track,blob){
-  const db=await fmMusicOpenCache();if(!db)return false;
-  return new Promise(resolve=>{
-    let settled=false;const finish=value=>{if(settled)return;settled=true;resolve(value);};
-    try{
-      const tx=db.transaction('tracks','readwrite');
-      tx.objectStore('tracks').put({key:fmMusicCacheKey(track),version:fmMusicCacheVersion(track),blob,size:blob.size,savedAt:Date.now(),name:track.name});
-      tx.oncomplete=()=>finish(true);tx.onerror=()=>finish(false);tx.onabort=()=>finish(false);
-    }catch(error){finish(false);}
-  });
-}
-function fmMusicCacheTrack(track){
-  const key=fmMusicCacheKey(track)+'|'+fmMusicCacheVersion(track);
-  if(fmMusicCacheWrites.has(key))return fmMusicCacheWrites.get(key);
-  const operation=(async()=>{
-    const db=await fmMusicOpenCache();if(!db)return false;
-    const cached=await fmMusicReadCachedTrack(track);if(cached)return true;
-    try{
-      const response=await fetch(fmMusicSourceUrl(track),{credentials:'same-origin',cache:'no-store',headers:{Accept:'audio/*,*/*;q=0.8'}});
-      if(!response.ok)throw new Error('Audio download failed.');
-      const blob=await response.blob();
-      if(!blob.size||(track.size>0&&blob.size!==track.size))throw new Error('Audio file changed while being saved.');
-      return await fmMusicWriteCachedTrack(track,blob);
-    }catch(error){return false;}
-  })().finally(()=>fmMusicCacheWrites.delete(key));
-  fmMusicCacheWrites.set(key,operation);return operation;
-}
-function fmMusicSetCacheStatus(message){
-  const status=document.getElementById('fmMusicCacheStatus');if(status)status.textContent=message;
-}
-function fmMusicSetLoading(loading){
-  const busy=!!loading;
-  ['fmMusicPlay','fmMusicMiniPlay'].forEach(id=>{
-    const button=document.getElementById(id);if(!button)return;
-    button.classList.toggle('fm-loading',busy);
-    button.setAttribute('aria-busy',String(busy));
-  });
-  document.querySelector('.fm-music-progress-wrap')?.classList.toggle('fm-buffering',busy);
-}
-function fmMusicMeta(filename,url=''){
-  const clean=String(filename||'').replace(/\.[^.]+$/,'').replace(/[_]+/g,' ').trim();
-  const split=clean.match(/^(.{1,80}?)\s+[-–-]\s+(.+)$/);
-  const parsed=split?{title:split[2].trim()||clean,artist:split[1].trim()||'Local file'}:{title:clean||filename||'Audio track',artist:'Local file'};
-  const tagged=url?fmMusicTagCache.get(url):null;
-  return tagged?{title:tagged.title||parsed.title,artist:tagged.artist||parsed.artist}:parsed;
-}
-function fmMusicCollect(){
-  const found=new Map();
-  document.querySelectorAll('.nc[data-type="audio"][data-preview]').forEach(el=>{
-    const name=el.dataset.fname||'';if(!name||found.has(name))return;
-    found.set(name,{name,url:el.dataset.preview,size:Number(el.dataset.audioSize)||0,mtime:Number(el.dataset.audioMtime)||0,art:el.dataset.art||'',defaultArt:el.dataset.artDefault||el.dataset.art||'',fallback:el.dataset.artFallback||'',lyrics:el.dataset.lyrics||''});
-  });
-  fmMusicTracks=Array.from(found.values());
-  const count=document.getElementById('fmMusicQueueCount'),summary=document.getElementById('fmMusicQueueSummary');
-  if(count)count.textContent=String(fmMusicTracks.length);
-  if(summary)summary.textContent=fmMusicTracks.length?`${fmMusicTracks.length} ${fmMusicTracks.length===1?'track':'tracks'}`:'No audio files';
-}
-function fmMusicHydrateTags(track){
-  if(!track||fmMusicTagRequests.has(track.url))return;
-  fmMusicTagRequests.add(track.url);
-  const url=track.url+(track.url.includes('?')?'&':'?')+'audio_meta=1';
-  fetch(url,{headers:{Accept:'application/json'}}).then(response=>{if(!response.ok)throw new Error('tag read unavailable');return response.json();}).then(tags=>{
-    if(!tags||typeof tags!=='object')return;
-    const fallback=fmMusicMeta(track.name),current=fmMusicTagCache.get(track.url)||{};
-    const tagged={title:String(tags.title||current.title||fallback.title).trim(),artist:String(tags.artist||current.artist||fallback.artist).trim(),album:String(tags.album||current.album||'').trim(),year:String(tags.year||current.year||'').trim(),genre:String(tags.genre||current.genre||'').trim(),hasCustomCover:!!tags.has_custom_cover};
-    fmMusicTagCache.set(track.url,tagged);
-    if(fmMusicTracks[fmMusicIndex]?.url===track.url){
-      fmMusicApplyMeta(track);
-    }
-  }).catch(()=>{});
-}
-let fmMusicEditTrackName='',fmMusicEditTrackUrl='',fmMusicEditHasCover=false,fmMusicEditClearCover=false,fmMusicEditPreviewUrl='',fmMusicEditPreviewRequest=0;
-function fmMusicEditPreview(url,fallback=''){
-  const image=document.getElementById('fmAudioEditArtPreview'),placeholder=document.getElementById('fmAudioEditArtPlaceholder');
-  if(fmMusicEditPreviewUrl&&fmMusicEditPreviewUrl.startsWith('blob:'))URL.revokeObjectURL(fmMusicEditPreviewUrl);
-  fmMusicEditPreviewUrl=url||'';
-  const request=++fmMusicEditPreviewRequest;
-  if(!image){if(placeholder)placeholder.hidden=!!url;return;}
-  image.hidden=true;image.onerror=null;image.onload=null;image.removeAttribute('src');
-  const sources=[...new Set([url,fallback].filter(Boolean))];let sourceIndex=0;
-  const showNext=()=>{
-    if(request!==fmMusicEditPreviewRequest)return;
-    if(sourceIndex>=sources.length){image.hidden=true;if(placeholder)placeholder.hidden=false;return;}
-    if(placeholder)placeholder.hidden=true;
-    image.hidden=false;image.src=sources[sourceIndex++];
-  };
-  image.onerror=showNext;
-  image.onload=()=>{if(request===fmMusicEditPreviewRequest){image.hidden=false;if(placeholder)placeholder.hidden=true;}};
-  if(!sources.length){image.hidden=true;if(placeholder)placeholder.hidden=false;return;}
-  showNext();
-}
-async function fmMusicOpenEditor(name){
-  if(!document.getElementById('fmAudioEditOverlay')){toast('Song details are unavailable in read-only mode.');return;}
-  fmMusicCollect();
-  const track=fmMusicTracks.find(item=>item.name===name);
-  if(!track){toast('This audio file is not available in the current folder.');return;}
-  const fallback=fmMusicMeta(track.name,track.url);
-  let metadata=fmMusicTagCache.get(track.url)||{title:fallback.title,artist:fallback.artist,album:'',year:'',genre:'',hasCustomCover:false};
-  try{
-    const url=track.url+(track.url.includes('?')?'&':'?')+'audio_meta=1';
-    const response=await fetch(url,{headers:{Accept:'application/json'},cache:'no-store'});
-    if(response.ok){
-      const tags=await response.json();
-      metadata={title:String(tags.title||metadata.title||fallback.title),artist:String(tags.artist||metadata.artist||fallback.artist),album:String(tags.album||''),year:String(tags.year||''),genre:String(tags.genre||''),hasCustomCover:!!tags.has_custom_cover};
-      fmMusicTagCache.set(track.url,metadata);
-      fmMusicRenderQueue();
-    }
-  }catch(error){}
-  fmMusicEditTrackName=track.name;fmMusicEditTrackUrl=track.url;fmMusicEditHasCover=!!metadata.hasCustomCover;fmMusicEditClearCover=false;
-  document.getElementById('fmAudioEditTitle').value=metadata.title||fallback.title;
-  document.getElementById('fmAudioEditArtist').value=metadata.artist||fallback.artist;
-  document.getElementById('fmAudioEditAlbum').value=metadata.album||'';
-  document.getElementById('fmAudioEditYear').value=metadata.year||'';
-  document.getElementById('fmAudioEditGenre').value=metadata.genre||'';
-  document.getElementById('fmAudioEditCover').value='';
-  const removeButton=document.getElementById('fmAudioEditRemoveCover');
-  if(removeButton){removeButton.hidden=!fmMusicEditHasCover;removeButton.textContent='Remove custom cover';}
-  const editArt=track.art||track.defaultArt||track.fallback||'';
-  fmMusicEditPreview(editArt,track.art?(track.defaultArt||track.fallback||''):'');
-  const overlay=document.getElementById('fmAudioEditOverlay');overlay.classList.add('open');overlay.setAttribute('aria-hidden','false');
-  window.setTimeout(()=>document.getElementById('fmAudioEditTitle')?.focus(),30);
-}
-function fmMusicCloseEditor(){
-  const overlay=document.getElementById('fmAudioEditOverlay');if(!overlay)return;
-  overlay.classList.remove('open');overlay.setAttribute('aria-hidden','true');
-  document.getElementById('fmAudioEditCover').value='';
-  fmMusicEditPreview('');
-}
-function fmMusicApplyEditedTrack(name,metadata,artUrl){
-  const oldTrack=fmMusicTracks.find(item=>item.name===name);
-  if(!oldTrack)return;
-  const fallbackArt=oldTrack.defaultArt||oldTrack.fallback||'';
-  const nextArt=artUrl||fallbackArt;
-  document.querySelectorAll('.nc[data-fname],.gi[data-name]').forEach(row=>{
-    const rowName=row.dataset.fname||row.dataset.name;
-    if(rowName!==name)return;
-    row.dataset.art=nextArt;row.dataset.artFallback=artUrl?fallbackArt:oldTrack.fallback;
-    const image=row.querySelector('.fm-track-art');
-    if(image){
-      image.dataset.fallback=artUrl?fallbackArt:oldTrack.fallback;
-      image.style.display=nextArt?'':'none';
-      if(nextArt)image.src=nextArt;
-    }
-  });
-  fmMusicTagCache.set(oldTrack.url,{title:metadata.title,artist:metadata.artist,album:metadata.album,year:metadata.year,genre:metadata.genre,hasCustomCover:!!artUrl});
-  fmMusicCollect();
-  const updated=fmMusicTracks.find(item=>item.name===name);
-  if(!updated)return;
-  if(fmMusicTracks[fmMusicIndex]?.name===name){
-    fmMusicSetArt(document.getElementById('fmMusicCoverArt'),updated.art,updated.fallback);
-    fmMusicSetArt(document.getElementById('fmMusicMiniArt'),updated.art,updated.fallback);
-    fmMusicApplyMeta(updated);
-  }else fmMusicRenderQueue();
-}
-document.getElementById('fmAudioEditClose')?.addEventListener('click',fmMusicCloseEditor);
-document.getElementById('fmAudioEditCancel')?.addEventListener('click',fmMusicCloseEditor);
-document.getElementById('fmAudioEditOverlay')?.addEventListener('click',e=>{if(e.target===e.currentTarget)fmMusicCloseEditor();});
-document.getElementById('fmAudioEditCover')?.addEventListener('change',e=>{
-  const file=e.currentTarget.files?.[0];if(!file)return;
-  fmMusicEditClearCover=false;
-  const removeButton=document.getElementById('fmAudioEditRemoveCover');
-  if(removeButton){removeButton.hidden=false;removeButton.textContent='Remove custom cover';}
-  fmMusicEditPreview(URL.createObjectURL(file));
-});
-document.getElementById('fmAudioEditRemoveCover')?.addEventListener('click',()=>{
-  const input=document.getElementById('fmAudioEditCover');
-  if(input)input.value='';
-  fmMusicEditClearCover=!fmMusicEditClearCover;
-  const removeButton=document.getElementById('fmAudioEditRemoveCover');
-  if(removeButton)removeButton.textContent=fmMusicEditClearCover?'Keep current cover':'Remove custom cover';
-  const track=fmMusicTracks.find(item=>item.name===fmMusicEditTrackName);
-  const previewArt=fmMusicEditClearCover?(track?.defaultArt||track?.fallback||''):(track?.art||track?.defaultArt||track?.fallback||'');
-  fmMusicEditPreview(previewArt,fmMusicEditClearCover?(track?.fallback||''):(track?.defaultArt||track?.fallback||''));
-});
-document.getElementById('fmAudioEditSave')?.addEventListener('click',async()=>{
-  const year=document.getElementById('fmAudioEditYear').value.trim();
-  if(year!==''&&!/^\d{4}$/.test(year)){toast('Enter a four-digit year or leave it empty.');return;}
-  const save=document.getElementById('fmAudioEditSave');save.disabled=true;
-  try{
-    const form=new FormData();
-    form.append('csrf_token',CSRF);form.append('dir',CWD);form.append('file',fmMusicEditTrackName);
-    ['title','artist','album','year','genre'].forEach(key=>form.append(key,document.getElementById('fmAudioEdit'+key[0].toUpperCase()+key.slice(1)).value.trim()));
-    const cover=document.getElementById('fmAudioEditCover').files?.[0];
-    if(cover)form.append('cover',cover);
-    else if(fmMusicEditClearCover)form.append('remove_cover','1');
-    const response=await fetch('?x=audio_metadata_save',{method:'POST',body:form,credentials:'same-origin',cache:'no-store'});
-    const result=await response.json();
-    if(!response.ok||!result.ok)throw new Error(result.error||'Song details could not be saved.');
-    fmMusicApplyEditedTrack(fmMusicEditTrackName,result.metadata||{},result.art_url||'');
-    fmMusicEditHasCover=!!result.art_url;fmMusicEditClearCover=false;
-    fmMusicCloseEditor();toast('Song details saved.');
-  }catch(error){toast(error.message||'Song details could not be saved.');}
-  finally{save.disabled=false;}
-});
-function fmMusicApplyCoverGlow(img){
-  if(!img||img.id!=='fmMusicCoverArt'||img.hidden)return;
-  const cover=img.closest('.fm-music-cover');if(!cover)return;
-  try{
-    const canvas=document.createElement('canvas');canvas.width=24;canvas.height=24;
-    const context=canvas.getContext('2d',{willReadFrequently:true});if(!context)return;
-    context.drawImage(img,0,0,24,24);
-    const pixels=context.getImageData(0,0,24,24).data;
-    let red=0,green=0,blue=0,total=0;
-    for(let i=0;i<pixels.length;i+=4){
-      const alpha=pixels[i+3]/255;if(alpha<.7)continue;
-      const r=pixels[i],g=pixels[i+1],b=pixels[i+2],max=Math.max(r,g,b),min=Math.min(r,g,b);
-      const saturation=max?((max-min)/max):0,brightness=(r+g+b)/3;
-      if(brightness<20)continue;
-      const weight=alpha*(.22+saturation*1.15)*Math.min(1,brightness/110);
-      red+=r*weight;green+=g*weight;blue+=b*weight;total+=weight;
-    }
-    if(!total)return;
-    const color=`${Math.round(red/total)},${Math.round(green/total)},${Math.round(blue/total)}`;
-    cover.style.setProperty('--fm-cover-glow',`rgba(${color},.48)`);
-  }catch(error){}
-}
-function fmMusicSetArt(img,primary,fallback){
-  if(!img)return;
-  const cover=img.id==='fmMusicCoverArt'?img.closest('.fm-music-cover'):null;
-  if(cover){cover.style.removeProperty('--fm-cover-glow');cover.classList.remove('fm-art-loading');}
-  img.onerror=null;img.hidden=true;img.removeAttribute('src');
-  if(!primary&&!fallback)return;
-  img.hidden=false;
-  if(cover)cover.classList.add('fm-art-loading');
-  let usedFallback=false;
-  img.onerror=()=>{
-    if(!usedFallback&&fallback&&primary!==fallback){usedFallback=true;img.src=fallback;return;}
-    img.hidden=true;if(cover)cover.classList.remove('fm-art-loading');
-  };
-  img.onload=()=>{img.hidden=false;if(cover){cover.classList.remove('fm-art-loading');fmMusicApplyCoverGlow(img);}};
-  img.src=primary||fallback;
-}
-function fmMusicFormatTime(seconds){
-  if(!Number.isFinite(seconds)||seconds<0)return'0:00';
-  const n=Math.floor(seconds),h=Math.floor(n/3600),m=Math.floor((n%3600)/60),s=n%60;
-  return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${m}:${String(s).padStart(2,'0')}`;
-}
-let fmMusicVideoFadeFrame=0;
-function fmMusicSyncVideoFade(){
-  const video=document.getElementById('fmMusicSelectedVideo');
-  if(!video)return;
-  if(window.innerWidth>768){
-    video.style.removeProperty('height');
-    video.style.removeProperty('-webkit-mask-image');
-    video.style.removeProperty('mask-image');
-    return;
-  }
-  const progress=document.querySelector('.fm-music-progress-wrap');
-  if(!progress)return;
-  const videoTop=video.getBoundingClientRect().top;
-  const endY=progress.getBoundingClientRect().bottom-videoTop+18;
-  const height=Math.max(1,Math.ceil(endY));
-  const start=Math.max(0,Math.min(height-1,Math.round(height*.70)));
-  const span=Math.max(1,height-start);
-  const ramp=[[0,1],[.10,.985],[.22,.94],[.36,.86],[.50,.72],[.64,.54],[.77,.35],[.88,.18],[.95,.07],[.99,.015],[1,0]];
-  const stops=ramp.map(([position,opacity])=>{
-    const y=(start+span*position).toFixed(1);
-    return `${opacity===0?'transparent':`rgba(0,0,0,${opacity})`} ${y}px`;
-  }).join(',');
-  const mask=`linear-gradient(to bottom,#000 0px,#000 ${start}px,${stops})`;
-  video.style.height=`${height}px`;
-  video.style.setProperty('-webkit-mask-image',mask);
-  video.style.setProperty('mask-image',mask);
-}
-function fmMusicScheduleVideoFade(){
-  if(fmMusicVideoFadeFrame)window.cancelAnimationFrame(fmMusicVideoFadeFrame);
-  fmMusicVideoFadeFrame=window.requestAnimationFrame(()=>{
-    fmMusicVideoFadeFrame=0;
-    fmMusicSyncVideoFade();
-  });
-}
-document.querySelector('.fm-music-scroll')?.addEventListener('scroll',fmMusicScheduleVideoFade,{passive:true});
-window.addEventListener('resize',fmMusicScheduleVideoFade,{passive:true});
-document.fonts?.ready?.then(fmMusicScheduleVideoFade).catch(()=>{});
-fmMusicScheduleVideoFade();
-function fmMusicApplyMeta(track){
-  const meta=fmMusicMeta(track.name,track.url),title=document.getElementById('fmMusicTitle'),artist=document.getElementById('fmMusicArtist'),miniTitle=document.getElementById('fmMusicMiniTitle'),miniArtist=document.getElementById('fmMusicMiniArtist');
-  if(title)title.textContent=meta.title;if(artist)artist.textContent=meta.artist;if(miniTitle)miniTitle.textContent=meta.title;if(miniArtist)miniArtist.textContent=meta.artist;
-  fmMusicScheduleVideoFade();
-  fmMusicRenderQueue();
-}
-function fmMusicParseLrc(source){
-  const entries=[],meta={};let offset=0;
-  for(const original of String(source||'').replace(/\r\n?/g,'\n').split('\n').slice(0,10000)){
-    const line=original.trim();if(!line)continue;
-    const tag=line.match(/^\[(ti|ar|al|by|offset):([^\]]*)\]$/i);
-    if(tag){const key=tag[1].toLowerCase();if(key==='offset')offset=(parseInt(tag[2],10)||0)/1000;else meta[key]=tag[2].trim();continue;}
-    const found=[...line.matchAll(/\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]/g)];
-    const text=line.replace(/\[(\d{1,3}):([0-5]?\d)(?:[.:](\d{1,3}))?\]/g,'').replace(/<\d{1,3}:[0-5]?\d(?:[.:]\d{1,3})?>/g,'').trim();
-    if(found.length){
-      for(const m of found){const fraction=(m[3]||'').padEnd(3,'0').slice(0,3);entries.push({time:Math.max(0,Number(m[1])*60+Number(m[2])+Number('0.'+fraction)+offset),text:text||'♪'});}
-    }else if(text&&!/^\[[a-z]+:/i.test(text))entries.push({time:null,text});
-  }
-  entries.sort((a,b)=>(a.time??Infinity)-(b.time??Infinity));
-  return{entries,meta};
-}
-function fmMusicRenderLyrics(){
-  const body=document.getElementById('fmMusicLyricsBody');if(!body)return;
-  body.replaceChildren();fmMusicLyricIndex=-1;
-  if(!fmMusicLyricEntries.length){const empty=document.createElement('div');empty.className='fm-music-queue-empty';empty.textContent='No readable lyric lines in this LRC file.';body.appendChild(empty);return;}
-  fmMusicLyricEntries.forEach((entry,index)=>{
-    const line=document.createElement('button');line.type='button';line.className='fm-music-lyric';line.textContent=entry.text;
-    if(entry.time===null)line.disabled=true;else line.addEventListener('click',()=>{fmMusicAudio.currentTime=entry.time;fmMusicSyncLyrics(true);});
-    body.appendChild(line);
-  });
-}
-function fmMusicSyncLyrics(scroll=false){
-  if(!fmMusicLyricEntries.length)return;
-  const time=Number.isFinite(fmMusicAudio.currentTime)?fmMusicAudio.currentTime:0;let lo=0,hi=fmMusicLyricEntries.length-1,active=-1;
-  while(lo<=hi){const mid=(lo+hi)>>1,t=fmMusicLyricEntries[mid].time;if(t===null){hi=mid-1;continue;}if(t<=time){active=mid;lo=mid+1;}else hi=mid-1;}
-  if(active===fmMusicLyricIndex&&!scroll)return;
-  const body=document.getElementById('fmMusicLyricsBody');if(!body)return;
-  body.querySelectorAll('.fm-music-lyric.current').forEach(el=>{el.classList.remove('current');el.removeAttribute('aria-current');});
-  fmMusicLyricIndex=active;if(active<0)return;
-  const line=body.children[active];if(line){line.classList.add('current');line.setAttribute('aria-current','true');if(scroll&&document.getElementById('fmMusicLyrics')?.hidden===false)line.scrollIntoView({block:'nearest',behavior:'smooth'});}
-}
-function fmMusicLoadLyrics(track){
-  const token=++fmMusicLyricLoad,button=document.getElementById('fmMusicLyricsToggle'),section=document.getElementById('fmMusicLyrics'),list=document.getElementById('fmMusicLyricsBody');
-  fmMusicLyricEntries=[];fmMusicLyricIndex=-1;if(button){button.hidden=true;button.setAttribute('aria-expanded','false');}if(section)section.hidden=true;if(list)list.replaceChildren();
-  if(!track?.lyrics)return;
-  fetch(track.lyrics,{headers:{Accept:'text/plain'}}).then(response=>{if(!response.ok)throw new Error('Lyrics could not be loaded.');return response.text();}).then(text=>{
-    if(token!==fmMusicLyricLoad||fmMusicTracks[fmMusicIndex]?.url!==track.url)return;
-    const parsed=fmMusicParseLrc(text);fmMusicLyricEntries=parsed.entries;fmMusicRenderLyrics();
-    if(button){button.hidden=false;button.setAttribute('aria-expanded','false');}
-    const fallback=fmMusicMeta(track.name),current=fmMusicTagCache.get(track.url)||{};
-    const titleFromTags=current.title&&current.title!==fallback.title,artistFromTags=current.artist&&current.artist!=='Local file'&&current.artist!==fallback.artist;
-    fmMusicTagCache.set(track.url,{title:titleFromTags?current.title:(parsed.meta.ti||current.title||fallback.title),artist:artistFromTags?current.artist:(parsed.meta.ar||current.artist||fallback.artist)});
-    fmMusicApplyMeta(track);
-  }).catch(()=>{});
-}
-function fmMusicRenderQueue(){
-  const list=document.getElementById('fmMusicQueueList');if(!list)return;
-  list.replaceChildren();
-  if(!fmMusicTracks.length){const empty=document.createElement('div');empty.className='fm-music-queue-empty';empty.textContent='No audio files in this folder.';list.appendChild(empty);return;}
-  fmMusicTracks.forEach((track,index)=>{
-    const meta=fmMusicMeta(track.name,track.url),row=document.createElement('button');
-    row.type='button';row.className='fm-music-queue-row'+(index===fmMusicIndex?' current':'');
-    row.setAttribute('aria-label',`Play ${meta.title} by ${meta.artist}`);
-    const art=document.createElement('span');art.className='fm-music-queue-art';
-    const img=document.createElement('img');img.alt='';img.hidden=true;art.appendChild(img);fmMusicSetArt(img,track.art,track.fallback);
-    const copy=document.createElement('span');copy.className='fm-music-queue-meta';
-    const title=document.createElement('strong');title.textContent=meta.title;
-    const artist=document.createElement('span');artist.textContent=meta.artist;
-    copy.append(title,artist);
-    const state=document.createElement('span');state.className='fm-music-queue-state';state.textContent=index===fmMusicIndex&& !fmMusicAudio.paused?'♫':'';
-    row.append(art,copy,state);row.addEventListener('click',()=>fmMusicPlayTrack(index,true));list.appendChild(row);
-  });
-}
-function fmMusicUpdateButtons(){
-  const playing=!fmMusicAudio.paused;
-  ['fmMusicPlay','fmMusicMiniPlay'].forEach(id=>{const b=document.getElementById(id);if(!b)return;b.classList.toggle('fm-playing',playing);b.title=playing?'Pause':'Play';b.setAttribute('aria-label',playing?'Pause':'Play');});
-  const sh=document.getElementById('fmMusicShuffle');sh?.classList.toggle('active',fmMusicShuffle);if(sh){sh.title=fmMusicShuffle?'Shuffle on':'Shuffle off';sh.setAttribute('aria-label',sh.title);}
-  const rp=document.getElementById('fmMusicRepeat');rp?.classList.toggle('active',fmMusicRepeat>0);rp?.classList.toggle('repeat-one',fmMusicRepeat===2);
-  if(rp){rp.title=fmMusicRepeat===0?'Repeat off':fmMusicRepeat===1?'Repeat all':'Repeat one';rp.setAttribute('aria-label',rp.title);}
-  fmMusicRenderQueue();
-}
-function fmMusicUpdateProgress(){
-  const duration=Number.isFinite(fmMusicAudio.duration)?fmMusicAudio.duration:0;
-  const current=Number.isFinite(fmMusicAudio.currentTime)?fmMusicAudio.currentTime:0;
-  const ratio=duration?Math.min(1,current/duration):0,percent=(ratio*100).toFixed(2)+'%';
-  const seek=document.getElementById('fmMusicSeek');if(seek){seek.max='1000';if(!fmMusicSeeking)seek.value=String(Math.round(ratio*1000));seek.style.setProperty('--fm-progress',percent);}
-  const elapsed=document.getElementById('fmMusicElapsed'),total=document.getElementById('fmMusicDuration'),mini=document.getElementById('fmMusicMiniProgress');
-  if(elapsed)elapsed.textContent=fmMusicFormatTime(current);if(total)total.textContent=fmMusicFormatTime(duration);if(mini)mini.style.width=percent;
-}
-function fmMusicOpenPanel(){
-  window.clearTimeout(fmMusicCloseTimer);window.clearTimeout(fmMusicOpenTimer);window.clearTimeout(fmMusicDragTimer);
-  const panel=document.getElementById('fmMusicPanel');
-  fmMusicLayer.classList.remove('closing','dragging');fmMusicLayer.style.removeProperty('--fm-player-scrim-opacity');
-  if(panel){panel.classList.remove('fm-player-entering');panel.style.removeProperty('transform');panel.style.removeProperty('opacity');panel.style.removeProperty('transition');}
-  if(window.innerWidth>768&&panel)fmMusicSetPaneWidth(panel.getBoundingClientRect().width);
-  fmMusicDock.classList.remove('fm-dock-in-front','fm-dock-expanding');fmMusicDock.classList.add('fm-panel-open');fmMusicDock.style.removeProperty('--fm-dock-handoff-opacity');fmMusicDock.style.removeProperty('transition');
-  document.querySelector('.shell')?.classList.add('fm-music-side-open');
-  fmMusicLayer.classList.add('open');fmMusicLayer.setAttribute('aria-hidden','false');fmMusicDock.classList.add('visible','fm-dock-expanding');fmMusicDock.setAttribute('aria-hidden','false');
-  if(panel){void panel.offsetHeight;panel.classList.add('fm-player-entering');}
-fmMusicOpenTimer=window.setTimeout(()=>{
-  panel?.classList.remove('fm-player-entering');
-  fmMusicScheduleVideoFade();
-},470);
-  const queueToggle=document.getElementById('fmMusicQueueToggle');
-  queueToggle?.setAttribute('aria-expanded','true');
-  fmMusicScheduleVideoFade();
-}
-const fmMusicResizeHandle=document.getElementById('fmMusicResize');
-const fmMusicShell=document.querySelector('.shell');
-function fmMusicPaneLimits(){
-  return{min:320,max:Math.max(320,Math.min(720,window.innerWidth-270))};
-}
-function fmMusicSetPaneWidth(width){
-  if(!fmMusicShell||!fmMusicResizeHandle)return;
-  const limits=fmMusicPaneLimits(),next=Math.round(Math.max(limits.min,Math.min(limits.max,width)));
-  fmMusicShell.style.setProperty('--fm-music-pane-w',next+'px');
-  fmMusicResizeHandle.setAttribute('aria-valuenow',String(next));
-  fmMusicResizeHandle.setAttribute('aria-valuemin',String(limits.min));
-  fmMusicResizeHandle.setAttribute('aria-valuemax',String(limits.max));
-}
-const fmMusicSavedPaneWidth=Number(fmMusicSetting('pane-width','560'));
-if(window.innerWidth>768&&Number.isFinite(fmMusicSavedPaneWidth))fmMusicSetPaneWidth(fmMusicSavedPaneWidth);
-fmMusicResizeHandle?.addEventListener('pointerdown',event=>{
-  if(window.innerWidth<=768||!fmMusicShell)return;
-  event.preventDefault();
-  const panel=document.getElementById('fmMusicPanel');
-  if(!panel)return;
-  fmMusicShell.classList.add('fm-music-resizing');
-  panel.classList.add('fm-music-resizing');
-  try{fmMusicResizeHandle.setPointerCapture(event.pointerId);}catch(error){}
-  const pointerId=event.pointerId,startX=event.clientX,startWidth=panel.getBoundingClientRect().width;
-  const move=moveEvent=>{
-    if(moveEvent.pointerId!==pointerId)return;
-    fmMusicSetPaneWidth(startWidth+(startX-moveEvent.clientX));
-  };
-  const finish=endEvent=>{
-    if(endEvent.pointerId!==pointerId)return;
-    fmMusicShell.classList.remove('fm-music-resizing');
-    panel.classList.remove('fm-music-resizing');
-    fmMusicStoreSetting('pane-width',String(Math.round(panel.getBoundingClientRect().width)));
-    document.removeEventListener('pointermove',move);
-    document.removeEventListener('pointerup',finish);
-    document.removeEventListener('pointercancel',finish);
-  };
-  document.addEventListener('pointermove',move);
-  document.addEventListener('pointerup',finish);
-  document.addEventListener('pointercancel',finish);
-});
-fmMusicResizeHandle?.addEventListener('keydown',event=>{
-  const step=event.shiftKey?50:20;
-  const current=document.getElementById('fmMusicPanel')?.getBoundingClientRect().width||420;
-  if(event.key==='ArrowLeft'){event.preventDefault();fmMusicSetPaneWidth(current+step);fmMusicStoreSetting('pane-width',String(Math.round(document.getElementById('fmMusicPanel')?.getBoundingClientRect().width||current+step)));}
-  else if(event.key==='ArrowRight'){event.preventDefault();fmMusicSetPaneWidth(current-step);fmMusicStoreSetting('pane-width',String(Math.round(document.getElementById('fmMusicPanel')?.getBoundingClientRect().width||current-step)));}
-});
-window.addEventListener('resize',()=>{
-  if(window.innerWidth>768&&document.querySelector('.shell')?.classList.contains('fm-music-side-open')){
-    const width=document.getElementById('fmMusicPanel')?.getBoundingClientRect().width||420;
-    fmMusicSetPaneWidth(width);
-  }
-});
-function fmMusicClearGestureStyles(){
-  const panel=document.getElementById('fmMusicPanel');
-  if(panel){panel.classList.remove('fm-player-entering');panel.style.removeProperty('transform');panel.style.removeProperty('opacity');panel.style.removeProperty('transition');}
-  fmMusicLayer.style.removeProperty('--fm-player-scrim-opacity');
-  fmMusicDock.style.removeProperty('--fm-dock-handoff-opacity');fmMusicDock.style.removeProperty('transition');
-}
-function fmMusicResetDrag(animate=true){
-  const panel=document.getElementById('fmMusicPanel');
-  fmMusicDrag.active=false;fmMusicDrag.dragging=false;fmMusicDrag.pull=0;
-  window.clearTimeout(fmMusicDragTimer);fmMusicLayer.classList.remove('dragging');fmMusicDock.classList.remove('fm-dock-in-front');
-  if(!panel||!animate){fmMusicClearGestureStyles();return;}
-  panel.style.transition='transform .42s cubic-bezier(.22,.8,.2,1),opacity .28s ease';
-  panel.style.transform='translate3d(0,0,0) scale(1)';panel.style.opacity='1';
-  fmMusicLayer.style.setProperty('--fm-player-scrim-opacity','1');
-  fmMusicDragTimer=window.setTimeout(fmMusicClearGestureStyles,460);
-}
-function fmMusicMinimize(fromGesture=false){
-  if(!fmMusicLayer.classList.contains('open'))return;
-  if(fmMusicOptions)fmMusicOptions.open=false;
-  window.clearTimeout(fmMusicCloseTimer);window.clearTimeout(fmMusicOpenTimer);window.clearTimeout(fmMusicDragTimer);
-  const panel=document.getElementById('fmMusicPanel');
-  fmMusicDrag.active=false;fmMusicDrag.dragging=false;fmMusicDock.classList.remove('fm-dock-expanding');fmMusicLayer.classList.remove('dragging');fmMusicLayer.classList.add('closing');panel?.classList.remove('fm-player-entering');
-  fmMusicDock.classList.add('visible');fmMusicDock.setAttribute('aria-hidden','false');
-  if(fromGesture&&panel){
-    fmMusicDock.classList.add('fm-dock-in-front');fmMusicDock.style.setProperty('--fm-dock-handoff-opacity','1');
-    panel.style.transition='none';void panel.offsetHeight;
-    panel.style.transition='transform .42s cubic-bezier(.22,.8,.2,1),opacity .32s ease';
-    panel.style.transform='translate3d(0,100%,0) scale(.96)';panel.style.opacity='0';
-    fmMusicLayer.style.setProperty('--fm-player-scrim-opacity','0');
-  }else{
-    fmMusicDock.classList.remove('fm-dock-in-front');fmMusicDock.style.removeProperty('--fm-dock-handoff-opacity');
-    fmMusicClearGestureStyles();
-  }
-  fmMusicCloseTimer=window.setTimeout(()=>{
-    fmMusicLayer.classList.remove('open','closing','dragging');fmMusicLayer.setAttribute('aria-hidden','true');
-    document.querySelector('.shell')?.classList.remove('fm-music-side-open');
-    fmMusicDock.classList.remove('fm-dock-in-front','fm-dock-expanding','fm-panel-open');fmMusicClearGestureStyles();
-  },460);
-}
-function fmMusicPlayTrack(index,openPanel=true){
-  fmMusicCollect();
-  if(index<0||index>=fmMusicTracks.length)return;
-  fmMusicIndex=index;const track=fmMusicTracks[index],meta=fmMusicMeta(track.name,track.url);
-  fmMusicPausePending=false;
-  const request=++fmMusicPlaybackRequest,action=++fmMusicPlaybackAction,oldObjectUrl=fmMusicActiveObjectUrl;
-  fmMusicWaitingForSource=true;fmMusicSetLoading(true);
-  const title=document.getElementById('fmMusicTitle'),artist=document.getElementById('fmMusicArtist'),miniTitle=document.getElementById('fmMusicMiniTitle'),miniArtist=document.getElementById('fmMusicMiniArtist');
-  if(title)title.textContent=meta.title;if(artist)artist.textContent=meta.artist;if(miniTitle)miniTitle.textContent=meta.title;if(miniArtist)miniArtist.textContent=meta.artist;
-  fmMusicSetArt(document.getElementById('fmMusicCoverArt'),track.art,track.fallback);
-  fmMusicSetArt(document.getElementById('fmMusicMiniArt'),track.art,track.fallback);
-  const download=document.getElementById('fmMusicDownload');
-  if(download)download.onclick=()=>{const url=fmMusicSourceUrl(track);const a=document.createElement('a');a.href=url+(url.includes('?')?'&':'?')+'dl=1';a.download=track.name;document.body.appendChild(a);a.click();a.remove();};
-  fmMusicUpdateProgress();
-  if(openPanel)fmMusicOpenPanel();
-  fmMusicDock.classList.add('visible');fmMusicDock.setAttribute('aria-hidden','false');fmMusicRenderQueue();
-  fmMusicHydrateTags(track);fmMusicLoadLyrics(track);
-  fmMusicSetCacheStatus('Checking for a saved copy…');
-  const cachedTrackPromise=fmMusicReadCachedTrack(track);
-  const beginSourceLoad=()=>{
-    if(request!==fmMusicPlaybackRequest||action!==fmMusicPlaybackAction)return;
-    fmMusicAudio.pause();fmMusicAudio.removeAttribute('src');fmMusicAudio.load();
-    fmMusicActiveObjectUrl='';
-    if(oldObjectUrl)URL.revokeObjectURL(oldObjectUrl);
-    cachedTrackPromise.then(cachedBlob=>{
-      if(request!==fmMusicPlaybackRequest)return;
-      const useCached=blob=>{
-        if(request!==fmMusicPlaybackRequest)return;
-        fmMusicWaitingForSource=false;
-        let source=fmMusicSourceUrl(track);
-        if(blob){source=URL.createObjectURL(blob);fmMusicActiveObjectUrl=source;}
-        fmMusicAudio.src=source;fmMusicAudio.playbackRate=fmMusicPlaybackRate;fmMusicAudio.load();
-        fmMusicStartWithFade(request,error=>{
-          fmMusicSetLoading(false);fmMusicUpdateButtons();
-          if(fmMusicAudio.error?.code===4)toast('This audio format is not supported by the current browser.');
-          else if(error?.name==='NotAllowedError')fmMusicSetCacheStatus('Press Play to start audio playback.');
-          else toast('The audio could not be played. Check the file format and server access.');
-        });
-      };
-      if(cachedBlob){
-        fmMusicSetCacheStatus('Playing the copy saved in this browser.');
-        useCached(cachedBlob);return;
-      }
-      useCached(null);
-      if(!('indexedDB'in window)){fmMusicSetCacheStatus('Browser storage is unavailable; streaming only.');return;}
-      fmMusicSetCacheStatus('Streaming now · saving a copy for next time…');
-      fmMusicCacheTrack(track).then(saved=>{
-        if(request!==fmMusicPlaybackRequest)return;
-        fmMusicSetCacheStatus(saved?'Saved in this browser for your next listen.':'Could not save a browser copy; check available storage.');
-      });
-    }).catch(()=>{
-      if(request!==fmMusicPlaybackRequest)return;
-      fmMusicWaitingForSource=false;
-      fmMusicAudio.src=fmMusicSourceUrl(track);fmMusicAudio.playbackRate=fmMusicPlaybackRate;fmMusicAudio.load();
-      fmMusicSetCacheStatus('Browser storage is unavailable; streaming only.');
-      fmMusicStartWithFade(request,()=>{
-        fmMusicSetLoading(false);fmMusicUpdateButtons();
-        toast('The audio could not be played. Check the file format and server access.');
-      });
-    });
-  };
-  if(!fmMusicAudio.paused&&fmMusicOutputGain>0)fmMusicFadeOutput(0,220,beginSourceLoad);
-  else fmMusicFadeOutput(0,0,beginSourceLoad);
-}
-function fmMusicSeekBy(seconds){
-  if(!Number.isFinite(fmMusicAudio.duration)||fmMusicAudio.duration<=0)return;
-  fmMusicAudio.currentTime=Math.max(0,Math.min(fmMusicAudio.duration,fmMusicAudio.currentTime+seconds));
-}
-function fmMusicSetRate(value){
-  const rate=Number(value);if(!fmMusicCacheValues.includes(rate))return;
-  fmMusicPlaybackRate=rate;fmMusicAudio.playbackRate=rate;fmMusicAudio.preservesPitch=true;
-  fmMusicStoreSetting('speed',rate);
-  const select=document.getElementById('fmMusicSpeed');if(select)select.value=String(rate);
-}
-function fmMusicSetVolume(value){
-  const volume=Math.max(0,Math.min(1,Number(value)/100));if(!Number.isFinite(volume))return;
-  fmMusicVolume=volume;fmMusicApplyOutputVolume();fmMusicAudio.muted=false;
-  fmMusicStoreSetting('volume',volume);
-}
-const fmMusicSpeedSelect=document.getElementById('fmMusicSpeed');
-if(fmMusicSpeedSelect){fmMusicSpeedSelect.value=String(fmMusicPlaybackRate);fmMusicSpeedSelect.addEventListener('change',()=>fmMusicSetRate(fmMusicSpeedSelect.value));}
-const fmMusicVolumeSlider=document.getElementById('fmMusicVolume');
-fmMusicApplyOutputVolume();
-if(fmMusicVolumeSlider){fmMusicVolumeSlider.value=String(Math.round(fmMusicVolume*100));fmMusicVolumeSlider.addEventListener('input',()=>fmMusicSetVolume(fmMusicVolumeSlider.value));}
-document.getElementById('fmMusicBack10')?.addEventListener('click',()=>fmMusicSeekBy(-10));
-document.getElementById('fmMusicForward10')?.addEventListener('click',()=>fmMusicSeekBy(10));
-const fmMusicOptions=document.getElementById('fmMusicOptions');
-document.addEventListener('pointerdown',e=>{if(fmMusicOptions?.open&&!fmMusicOptions.contains(e.target))fmMusicOptions.open=false;});
-function fmMusicTogglePlayback(){
-  if(window.mfmSelectedSongsLoading||fmMusicWaitingForSource)return;
-  if(fmMusicIndex<0){fmMusicCollect();if(fmMusicTracks.length)fmMusicPlayTrack(0);return;}
-  if(fmMusicPausePending&&fmMusicAudio.paused){
-    fmMusicPausePending=false;
-    fmMusicStartWithFade(fmMusicPlaybackRequest,()=>toast('The audio could not be played.'));
-    return;
-  }
-  if(fmMusicPausePending){
-    fmMusicPausePending=false;++fmMusicPlaybackAction;
-    fmMusicFadeOutput(1,260);return;
-  }
-  if(fmMusicAudio.paused)fmMusicStartWithFade(fmMusicPlaybackRequest,()=>toast('The audio could not be played.'));
-  else fmMusicPauseWithFade();
-}
-function fmMusicStep(direction,ended=false){
-  if(fmMusicIndex<0||!fmMusicTracks.length)return;
-  if(direction<0&&fmMusicAudio.currentTime>3&&!ended){fmMusicAudio.currentTime=0;return;}
-  let next;
-  if(fmMusicShuffle&&fmMusicTracks.length>1){do{next=Math.floor(Math.random()*fmMusicTracks.length);}while(next===fmMusicIndex);}
-  else{next=fmMusicIndex+direction;if(next>=fmMusicTracks.length)next=fmMusicRepeat===1?0:-1;if(next<0)next=fmMusicRepeat===1?fmMusicTracks.length-1:(direction<0?0:-1);}
-  if(next<0){fmMusicPauseWithFade(()=>{fmMusicAudio.currentTime=0;fmMusicUpdateButtons();fmMusicUpdateProgress();});return;}
-  fmMusicPlayTrack(next,false);
-}
-const fmMusicGesturePanel=document.getElementById('fmMusicPanel');
-function fmMusicTouchHasScrolledContent(target){
-  let node=target instanceof Element?target:null;
-  while(node&&node!==fmMusicGesturePanel){
-    const overflowY=window.getComputedStyle(node).overflowY;
-    if((overflowY==='auto'||overflowY==='scroll'||overflowY==='overlay')
-      &&node.scrollHeight>node.clientHeight+1&&node.scrollTop>1)return true;
-    node=node.parentElement;
-  }
-  return false;
-}
-fmMusicGesturePanel?.addEventListener('touchstart',e=>{
-  if(!window.matchMedia('(max-width: 768px)').matches||!fmMusicLayer.classList.contains('open')||fmMusicLayer.classList.contains('closing')||e.touches.length!==1)return;
-  if(e.target.closest?.('#fmMusicSeek,input[type="range"]'))return;
-  fmMusicDrag.active=false;fmMusicDrag.dragging=false;fmMusicDrag.pull=0;
-  if(fmMusicTouchHasScrolledContent(e.target))return;
-  const touch=e.touches[0];
-  fmMusicDrag.active=true;fmMusicDrag.dragging=false;fmMusicDrag.startX=touch.clientX;fmMusicDrag.startY=touch.clientY;fmMusicDrag.startTime=performance.now();fmMusicDrag.lastY=touch.clientY;fmMusicDrag.lastTime=fmMusicDrag.startTime;fmMusicDrag.velocity=0;fmMusicDrag.pull=0;
-},{passive:true});
-fmMusicGesturePanel?.addEventListener('touchmove',e=>{
-  if(!fmMusicDrag.active||e.touches.length!==1)return;
-  const touch=e.touches[0],dx=touch.clientX-fmMusicDrag.startX,dy=touch.clientY-fmMusicDrag.startY;
-  if(!fmMusicDrag.dragging){
-    if(Math.abs(dx)>12&&Math.abs(dx)>Math.max(0,dy)*1.15){fmMusicDrag.active=false;return;}
-    if(dy<10||dy<Math.abs(dx)*1.08)return;
-    fmMusicDrag.dragging=true;fmMusicLayer.classList.add('dragging');fmMusicDock.classList.remove('fm-dock-expanding');fmMusicDock.classList.add('visible','fm-dock-in-front');fmMusicDock.style.transition='none';
-    document.getElementById('fmMusicPanel')?.classList.remove('fm-player-entering');
-  }
-  if(e.cancelable)e.preventDefault();
-  const moveTime=performance.now(),moveElapsed=Math.max(1,moveTime-fmMusicDrag.lastTime);
-  fmMusicDrag.velocity=(touch.clientY-fmMusicDrag.lastY)/moveElapsed;
-  const pull=Math.min(Math.max(0,dy),Math.max(220,window.innerHeight*.92)),progress=Math.min(1,pull/Math.max(1,window.innerHeight*.62));
-  fmMusicDrag.pull=pull;fmMusicDrag.lastY=touch.clientY;fmMusicDrag.lastTime=moveTime;
-  const panel=document.getElementById('fmMusicPanel');
-  if(panel){panel.style.transform=`translate3d(0,${pull}px,0) scale(${(1-progress*.035).toFixed(4)})`;panel.style.opacity=String(1-progress*.08);}
-  fmMusicLayer.style.setProperty('--fm-player-scrim-opacity',String((1-progress*.88).toFixed(3)));
-  fmMusicDock.style.setProperty('--fm-dock-handoff-opacity',String((.08+progress*.92).toFixed(3)));
-},{passive:false});
-fmMusicGesturePanel?.addEventListener('touchend',()=>{
-  if(!fmMusicDrag.active)return;
-  const wasDragging=fmMusicDrag.dragging,pull=fmMusicDrag.pull,velocity=fmMusicDrag.velocity*Math.exp(-Math.max(0,performance.now()-fmMusicDrag.lastTime)/130);
-  fmMusicDrag.active=false;
-  if(!wasDragging){fmMusicDrag.pull=0;return;}
-  if(pull>=Math.max(100,Math.min(180,window.innerHeight*.14))||(pull>48&&velocity>.65))fmMusicMinimize(true);
-  else fmMusicResetDrag(true);
-},{passive:true});
-fmMusicGesturePanel?.addEventListener('touchcancel',()=>{
-  if(fmMusicDrag.dragging)fmMusicResetDrag(true);
-  else{fmMusicDrag.active=false;fmMusicDrag.pull=0;}
-},{passive:true});
-document.getElementById('fmMusicMiniOpen')?.addEventListener('click',fmMusicOpenPanel);
-document.getElementById('fmMusicMinimize')?.addEventListener('click',fmMusicMinimize);
-document.getElementById('fmMusicMiniPlay')?.addEventListener('click',fmMusicTogglePlayback);
-document.getElementById('fmMusicPlay')?.addEventListener('click',fmMusicTogglePlayback);
-document.getElementById('fmMusicMiniPrev')?.addEventListener('click',()=>fmMusicStep(-1));
-document.getElementById('fmMusicPrev')?.addEventListener('click',()=>fmMusicStep(-1));
-document.getElementById('fmMusicMiniNext')?.addEventListener('click',()=>fmMusicStep(1));
-document.getElementById('fmMusicNext')?.addEventListener('click',()=>fmMusicStep(1));
-document.getElementById('fmMusicShuffle')?.addEventListener('click',()=>{fmMusicShuffle=!fmMusicShuffle;fmMusicUpdateButtons();});
-document.getElementById('fmMusicRepeat')?.addEventListener('click',()=>{fmMusicRepeat=(fmMusicRepeat+1)%3;fmMusicAudio.loop=fmMusicRepeat===2;fmMusicUpdateButtons();});
-document.getElementById('fmMusicQueueToggle')?.addEventListener('click',()=>{
-  document.getElementById('fmMusicQueue')?.scrollIntoView({behavior:'smooth',block:'start'});
-});
-document.getElementById('fmMusicLyricsToggle')?.addEventListener('click',e=>{
-  const section=document.getElementById('fmMusicLyrics'),show=!!section?.hidden;
-  if(section)section.hidden=!show;e.currentTarget.setAttribute('aria-expanded',String(show));
-  if(show)fmMusicSyncLyrics(true);
-});
-document.getElementById('fmMusicSeek')?.addEventListener('input',e=>{
-  fmMusicSeeking=true;const duration=Number.isFinite(fmMusicAudio.duration)?fmMusicAudio.duration:0,ratio=Number(e.currentTarget.value)/1000;
-  if(duration)fmMusicAudio.currentTime=duration*ratio;e.currentTarget.style.setProperty('--fm-progress',(ratio*100)+'%');
-});
-document.getElementById('fmMusicSeek')?.addEventListener('change',()=>{fmMusicSeeking=false;fmMusicUpdateProgress();});
-fmMusicAudio.addEventListener('timeupdate',()=>{fmMusicUpdateProgress();fmMusicSyncLyrics();});
-fmMusicAudio.addEventListener('loadedmetadata',fmMusicUpdateProgress);
-fmMusicAudio.addEventListener('waiting',()=>{if(!fmMusicAudio.paused)fmMusicSetLoading(true);});
-fmMusicAudio.addEventListener('stalled',()=>{if(!fmMusicAudio.paused)fmMusicSetLoading(true);});
-fmMusicAudio.addEventListener('playing',()=>fmMusicSetLoading(false));
-fmMusicAudio.addEventListener('canplay',()=>{if(!fmMusicAudio.paused)fmMusicSetLoading(false);});
-fmMusicAudio.addEventListener('play',fmMusicUpdateButtons);
-fmMusicAudio.addEventListener('pause',()=>{fmMusicUpdateButtons();if(fmMusicAudio.paused&&!fmMusicWaitingForSource&&!window.mfmSelectedSongsLoading)fmMusicSetLoading(false);});
-fmMusicAudio.addEventListener('ended',()=>{if(fmMusicRepeat===2)return;fmMusicStep(1,true);});
-fmMusicAudio.addEventListener('error',()=>{if(fmMusicAudio.currentSrc)fmMusicUpdateButtons();fmMusicWaitingForSource=false;fmMusicSetLoading(false);});
-document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&document.getElementById('fmAudioEditOverlay')?.classList.contains('open')){fmMusicCloseEditor();return;}
-  if(e.key==='Escape'&&fmMusicOptions?.open){fmMusicOptions.open=false;fmMusicOptions.querySelector('summary')?.focus();return;}
-  if(e.key==='Escape'&&fmMusicLayer.classList.contains('open'))fmMusicMinimize();
-});
-
 /* Grid click to preview */
 document.getElementById('gvw')?.addEventListener('click',e=>{
   const gi=e.target.closest('.gi[data-preview]');
@@ -32884,7 +28044,7 @@ async function openDocViewer(fname,provider){
   }catch(e){toast('Online viewer: '+String(e&&e.message||e),5000);}
 }
 function openPreview(url,type,fname){
-  if(type==='audio'){fmMusicCollect();const found=fmMusicTracks.findIndex(t=>t.name===fname);if(found>=0)fmMusicPlayTrack(found,true);return;}
+  if(type==='audio'){document.getElementById('prevName').textContent=fname;document.getElementById('prevDl').href=url+'&dl=1';prevBody.innerHTML='';prevBody.style.flexDirection='';const a=document.createElement('audio');a.src=url;a.controls=true;prevBody.appendChild(a);prevOv.classList.add('open');return;}
   document.getElementById('prevName').textContent=fname;
   document.getElementById('prevDl').href=url+'&dl=1';
   prevBody.innerHTML='';prevBody.style.flexDirection='';
@@ -33023,6 +28183,18 @@ document.getElementById('rdApply')?.addEventListener('click',()=>{
   if(!/^https?:\/\//i.test(url)){toast('Enter a valid http(s) URL');return;}
   af('remote_download',{url,fname:document.getElementById('rdName').value.trim()});
 });
+
+/* + NEW MENU */
+(function(){
+  const wrap=document.getElementById('newMenu');
+  const btn=document.getElementById('newMenuBtn');
+  if(!wrap||!btn)return;
+  const close=()=>{wrap.classList.remove('open');btn.setAttribute('aria-expanded','false');};
+  const open=()=>{wrap.classList.add('open');btn.setAttribute('aria-expanded','true');const input=wrap.querySelector('.tb-new-menu input.inp');if(input)setTimeout(function(){input.focus();},30);};
+  btn.addEventListener('click',function(event){event.preventDefault();event.stopPropagation();if(wrap.classList.contains('open'))close();else open();});
+  document.addEventListener('click',function(event){if(!wrap.contains(event.target))close();});
+  document.addEventListener('keydown',function(event){if(event.key==='Escape')close();});
+})();
 
 /* ═══════════════════════════════════════
    ACTIVITY LOG
@@ -35245,25 +30417,6 @@ async function loadCmsMaintenance(){
   }catch(e){el.innerHTML='<div style="padding:20px;color:#fca5a5">Failed: '+esc(String(e))+'</div>';}
 }
 
-/* ═══════════════════════════════════════
-   NETWORK SPEED TEST (ping / download / upload)
-═══════════════════════════════════════ */
-document.getElementById('speedBtn')?.addEventListener('click',()=>openMod('speedOv'));
-document.getElementById('speedClose')?.addEventListener('click',()=>closeMod('speedOv'));
-document.getElementById('spRun')?.addEventListener('click',async()=>{
-  const btn=document.getElementById('spRun'),st=document.getElementById('spStatus');
-  btn.disabled=true;document.getElementById('spPing').textContent='-';document.getElementById('spDown').textContent='-';document.getElementById('spUp').textContent='-';
-  st.textContent='Testing the server\'s connection to the internet… this runs entirely on the server.';
-  try{
-    const d=await fetch('?x=speedtest_server&r='+Math.random(),{cache:'no-store'}).then(r=>r.json());
-    document.getElementById('spPing').textContent=(d.ping_ms!=null?d.ping_ms+' ms':'-');
-    document.getElementById('spDown').textContent=(d.download_mbps!=null?d.download_mbps+' Mbps':'-');
-    document.getElementById('spUp').textContent=(d.upload_mbps!=null?d.upload_mbps+' Mbps':'-');
-    st.textContent=d.error?d.error:'Done - measured on the server, not your device.';
-  }catch{st.textContent='Test failed. The server could not be reached or the request errored.';}
-  btn.disabled=false;
-});
-
 /* ── WP Admin: create a WordPress administrator in the current site ── */
 function wpAdminCopyText(text,btn){
   const done=()=>{if(!btn)return;const prev=btn.textContent;btn.textContent='Copied';btn.classList.add('is-copied');setTimeout(()=>{btn.textContent=prev;btn.classList.remove('is-copied');},1400);};
@@ -35373,6 +30526,28 @@ async function recRefresh(){
 document.getElementById('recClose')?.addEventListener('click',()=>closeMod('recOv'));
 document.getElementById('recoveryBtn')?.addEventListener('click',()=>{openMod('recOv');recRefresh();});
 document.getElementById('recRefresh')?.addEventListener('click',recRefresh);
+function recRenderReport(rep){
+  const box=document.getElementById('recReport');
+  if(!box)return;
+  box.style.display='block';
+  if(!rep||!rep.length){box.innerHTML='<div style="padding:6px;color:var(--t3)">No results.</div>';return;}
+  box.innerHTML=rep.map(function(it){return '<div style="display:flex;gap:8px;padding:7px 2px;border-bottom:1px solid var(--border);align-items:flex-start"><span style="font-weight:800;color:'+(it.ok?'#34d399':'#f87171')+'">'+(it.ok?'✓':'✕')+'</span><div style="min-width:0"><div style="font-size:12px;color:var(--t1);font-weight:600">'+esc(it.label)+'</div><div style="font-size:10.5px;color:var(--t3);line-height:1.45;word-break:break-word">'+esc(it.detail||'')+'</div></div></div>';}).join('');
+}
+document.getElementById('recRepair')?.addEventListener('click',async()=>{
+  const btn=document.getElementById('recRepair'),rep=document.getElementById('recReport');
+  if(!btn)return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent='Onarılıyor…';
+  if(rep){rep.style.display='block';rep.innerHTML='<div style="padding:6px;color:var(--t3)">Katmanlar yeniden kuruluyor ve doğrulanıyor…</div>';}
+  try{
+    const fd=new FormData();fd.append('csrf_token',CSRF);
+    const d=await fetch('?x=recovery_repair&dir='+encodeURIComponent(CWD),{method:'POST',body:fd,cache:'no-store',credentials:'same-origin',headers:{'Accept':'application/json'}}).then(r=>r.json());
+    if(!d||!d.ok)throw new Error((d&&d.error)||'Repair failed.');
+    recRenderReport(d.report||[]);
+    if(d.status)recRenderStatus(d.status);
+    toast('Onarım ve doğrulama tamamlandı.',6000);
+  }catch(e){if(rep)rep.innerHTML='<div style="padding:6px;color:#f87171">'+esc(String(e&&e.message||e))+'</div>';}
+  finally{btn.disabled=false;btn.textContent=old;}
+});
 document.getElementById('recInstall')?.addEventListener('click',async()=>{
   const btn=document.getElementById('recInstall'),out=document.getElementById('recOut');
   btn.disabled=true;if(out)out.textContent='Installing…';
@@ -38340,668 +33515,9 @@ else bind();
 window.cpmOpen=open;
 })();
 
-
-/* ═══════════════════════════════════════
-   WEBMAIL MANAGER
-   Every mailbox the host holds - Maildir, mbox, IMAP, POP3, the mail account
-   a site's own settings name, and the cPanel accounts - listed in one place
-   and opened by a click, with nothing typed in. The window is built in the
-   order the work happens: choose a mailbox, choose a folder, choose a
-   message, read it; writing is one button away from wherever the reading is.
-═══════════════════════════════════════ */
-(function(){
-'use strict';
-
-const KIND={
-  maildir:{t:'Mail folder',d:'one file per message on this server'},
-  mbox:{t:'Mail file',d:'an old-style single mail file'},
-  imap:{t:'Mail server',d:'read over IMAP with the sign-in the site holds'},
-  pop3:{t:'POP3',d:'read over POP3 with the sign-in the site holds'},
-  cpanel:{t:'cPanel account',d:'opened through cPanel\'s own webmail sign-on'},
-  site:{t:'Address only',d:'the site knows this address, but no mailbox for it is here'}
-};
-const S={accounts:[],notes:[],search:'',acc:null,can:{},folders:[],folder:'INBOX',
-         msgs:[],sel:new Set(),msg:null,view:'msg',msgFilter:'',busy:false,
-         attachments:[],compose:null};
-
-const q=(sel)=>document.querySelector(sel);
-const qa=(sel)=>Array.prototype.slice.call(document.querySelectorAll(sel));
-const el=(id)=>document.getElementById(id);
-const num=(n)=>String(n==null?0:n);
-const when=(ts)=>{
-  if(!ts)return '';
-  const d=new Date(ts*1000),now=new Date();
-  const same=d.toDateString()===now.toDateString();
-  const pad=(x)=>String(x).padStart(2,'0');
-  if(same)return pad(d.getHours())+':'+pad(d.getMinutes());
-  if(d.getFullYear()===now.getFullYear())return d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
-  return d.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});
-};
-const size=(b)=>{
-  b=Number(b)||0;
-  if(b<1024)return b+' B';
-  if(b<1048576)return (b/1024).toFixed(b<10240?1:0)+' KB';
-  return (b/1048576).toFixed(1)+' MB';
-};
-
-/* ── talking to the server ─────────────────────────────────────────────── */
-async function api(action,fields){
-  const fd=new FormData();
-  fd.append('csrf_token',CSRF);
-  fd.append('action',action);
-  Object.keys(fields||{}).forEach(k=>{
-    const v=fields[k];
-    if(v!==undefined&&v!==null)fd.append(k,v);
-  });
-  let d={ok:false,error:'The server answered nothing.'};
-  try{
-    const r=await fetch('?x=mail',{method:'POST',body:fd,cache:'no-store',credentials:'same-origin'});
-    const txt=await r.text();
-    try{d=JSON.parse(txt);}catch(e){d={ok:false,error:r.status===403?'This account is not allowed to use the Webmail Manager.':'The server sent an answer this window cannot read.'};}
-    if(r.status===403)d={ok:false,error:'This account is not allowed to use the Webmail Manager. Ask the administrator for the CMS permission.'};
-  }catch(e){d={ok:false,error:'The manager could not be reached: '+e.message};}
-  return d;
-}
-function flash(kind,text){
-  const box=el('wmStatus');
-  if(!box)return;
-  box.className='wm-status '+(kind||'');
-  box.textContent=text||'';
-  if(kind==='good'||kind==='bad'){
-    clearTimeout(flash._t);
-    flash._t=setTimeout(()=>{if(box.textContent===text)box.textContent='';},9000);
-  }
-}
-function download(url){
-  if(!url)return;
-  const a=document.createElement('a');
-  a.href=url;a.rel='noopener';a.download='';
-  document.body.appendChild(a);a.click();a.remove();
-}
-
-/* ── the rail: every mailbox, grouped by where it was found ─────────────── */
-function renderRail(){
-  const box=el('wmList');
-  if(!box)return;
-  const term=S.search.trim().toLowerCase();
-  const groups=[
-    {key:'This server',note:'mail that is physically on this machine'},
-    {key:'The sites',note:'mail servers and addresses the sites themselves name'},
-    {key:'',note:'addresses known to the sites, with no mailbox here'}
-  ];
-  let html='';
-  groups.forEach(g=>{
-    const rows=S.accounts.filter(a=>{
-      if((a.group||'')!==g.key)return false;
-      if(!term)return true;
-      return (a.email+' '+(a.origin||'')+' '+(a.name||'')).toLowerCase().indexOf(term)>=0;
-    });
-    if(!rows.length)return;
-    html+='<div class="wm-group"><span>'+esc(g.key||'Addresses')+'</span><i>'+esc(g.note)+'</i></div>';
-    rows.forEach(a=>{
-      const can=a.can&&a.can.read;
-      const selected=S.acc&&S.acc.id===a.id;
-      html+='<button type="button" class="wm-item'+(selected?' is-on':'')+(can?'':' wm-item-off')+'" data-id="'+esc(a.id)+'" title="'+esc((a.origin||'')+(a.where?' · '+a.where:''))+'">'
-        +'<span class="wm-dot'+(can?'':' off')+'"></span>'
-        +'<span class="t"><b>'+esc(a.email)+'</b><span>'+esc((KIND[a.kind]||{t:a.kind}).t)+(a.name&&a.name!==a.email?' · '+esc(a.name):'')+'</span></span>'
-        +'</button>';
-    });
-  });
-  if(!html)html='<div class="wm-empty">'+(term?'No mailbox matches that.':'No mailbox was found on this server.')+'</div>';
-  box.innerHTML=html;
-  qa('#wmList .wm-item').forEach(b=>b.addEventListener('click',()=>{
-    const a=S.accounts.filter(x=>x.id===b.dataset.id)[0];
-    if(a)openMailbox(a);
-  }));
-}
-function renderNotes(data){
-  const box=el('wmFoot');
-  if(!box)return;
-  const parts=[];
-  parts.push('<div class="wm-foot-line"><b>'+num(S.accounts.filter(a=>a.can&&a.can.read).length)+'</b> readable · <b>'+num(S.accounts.length)+'</b> found</div>');
-  (S.notes||[]).forEach(n=>parts.push('<div class="wm-foot-note">'+esc(n)+'</div>'));
-  if(data&&data.scanned&&data.scanned.length)parts.push('<div class="wm-foot-note">Looked in '+data.scanned.map(esc).join(', ')+'</div>');
-  box.innerHTML=parts.join('');
-}
-
-/* ── one mailbox, opened as soon as it is picked ────────────────────────── */
-async function openMailbox(a){
-  S.acc=a;S.can=a.can||{};S.folders=[];S.msgs=[];S.sel=new Set();S.msg=null;S.msgFilter='';S.folder='INBOX';
-  renderRail();
-  renderHead();
-  el('wmFolders').innerHTML='';
-  el('wmMsgs').innerHTML='<div class="wm-empty">Opening '+esc(a.email)+'…</div>';
-  renderRead(null);
-  const d=await api('folders',{account:a.id});
-  S.can=d.can||S.can;
-  S.folders=d.folders||[];
-  renderHead();
-  renderFolders();
-  const first=S.folders.filter(f=>f.id==='INBOX')[0]||S.folders[0];
-  if(!first){
-    /* A mailbox that cannot be read here is not a dead end: the cPanel
-       sign-on still opens it, and that is the way out this window offers. */
-    const why=d.why||(S.can.why||'This mailbox has no folder to open.');
-    el('wmMsgs').innerHTML='<div class="wm-empty">'+esc(why)
-      +((S.acc&&S.acc.webmail)?'<div style="margin-top:10px"><button type="button" class="btn btn-xs btn-g" id="wmWebmailEmpty">Open this address in cPanel webmail</button></div>':'')
-      +'</div>';
-    const be=el('wmWebmailEmpty');
-    if(be)be.addEventListener('click',openInWebmail);
-    return false;
-  }
-  await selectFolder(first.id);
-  return true;
-}
-function renderHead(){
-  const a=S.acc;
-  const box=el('wmHeadMain');
-  if(!box)return;
-  if(!a){box.innerHTML='<div class="wm-head-idle">Pick a mailbox on the left. It opens by itself - nothing to sign in to.</div>';return;}
-  const can=S.can||{};
-  const chips=[];
-  chips.push('<span class="pma-chip acc">'+esc((KIND[a.kind]||{t:a.kind}).t)+'</span>');
-  chips.push(can.read?'<span class="pma-chip ok">read</span>':'<span class="pma-chip bad">not readable here</span>');
-  if(can.delete)chips.push('<span class="pma-chip ok">delete</span>');
-  if(can.send)chips.push('<span class="pma-chip ok">send</span>');
-  if(a.site&&a.site.label)chips.push('<span class="pma-chip">'+esc(a.site.label)+'</span>');
-  box.innerHTML='<div class="wm-head-row"><div class="wm-head-id"><b>'+esc(a.email)+'</b>'
-    +'<span>'+esc(a.origin||'')+(a.where?' · '+esc(a.where):'')+'</span></div>'
-    +'<div class="pma-chips">'+chips.join('')+'</div></div>';
-}
-function renderFolders(){
-  const box=el('wmFolders');
-  if(!box)return;
-  if(!S.folders.length){box.innerHTML='';return;}
-  box.innerHTML=S.folders.map(f=>{
-    const on=f.id===S.folder;
-    return '<button type="button" class="wm-folder'+(on?' is-on':'')+'" data-f="'+esc(f.id)+'">'
-      +esc(f.name)+(f.count?'<i>'+num(f.count)+'</i>':'')
-      +(f.unread?'<u>'+num(f.unread)+' new</u>':'')
-      +'</button>';
-  }).join('');
-  qa('#wmFolders .wm-folder').forEach(b=>b.addEventListener('click',()=>selectFolder(b.dataset.f)));
-}
-async function selectFolder(id){
-  S.folder=id;S.sel=new Set();S.msg=null;S.msgFilter='';
-  renderFolders();renderRead(null);
-  const f=S.folders.filter(x=>x.id===id)[0];
-  el('wmMsgsTitle').textContent=(f?f.name:id);
-  el('wmMsgs').innerHTML='<div class="wm-empty">Reading '+esc(f?f.name:id)+'…</div>';
-  const d=await api('messages',{account:S.acc.id,folder:id});
-  S.msgs=d.messages||[];
-  if(d.can)S.can=d.can;
-  S.dlBase=d.download_all||'';
-  renderMsgs();
-  renderBulk();
-}
-function renderMsgs(){
-  const box=el('wmMsgs');
-  if(!box)return;
-  const term=S.msgFilter.trim().toLowerCase();
-  const rows=S.msgs.filter(m=>!term||((m.subject+' '+m.from+' '+m.from_email+' '+m.to)||'').toLowerCase().indexOf(term)>=0);
-  if(!rows.length){
-    box.innerHTML='<div class="wm-empty">'+(S.msgs.length?'Nothing matches that.':'This folder is empty.')+'</div>';
-    return;
-  }
-  box.innerHTML=rows.map(m=>{
-    const on=S.msg&&S.msg.uid===m.uid;
-    return '<div class="wm-row'+(on?' is-on':'')+(m.seen?'':' unread')+'" data-uid="'+esc(m.uid)+'">'
-      +'<label class="wm-check"><input type="checkbox" data-sel="'+esc(m.uid)+'"'+(S.sel.has(m.uid)?' checked':'')+'></label>'
-      +'<div class="wm-row-main">'
-      +'<div class="wm-row-top"><b>'+esc(m.from||m.from_email||'(unknown)')+'</b><span>'+esc(when(m.date))+'</span></div>'
-      +'<div class="wm-row-sub">'+esc(m.subject||'(no subject)')+'</div>'
-      +'<div class="wm-row-end"><span>'+esc(size(m.size))+'</span>'
-      +(m.attachments?'<svg viewBox="0 0 24 24" class="wm-clip"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>':'')
-      +'</div></div></div>';
-  }).join('');
-  qa('#wmMsgs .wm-row').forEach(r=>{
-    r.addEventListener('click',(ev)=>{
-      if(ev.target.closest('.wm-check'))return;
-      openMessage(r.dataset.uid);
-    });
-    const cb=r.querySelector('input[data-sel]');
-    if(cb)cb.addEventListener('change',()=>{
-      if(cb.checked)S.sel.add(cb.dataset.sel);else S.sel.delete(cb.dataset.sel);
-      renderBulk();
-    });
-  });
-}
-function renderBulk(){
-  const box=el('wmBulk');
-  if(!box)return;
-  const canDelete=S.can&&S.can.delete;
-  box.innerHTML='<label class="wm-check wm-check-all"><input type="checkbox" id="wmSelAll"'+(S.sel.size&&S.sel.size===S.msgs.length?' checked':'')+'></label>'
-    +'<span class="wm-bulk-n">'+num(S.sel.size)+' selected</span>'
-    +'<button type="button" class="btn btn-xs btn-g" id="wmDeleteSel"'+(canDelete?'':' disabled title="'+esc(S.can.why||'This mailbox cannot delete messages.')+'"')+'>'
-    +'<svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>Delete</button>'
-    +'<button type="button" class="btn btn-xs btn-g" id="wmDownloadSel"'+((S.sel.size)||S.dlBase?'':' disabled')+'>'
-    +'<svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>';
-  const all=el('wmSelAll');
-  if(all)all.addEventListener('change',()=>{
-    S.sel=new Set();
-    if(all.checked)S.msgs.forEach(m=>S.sel.add(m.uid));
-    /* tick the rows that are already drawn - rebuilding the whole list on a
-       single click throws away the scroll position and every open row */
-    qa('#wmMsgs input[data-sel]').forEach(cb=>{cb.checked=all.checked;});
-    renderBulk();
-  });
-  const del=el('wmDeleteSel');
-  if(del)del.addEventListener('click',deleteSelected);
-  const dl=el('wmDownloadSel');
-  if(dl)dl.addEventListener('click',()=>{
-    if(S.sel.size){
-      const chosen=S.msgs.filter(m=>S.sel.has(m.uid));
-      chosen.forEach(m=>download(S.dlBase+'&uid='+encodeURIComponent(m.uid)+'&what=eml'));
-      flash('good','Downloading '+chosen.length+' message'+(chosen.length===1?'':'s')+'.');
-    }else if(S.dlBase){
-      download(S.dlBase+'&what=all');
-      flash('good','Downloading the whole folder as one mail file.');
-    }
-  });
-}
-async function deleteSelected(){
-  if(!S.sel.size)return;
-  const uids=Array.from(S.sel);
-  if(!confirm('Delete '+uids.length+' message'+(uids.length===1?'':'s')+'? They go to Trash when the mailbox has one.'))return;
-  flash('','Deleting…');
-  const d=await api('delete',{account:S.acc.id,folder:S.folder,uids:JSON.stringify(uids)});
-  if(!d.ok){flash('bad',d.error||'They could not be deleted.');return;}
-  flash('good','Deleted '+num(d.deleted)+' message'+(d.deleted===1?'':'s')+(d.moved?' (moved to '+d.moved+')':'')+'.');
-  S.sel=new Set();
-  if(S.msg&&uids.indexOf(S.msg.uid)>=0){S.msg=null;renderRead(null);}
-  /* the list is corrected at once, and read again from the mailbox in the
-     background, so the window never lags behind the click */
-  S.msgs=S.msgs.filter(m=>uids.indexOf(m.uid)<0);
-  renderMsgs();renderBulk();
-  refreshFolder();
-}
-async function refreshFolder(){
-  const d=await api('messages',{account:S.acc.id,folder:S.folder});
-  S.msgs=d.messages||[];S.dlBase=d.download_all||'';
-  renderMsgs();renderBulk();
-  const f=await api('folders',{account:S.acc.id});
-  if(f.ok&&f.folders)S.folders=f.folders;
-  renderFolders();
-}
-
-/* ── reading one message ────────────────────────────────────────────────── */
-async function openMessage(uid){
-  el('wmRead').innerHTML='<div class="wm-empty">Opening the message…</div>';
-  const d=await api('message',{account:S.acc.id,folder:S.folder,uid:uid});
-  if(!d.ok){el('wmRead').innerHTML='<div class="wm-empty bad">'+esc(d.error||'That message could not be read.')+'</div>';return;}
-  S.msg=d.message;S.view='msg';
-  const row=S.msgs.filter(m=>m.uid===uid)[0];
-  if(row&&!row.seen){row.seen=true;renderMsgs();}
-  renderRead();
-}
-function renderRead(){
-  const box=el('wmRead');
-  if(!box)return;
-  const m=S.msg;
-  if(!m){
-    box.innerHTML='<div class="wm-read-idle"><svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>'
-      +'<b>No message open</b><span>Pick one on the left and it opens here, formatted as it was sent.</span></div>';
-    return;
-  }
-  const can={...S.can};
-  const tabs=[['msg','Message'],['text','Plain text'],['info','Details']];
-  const tabHtml=tabs.map(t=>'<button type="button" class="wm-tab'+(S.view===t[0]?' is-on':'')+'" data-view="'+t[0]+'">'+t[1]+'</button>').join('');
-  let bodyHtml='';
-  if(S.view==='msg'){
-    if(m.html&&m.html.trim()!=='')bodyHtml='<iframe class="wm-frame" id="wmFrame" sandbox="allow-same-origin" referrerpolicy="no-referrer" title="Message"></iframe>';
-    else bodyHtml='<pre class="wm-pre">'+esc(m.plain||'(This message has no readable body.)')+'</pre>';
-  }else if(S.view==='text'){
-    bodyHtml='<pre class="wm-pre">'+esc(m.plain||'(There is no plain-text part.)')+'</pre>';
-  }else{
-    bodyHtml='<div class="wm-info">'
-      +'<div class="pma-line"><span class="k">From</span><span class="v">'+esc(m.from||'')+' &lt;'+esc(m.from_email||'')+'&gt;</span></div>'
-      +'<div class="pma-line"><span class="k">To</span><span class="v">'+esc(m.to_text||'')+'</span></div>'
-      +'<div class="pma-line"><span class="k">Cc</span><span class="v">'+esc(m.cc_text||'-')+'</span></div>'
-      +'<div class="pma-line"><span class="k">Date</span><span class="v">'+esc(m.date_text||'')+'</span></div>'
-      +'<div class="pma-line"><span class="k">Message-ID</span><span class="v mono">'+esc(m.message_id||'-')+'</span></div>'
-      +'<div class="pma-line"><span class="k">Reply-To</span><span class="v mono">'+esc(m.reply_to||'-')+'</span></div>'
-      +'</div>';
-  }
-  const atts=(m.attachments||[]).map(a=>'<a class="wm-att" href="'+esc(a.url||'#')+'" download><svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>'
-    +'<span>'+esc(a.name)+'</span><i>'+esc(size(a.size))+'</i></a>').join('');
-  box.innerHTML='<div class="wm-read-head">'
-    +'<div class="wm-read-subject">'+esc(m.subject||'(no subject)')+'</div>'
-    +'<div class="wm-read-meta"><b>'+esc(m.from||m.from_email)+'</b><span>'+esc(m.from_email)+'</span></div>'
-    +'<div class="wm-read-meta2"><span>to '+esc(m.to_text||'')+'</span><span>'+esc(m.date_text||'')+'</span></div>'
-    +'<div class="wm-read-acts">'
-      +'<button type="button" class="btn btn-xs btn-p" id="wmReply"><svg viewBox="0 0 24 24"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>Reply</button>'
-      +'<button type="button" class="btn btn-xs btn-g" id="wmReplyAll"><svg viewBox="0 0 24 24"><polyline points="7 17 2 12 7 7"/><polyline points="12 17 7 12 12 7"/><path d="M22 18v-2a4 4 0 0 0-4-4H7"/></svg>Reply all</button>'
-      +'<button type="button" class="btn btn-xs btn-g" id="wmForward"><svg viewBox="0 0 24 24"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>Forward</button>'
-      +'<button type="button" class="btn btn-xs btn-g" id="wmMarkUnread"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 7l10 6 10-6"/></svg>Mark unread</button>'
-      +'<button type="button" class="btn btn-xs btn-g" id="wmDeleteOne"'+(can.delete?'':' disabled title="'+esc(S.can.why||'This mailbox cannot delete messages.')+'"')+'><svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>Delete</button>'
-      +'<button type="button" class="btn btn-xs btn-g" id="wmDownloadOne"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download</button>'
-      +(S.acc&&S.acc.webmail?'<button type="button" class="btn btn-xs btn-g" id="wmWebmail"><svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Open in webmail</button>':'')
-    +'</div></div>'
-    +'<div class="wm-tabs">'+tabHtml+'</div>'
-    +'<div class="wm-read-body">'+bodyHtml+'</div>'
-    +(atts?'<div class="wm-atts"><div class="wm-atts-h">'+num((m.attachments||[]).length)+' attachment'+((m.attachments||[]).length===1?'':'s')+'</div>'+atts+'</div>':'');
-  const frame=el('wmFrame');
-  if(frame)frame.srcdoc='<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank"><style>'
-    +'html,body{margin:0;padding:16px;background:#fff;color:#1b1b1b;font:14px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;word-break:break-word}'
-    +'img{max-width:100%;height:auto}table{max-width:100%}a{color:#1a5fd0}blockquote{margin:0 0 0 2px;padding-left:12px;border-left:2px solid #d8d8d8;color:#555}'
-    +'pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body>'+(S.msg.html||'')+'</body></html>';
-  qa('#wmRead .wm-tab').forEach(b=>b.addEventListener('click',()=>{S.view=b.dataset.view;renderRead();}));
-  const on=(id,fn)=>{const n=el(id);if(n)n.addEventListener('click',fn);};
-  on('wmReply',()=>reply(false,false));
-  on('wmReplyAll',()=>reply(true,false));
-  on('wmForward',()=>reply(false,true));
-  on('wmDownloadOne',()=>download((S.msg.links||{}).eml));
-  on('wmMarkUnread',async()=>{
-    const d=await api('flag',{account:S.acc.id,folder:S.folder,uid:S.msg.uid,seen:''});
-    if(!d.ok){flash('bad',d.error||'That could not be marked.');return;}
-    const row=S.msgs.filter(x=>x.uid===d.uid)[0];
-    if(row)row.seen=false;
-    S.msg.uid=d.uid;
-    renderMsgs();flash('good','Marked unread.');
-  });
-  on('wmDeleteOne',async()=>{
-    if(!confirm('Delete this message?'))return;
-    const gone=S.msg.uid;
-    const d=await api('delete',{account:S.acc.id,folder:S.folder,uids:JSON.stringify([gone])});
-    if(!d.ok){flash('bad',d.error||'It could not be deleted.');return;}
-    S.msg=null;renderRead();
-    S.msgs=S.msgs.filter(m=>m.uid!==gone);
-    renderMsgs();renderBulk();
-    flash('good','Deleted'+(d.moved?' (moved to '+d.moved+')':'')+'.');
-    refreshFolder();
-  });
-  on('wmWebmail',openInWebmail);
-}
-async function openInWebmail(){
-  if(!S.acc){flash('bad','Pick a mailbox first.');return;}
-  flash('','Opening cPanel webmail…');
-  const d=await api('signin',{account:S.acc.id,email:S.acc.email});
-  if(!d.ok){flash('bad',d.error||'cPanel refused to open it.');return;}
-  window.open(d.url,'_blank','noopener');
-  flash('good','cPanel webmail opened signed in.');
-}
-function reply(all,forward){
-  const m=S.msg;
-  if(!m)return;
-  const to=forward?'':(m.from_email||'');
-  const cc=all?((m.cc||[]).map(a=>a.email).join(', ')):'';
-  const subject=(forward?'Fwd: ':(/^re:/i.test(m.subject||'')?'':'Re: '))+(m.subject||'');
-  let quoted='';
-  if(forward){
-    quoted='<br><br><div class="wm-quote">---------- Forwarded message ----------<br>From: '+esc(m.from||'')+' &lt;'+esc(m.from_email||'')+'&gt;<br>To: '+esc(m.to_text||'')+'<br>Date: '+esc(m.date_text||'')+'<br>Subject: '+esc(m.subject||'')+'</div><br>'
-      +(m.html||('<pre>'+esc(m.plain||'')+'</pre>'));
-  }else{
-    quoted='<br><br><blockquote style="margin:0;padding-left:12px;border-left:2px solid #cbd5e1;color:#475569">'
-      +'<div>On '+esc(m.date_text||'')+', '+esc(m.from||m.from_email)+' wrote:</div><br>'
-      +(m.html||('<pre>'+esc(m.plain||'')+'</pre>'))+'</blockquote>';
-  }
-  openComposer({to:to,cc:cc,subject:subject,html:quoted});
-  if(forward)carryAttachments(m);
-}
-/* a forwarded message should still carry what was attached to it, not just
-   the words: the files are fetched back through their own signed links */
-async function carryAttachments(m){
-  const list=(m.attachments||[]).filter(a=>a&&a.url);
-  if(!list.length)return;
-  setCoStatus('','Fetching the '+(list.length===1?'file that came':list.length+' files that came')+' with the message…');
-  for(const a of list){
-    try{
-      const r=await fetch(a.url,{credentials:'same-origin'});
-      if(!r.ok)continue;
-      const b=await r.blob();
-      const data=await new Promise(res=>{
-        const fr=new FileReader();
-        fr.onload=()=>{const t=String(fr.result||'');const c=t.indexOf(',');res(c>=0?t.slice(c+1):'');};
-        fr.onerror=()=>res('');
-        fr.readAsDataURL(b);
-      });
-      if(!data)continue;
-      S.attachments.push({name:a.name||'attachment',type:a.type||b.type||'application/octet-stream',size:b.size||a.size||0,data:data});
-    }catch(e){/* one file that cannot be carried must not stop the rest */}
-  }
-  renderAtts();
-  if(S.attachments.length)setCoStatus('','The file'+(S.attachments.length===1?' that came with it is':'s that came with it are')+' attached.');
-  else setCoStatus('bad','The files on the message could not be carried over - attach them again by hand.');
-}
-
-/* ── writing a message ──────────────────────────────────────────────────── */
-function openComposer(seed){
-  const a=S.acc;
-  if(!a){flash('bad','Pick a mailbox first - a message must be sent from one.');return;}
-  S.compose=Object.assign({to:'',cc:'',bcc:'',subject:'',html:'',showCc:false,showBcc:false},seed||{});
-  S.attachments=[];
-  el('wmCoFrom').textContent=a.email+(a.name&&a.name!==a.email?' ('+a.name+')':'');
-  el('wmCoTo').value=S.compose.to||'';
-  el('wmCoCc').value=S.compose.cc||'';
-  el('wmCoBcc').value=S.compose.bcc||'';
-  el('wmCoSubject').value=S.compose.subject||'';
-  el('wmCoBody').innerHTML=S.compose.html||'';
-  el('wmCoSource').value=S.compose.html||'';
-  el('wmCoCcRow').style.display=(S.compose.cc?'flex':'none');
-  el('wmCoBccRow').style.display='none';
-  el('wmCoSource').style.display='none';
-  el('wmCoEditorWrap').style.display='flex';
-  el('wmCoStatus').textContent='';
-  el('wmCoStatus').className='wm-co-status';
-  renderAtts();
-  openMod('webmailComposeOv');
-  setTimeout(()=>el('wmCoTo').focus(),60);
-}
-function renderAtts(){
-  const box=el('wmCoAtts');
-  if(!box)return;
-  if(!S.attachments.length){box.innerHTML='';return;}
-  box.innerHTML=S.attachments.map((a,i)=>'<span class="wm-co-att"><b>'+esc(a.name)+'</b><i>'+esc(size(a.size))+'</i>'
-    +'<button type="button" data-att="'+i+'" title="Remove"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></span>').join('');
-  qa('#wmCoAtts [data-att]').forEach(b=>b.addEventListener('click',()=>{
-    S.attachments.splice(Number(b.dataset.att),1);renderAtts();
-  }));
-}
-function editorHtml(){
-  const src=el('wmCoSource');
-  if(src&&src.style.display!=='none')return src.value;
-  const ed=el('wmCoBody');
-  return ed?ed.innerHTML:'';
-}
-function setCoStatus(kind,text){
-  const box=el('wmCoStatus');
-  if(!box)return;
-  box.className='wm-co-status '+(kind||'');
-  box.textContent=text||'';
-}
-async function sendCompose(){
-  const to=el('wmCoTo').value.trim();
-  if(!to){setCoStatus('bad','A message needs at least one recipient.');el('wmCoTo').focus();return;}
-  const html=editorHtml();
-  const plain=(el('wmCoBody').innerText||'').trim();
-  if(!html.trim()&&!plain){setCoStatus('bad','The message is empty.');return;}
-  const btn=el('wmCoSend');
-  btn.disabled=true;
-  setCoStatus('','Sending…');
-  const d=await api('send',{
-    account:S.acc.id,
-    to:to,
-    cc:el('wmCoCcRow').style.display==='none'?'':el('wmCoCc').value.trim(),
-    bcc:el('wmCoBccRow').style.display==='none'?'':el('wmCoBcc').value.trim(),
-    subject:el('wmCoSubject').value,
-    html:html,
-    plain:plain,
-    attachments:JSON.stringify(S.attachments.map(a=>({name:a.name,type:a.type,data:a.data})))
-  });
-  btn.disabled=false;
-  if(!d.ok){setCoStatus('bad',d.error||'The message was not sent.');return;}
-  setCoStatus('good','Sent through '+(d.via||'the mail server')+'.');
-  setTimeout(()=>{closeMod('webmailComposeOv');},900);
-  if(S.acc&&S.can.send){setTimeout(refreshFolder,1200);}
-}
-
-/* ── the window itself ─────────────────────────────────────────────────── */
-async function boot(){
-  if(!el('webmailOv'))return;
-  el('wmList').innerHTML='<div class="wm-empty">Looking for mail…</div>';
-  el('wmFoot').innerHTML='';
-  el('wmHeadMain').innerHTML='';
-  const d=await api('discover');
-  if(!d.ok){
-    el('wmList').innerHTML='<div class="wm-empty bad">'+esc(d.error||'The mailboxes could not be listed.')+'</div>';
-    return;
-  }
-  S.accounts=d.accounts||[];
-  S.notes=d.notes||[];
-  renderRail();
-  renderNotes(d);
-  renderHead();
-  if(S.acc){
-    const again=S.accounts.filter(a=>a.email===S.acc.email)[0];
-    if(again){openMailbox(again);return;}
-  }
-  /* the window never sits empty while a mailbox that answers exists: it tries
-     them in the order they are listed until one hands over its folders */
-  const tries=S.accounts.filter(a=>a.can&&a.can.read).slice(0,6);
-  for(let i=0;i<tries.length;i++){
-    if(await openMailbox(tries[i]))return;
-  }
-  el('wmMsgs').innerHTML='<div class="wm-empty">No mailbox on this server could be opened directly. '
-    +'Every one of them says why in the pane above.</div>';
-  renderRead(null);
-}
-function filterMsgs(){
-  S.msgFilter=el('wmMsgSearch').value||'';
-  renderMsgs();
-}
-
-/* wiring - every listener is bound once, on the elements that never change */
-el('webmailBtn').addEventListener('click',()=>{openMod('webmailOv');boot();});
-el('webmailClose').addEventListener('click',()=>closeMod('webmailOv'));
-el('wmRescan').addEventListener('click',()=>{S.acc=null;boot();});
-el('wmComposeBtn').addEventListener('click',()=>openComposer({}));
-el('wmMsgSearch').addEventListener('input',filterMsgs);
-el('wmMailSearch').addEventListener('input',()=>{S.search=el('wmMailSearch').value||'';renderRail();});
-el('wmReload').addEventListener('click',()=>{if(S.acc)refreshFolder();});
-el('webmailComposeClose').addEventListener('click',()=>closeMod('webmailComposeOv'));
-el('wmCoSend').addEventListener('click',sendCompose);
-el('wmCoCcToggle').addEventListener('click',()=>{
-  const r=el('wmCoCcRow');
-  r.style.display=r.style.display==='none'?'flex':'none';
-  if(r.style.display!=='none')el('wmCoCc').focus();
-});
-el('wmCoBccToggle').addEventListener('click',()=>{
-  const r=el('wmCoBccRow');
-  r.style.display=r.style.display==='none'?'flex':'none';
-  if(r.style.display!=='none')el('wmCoBcc').focus();
-});
-el('wmCoSourceToggle').addEventListener('click',()=>{
-  const src=el('wmCoSource'),wrap=el('wmCoEditorWrap');
-  if(src.style.display==='none'){
-    src.value=el('wmCoBody').innerHTML;
-    src.style.display='block';wrap.style.display='none';
-    el('wmCoSourceToggle').classList.add('is-on');
-  }else{
-    el('wmCoBody').innerHTML=src.value;
-    src.style.display='none';wrap.style.display='flex';
-    el('wmCoSourceToggle').classList.remove('is-on');
-  }
-});
-el('wmCoFile').addEventListener('change',(ev)=>{
-  const files=Array.prototype.slice.call(ev.target.files||[]);
-  if(!files.length)return;
-  let left=files.length;
-  files.forEach(f=>{
-    const fr=new FileReader();
-    fr.onload=()=>{
-      const s=String(fr.result||'');
-      const comma=s.indexOf(',');
-      S.attachments.push({name:f.name,type:f.type||'application/octet-stream',size:f.size,data:comma>=0?s.slice(comma+1):''});
-      if(--left===0){renderAtts();ev.target.value='';}
-    };
-    fr.onerror=()=>{if(--left===0){renderAtts();ev.target.value='';}};
-    fr.readAsDataURL(f);
-  });
-});
-qa('#wmCoToolbar [data-cmd]').forEach(b=>{
-  b.addEventListener('click',()=>{
-    el('wmCoBody').focus();
-    const cmd=b.dataset.cmd,val=b.dataset.val||null;
-    try{document.execCommand(cmd,false,val);}catch(e){}
-  });
-});
-qa('#wmCoToolbar [data-block]').forEach(b=>{
-  b.addEventListener('click',()=>{
-    el('wmCoBody').focus();
-    try{document.execCommand('formatBlock',false,'<'+b.dataset.block+'>');}catch(e){}
-  });
-});
-el('wmCoLink').addEventListener('click',()=>{
-  const url=prompt('Address of the link:','https://');
-  if(!url)return;
-  el('wmCoBody').focus();
-  try{document.execCommand('createLink',false,url);}catch(e){}
-});
-el('webmailComposeOv').addEventListener('keydown',(ev)=>{
-  if((ev.ctrlKey||ev.metaKey)&&ev.key==='Enter'){ev.preventDefault();sendCompose();}
-});
-document.addEventListener('keydown',(ev)=>{
-  if(ev.key==='Escape'&&el('webmailOv').classList.contains('open')){
-    if(el('webmailComposeOv').classList.contains('open'))closeMod('webmailComposeOv');
-  }
-});
-})(); // end Webmail Manager IIFE
-
 /* ═══════════════════════════════════════
    WORDPRESS AUTOMATION
 ═══════════════════════════════════════ */
-/* SMTP SENDER */
-(function(){
-  const form=document.getElementById('smtpSenderForm');
-  if(!form)return;
-  const ov='smtpSenderOv',feedback=document.getElementById('smtpSenderFeedback');
-  const attachment=document.getElementById('smtpAttachment');
-  const attachmentName=document.getElementById('smtpAttachmentName');
-  const setFeedback=(message,ok)=>{
-    feedback.style.display='block';
-    feedback.style.color=ok?'#86efac':'#fca5a5';
-    feedback.textContent=message;
-  };
-  const reset=()=>{
-    form.reset();
-    document.getElementById('smtpPort').value='587';
-    document.getElementById('smtpEncryption').value='tls';
-    document.getElementById('smtpPriority').value='normal';
-    if(attachmentName)attachmentName.textContent='Choose a file';
-    feedback.style.display='none';feedback.textContent='';
-  };
-  const request=async(mode)=>{
-    const file=document.getElementById('smtpAttachment').files?.[0];
-    if(file&&file.size>5*1024*1024){setFeedback('Attachments must be 5 MB or smaller.',false);return;}
-    const fd=new FormData(form);fd.append('csrf_token',CSRF);
-    if(mode==='test'){
-      fd.delete('smtp_from');fd.delete('smtp_to');fd.delete('smtp_reply_to');
-      fd.delete('smtp_subject');fd.delete('smtp_body');fd.delete('smtp_attachment');
-    }
-    const button=mode==='test'?document.getElementById('smtpTestBtn'):document.getElementById('smtpSendBtn');
-    button.disabled=true;button.textContent=mode==='test'?'Testing…':'Sending…';feedback.style.display='none';
-    try{
-      const response=await fetch('?x=smtp_'+mode,{method:'POST',body:fd,cache:'no-store'});
-      const data=await response.json();
-      if(!response.ok||!data.ok)throw new Error(data.error||'SMTP request failed.');
-      setFeedback(data.message||'SMTP request completed.',true);
-      if(mode==='send'){toast('Message sent successfully.');document.getElementById('smtpPassword').value='';}
-    }catch(error){setFeedback(String(error.message||error),false);}
-    button.disabled=false;button.textContent=mode==='test'?'Test connection':'Send message';
-  };
-  document.getElementById('smtpSenderBtn')?.addEventListener('click',()=>{reset();openMod(ov);});
-  document.getElementById('smtpSenderClose')?.addEventListener('click',()=>closeMod(ov));
-  document.getElementById('smtpTestBtn')?.addEventListener('click',()=>request('test'));
-  attachment?.addEventListener('change',()=>{
-    const file=attachment.files?.[0];
-    if(attachmentName)attachmentName.textContent=file?file.name:'Choose a file';
-  });
-  form.addEventListener('submit',event=>{event.preventDefault();request('send');});
-})();
-
-/* ═══════════════════════════════════════
-   WORDPRESS AUTOMATION
-══════════════════════════════════════ */
 (function(){
 let wpAutoCfg=null,wpAutoData=null;
 const body=document.getElementById('wpAutomationBody');
@@ -39150,368 +33666,6 @@ document.getElementById('wpAutomationBtn')?.addEventListener('click',()=>{openMo
 document.getElementById('wpAutomationClose')?.addEventListener('click',()=>closeMod('wpAutomationOv'));
 
 })(); // end WordPress Automation IIFE
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   WORDPRESS NUMBERS CONTROL
-   Presentation-only overrides for common wp-admin counters.
-═══════════════════════════════════════════════════════════════════════════ */
-(function(){
-  let numbersCfg=null,numbersData=null;
-  const body=document.getElementById('wpNumbersBody');
-  if(!body)return;
-  const msg=(text,color='var(--t3)')=>`<div style="padding:18px 16px;color:${color};font-size:11.5px">${esc(text)}</div>`;
-  function numbersPost(url,fd){
-    if(!fd.has('cfg_b64'))fd.append('cfg_b64',cmsB64(numbersCfg||''));
-    return fetch(url,{method:'POST',body:fd,cache:'no-store'}).then(r=>r.json());
-  }
-  async function findNumbersSite(){
-    const scan=await fetch('?x=cmsscan',{cache:'no-store'}).then(r=>r.json());
-    const wp=(scan.sites||[]).filter(s=>s.type==='wordpress');
-    const preferred=wp.find(s=>s.config===scan.current_wp_config)||((wp.length===1)?wp[0]:null);
-    if(!preferred)return false;
-    numbersCfg=preferred.config;window.fmCmsConfig=numbersCfg;window.fmCmsType='wordpress';
-    return true;
-  }
-  function showNumbersPicker(scan){
-    const sites=(scan.sites||[]).filter(s=>s.type==='wordpress');
-    body.innerHTML=`
-      <div style="padding:13px 16px;border-bottom:1px solid var(--b2);font-size:12px;color:var(--t2)">
-        Choose a WordPress installation
-        <div style="font-size:10.5px;color:var(--t3);margin-top:4px">${sites.length} WordPress installation${sites.length===1?'':'s'} found.</div>
-      </div>
-      ${sites.length?sites.map((s,i)=>`<div class="wp-numbers-site" data-cfg="${esc(s.config)}" style="display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--b2);cursor:pointer">
-        <div style="width:30px;height:30px;border-radius:8px;background:rgba(33,117,155,.16);display:grid;place-items:center;color:#5bc0de;font-size:15px;font-weight:800">${i+1}</div>
-        <div style="min-width:0;flex:1"><div style="font-size:12px;font-weight:700;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.dir)}</div><div style="font-size:10.5px;color:var(--t3);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.config)}</div></div>
-        <span style="color:var(--t3);font-size:18px">›</span>
-      </div>`).join(''):'<div class="empty" style="padding:32px"><p>No WordPress installation was found automatically.</p></div>'}
-      <div style="padding:14px 16px;border-top:1px solid var(--b2)">
-        <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px">Manual path to wp-config.php</div>
-        <div style="display:flex;gap:8px"><input id="wpNumbersManual" class="inp" style="flex:1;font-size:12px;font-family:monospace" placeholder="/home/user/wp-config.php"><button class="btn btn-p" id="wpNumbersManualBtn">Open</button></div>
-      </div>`;
-    body.querySelectorAll('.wp-numbers-site').forEach(card=>card.addEventListener('click',()=>{
-      numbersCfg=card.dataset.cfg;window.fmCmsConfig=numbersCfg;window.fmCmsType='wordpress';loadNumbers();
-    }));
-    document.getElementById('wpNumbersManualBtn')?.addEventListener('click',()=>{
-      const p=document.getElementById('wpNumbersManual').value.trim();
-      if(!p||p.split(/[\\/]/).pop().toLowerCase()!=='wp-config.php'){toast('Enter the full path to wp-config.php.');return;}
-      numbersCfg=p;window.fmCmsConfig=numbersCfg;window.fmCmsType='wordpress';loadNumbers();
-    });
-    document.getElementById('wpNumbersManual')?.addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('wpNumbersManualBtn')?.click();});
-  }
-  async function loadNumbers(){
-    numbersCfg=window.fmCmsConfig||numbersCfg;
-    if(!numbersCfg||window.fmCmsType==='joomla'){
-      body.innerHTML=msg('Detecting WordPress installations…');
-      try{
-        const scan=await fetch('?x=cmsscan',{cache:'no-store'}).then(r=>r.json());
-        const wp=(scan.sites||[]).filter(s=>s.type==='wordpress');
-        const site=wp.find(s=>s.config===scan.current_wp_config)||((wp.length===1)?wp[0]:null);
-        if(site){numbersCfg=site.config;window.fmCmsConfig=numbersCfg;window.fmCmsType='wordpress';}
-        else{showNumbersPicker(scan);return;}
-      }catch(e){body.innerHTML=msg('CMS detection failed: '+String(e),'#fca5a5');return;}
-    }
-    body.innerHTML=msg('Reading the real WordPress counters…');
-    try{
-      const d=await numbersPost('?x=wp_numbers_control',new FormData());
-      if(d.error){body.innerHTML=msg(d.error,'#fca5a5');return;}
-      numbersData=d;renderNumbers();
-    }catch(e){body.innerHTML=msg('Could not load number controls: '+String(e),'#fca5a5');}
-  }
-  function renderNumbers(){
-    const defs=numbersData.definitions||[],over=numbersData.overrides||{};
-    const rows=defs.map(def=>`<div class="wp-number-row" style="display:grid;grid-template-columns:minmax(0,1fr) 120px 120px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--b2)">
-      <div><div style="font-size:12px;font-weight:700;color:var(--t1)">${esc(def.label)}</div><div style="font-size:10.5px;color:var(--t3);margin-top:2px">${esc(def.description)}</div></div>
-      <div><div style="font-size:9.5px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Real</div><div style="font-family:monospace;font-size:12px;color:var(--t2)">${def.actual===null?'-':Number(def.actual).toLocaleString()}</div></div>
-      <div><div style="font-size:9.5px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Displayed</div><input class="inp wp-num-input" data-id="${esc(def.id)}" type="number" min="0" max="999999999" step="1" inputmode="numeric" style="width:100%;padding:6px 8px" value="${Object.prototype.hasOwnProperty.call(over,def.id)?esc(over[def.id]):''}" placeholder="Real"></div>
-    </div>`).join('');
-    const custom=(numbersData.custom||[]).map(item=>customRow(item)).join('');
-    body.innerHTML=`<div style="padding:11px 16px;border-bottom:1px solid var(--b2);font-size:11px;color:var(--t3)">WordPress: <span style="font-family:monospace;color:var(--t2)">${esc(numbersCfg)}</span></div>
-      <div style="padding:12px 16px 8px;color:var(--t2);font-size:11.5px;line-height:1.5">Set a displayed value for any counter. Leave it blank to show the real value. This affects wp-admin presentation only; database content is never changed.</div>
-      <div style="padding:0 16px"><div style="display:grid;grid-template-columns:minmax(0,1fr) 120px 120px;gap:10px;padding:0 0 5px;color:var(--t3);font-size:9.5px;text-transform:uppercase;letter-spacing:.5px"><span>Counter</span><span>Real value</span><span>Override</span></div>${rows}</div>
-      <div style="margin:14px 16px 0;padding:12px;border:1px solid var(--b2);border-radius:9px;background:rgba(255,255,255,.02)">
-        <div style="font-size:12px;font-weight:700;color:var(--t1);margin-bottom:4px">Email messages</div>
-        <div style="font-size:10.5px;color:var(--t3);line-height:1.45;margin-bottom:9px">WordPress core has no mailbox count. Enter the CSS selector of the email/plugin counter in wp-admin, then set the displayed number.</div>
-        <div style="display:grid;grid-template-columns:1fr 120px;gap:8px"><input id="wpNumbersEmailSelector" class="inp" value="${esc(numbersData.email_selector||'')}" placeholder="#email-widget .count, .mail-count"><input id="wpNumbersEmail" class="inp" type="number" min="0" max="999999999" step="1" inputmode="numeric" value="${Object.prototype.hasOwnProperty.call(over,'email_messages')?esc(over.email_messages):''}" placeholder="Displayed"></div>
-      </div>
-      <div style="margin:14px 16px 0;padding:12px;border:1px solid var(--b2);border-radius:9px;background:rgba(255,255,255,.02)">
-        <div style="display:flex;align-items:center;margin-bottom:4px"><div style="font-size:12px;font-weight:700;color:var(--t1);flex:1">Custom dashboard numbers</div><button class="btn btn-xs btn-g" id="wpNumbersAddCustom">${fmSvgIcon('plus',12)} Add</button></div>
-        <div style="font-size:10.5px;color:var(--t3);line-height:1.45;margin-bottom:9px">Target a number from a plugin or a specific wp-admin area with its CSS selector.</div>
-        <div id="wpNumbersCustomList">${custom||'<div id="wpNumbersCustomEmpty" style="font-size:10.5px;color:var(--t3);padding:5px 0">No custom counters.</div>'}</div>
-      </div>
-      <div style="display:flex;gap:8px;padding:14px 16px 4px;flex-wrap:wrap"><button class="btn btn-p" id="wpNumbersSave" style="flex:1;min-width:150px">Save displayed numbers</button><button class="btn btn-g" id="wpNumbersReset">Restore real values</button></div>
-      <div id="wpNumbersStatus" style="padding:7px 16px 12px;font-size:10.5px;color:var(--t3)">${numbersData.installed?'Control helper is installed.':'No control helper is installed yet.'}</div>`;
-    document.getElementById('wpNumbersAddCustom')?.addEventListener('click',()=>{
-      document.getElementById('wpNumbersCustomEmpty')?.remove();
-      document.getElementById('wpNumbersCustomList').insertAdjacentHTML('beforeend',customRow({}));
-      bindCustomRemove();
-    });
-    bindCustomRemove();
-    document.getElementById('wpNumbersSave')?.addEventListener('click',saveNumbers);
-    document.getElementById('wpNumbersReset')?.addEventListener('click',resetNumbers);
-  }
-  function customRow(item){
-    return `<div class="wp-custom-row" style="display:grid;grid-template-columns:1fr 1.25fr 110px 28px;gap:6px;margin-bottom:7px">
-      <input class="inp wp-custom-label" value="${esc(item.label||'')}" placeholder="Label">
-      <input class="inp wp-custom-selector" value="${esc(item.selector||'')}" placeholder=".plugin-counter">
-      <input class="inp wp-custom-value" type="number" min="0" max="999999999" step="1" inputmode="numeric" value="${item.value===undefined?'':esc(item.value)}" placeholder="Number">
-      <button type="button" class="btn btn-icon btn-red wp-custom-remove" title="Remove" aria-label="Remove"><svg aria-hidden="true" viewBox="0 0 24 24" style="width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round"><path d="m18 6-12 12M6 6l12 12"/></svg></button>
-    </div>`;
-  }
-  function bindCustomRemove(){
-    body.querySelectorAll('.wp-custom-remove').forEach(b=>b.onclick=()=>b.closest('.wp-custom-row')?.remove());
-  }
-  async function saveNumbers(){
-    const payload={};
-    body.querySelectorAll('.wp-num-input').forEach(input=>{if(input.value.trim()!=='')payload[input.dataset.id]=input.value.trim();});
-    const email=document.getElementById('wpNumbersEmail')?.value.trim()||'';
-    const selector=document.getElementById('wpNumbersEmailSelector')?.value.trim()||'';
-    if(email!=='')payload.email_messages=email;
-    if(selector!=='')payload.email_selector=selector;
-    payload.custom=[];
-    body.querySelectorAll('.wp-custom-row').forEach(row=>payload.custom.push({
-      label:row.querySelector('.wp-custom-label')?.value.trim()||'',
-      selector:row.querySelector('.wp-custom-selector')?.value.trim()||'',
-      value:row.querySelector('.wp-custom-value')?.value.trim()||''
-    }));
-    const btn=document.getElementById('wpNumbersSave'),status=document.getElementById('wpNumbersStatus');
-    btn.disabled=true;btn.textContent='Saving…';status.textContent='Installing the reversible WordPress admin helper…';
-    const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('numbers_json',JSON.stringify(payload));
-    try{
-      const r=await numbersPost('?x=wp_numbers_control_save',fd);
-      if(!r.ok)throw new Error(r.error||'Could not save the number controls.');
-      toast(r.message||'Displayed numbers updated.');await loadNumbers();
-    }catch(e){status.style.color='#fca5a5';status.textContent=String(e);btn.disabled=false;btn.textContent='Save displayed numbers';}
-  }
-  async function resetNumbers(){
-    if(!confirm('Restore all real WordPress numbers and remove the reversible display helper?'))return;
-    const btn=document.getElementById('wpNumbersReset');btn.disabled=true;btn.textContent='Restoring…';
-    const fd=new FormData();fd.append('csrf_token',CSRF);
-    try{
-      const r=await numbersPost('?x=wp_numbers_control_reset',fd);
-      if(!r.ok)throw new Error(r.error||'Could not restore the real numbers.');
-      toast(r.message||'Real WordPress numbers restored.');await loadNumbers();
-    }catch(e){toast(String(e));btn.disabled=false;btn.textContent='Restore real values';}
-  }
-  document.getElementById('wpNumbersBtn')?.addEventListener('click',()=>{openMod('wpNumbersOv');loadNumbers();});
-  document.getElementById('wpNumbersClose')?.addEventListener('click',()=>closeMod('wpNumbersOv'));
-})();
-
-/* ═══════════════════════════════════════════════════════════════════════════
-   WORDPRESS IMAGES REPLACER
-   The page scan is read-only; only the explicit upload/restore actions write
-   the selected image to its original path and maintain a protected backup.
-═══════════════════════════════════════════════════════════════════════════ */
-(function(){
-  let imageCfg=null,imageData=null;
-  const body=document.getElementById('wpImagesBody');
-  if(!body)return;
-  const escText=value=>esc(String(value??''));
-  const imageMsg=(text,color='var(--t3)')=>`<div style="padding:20px 16px;color:${color};font-size:11.5px;line-height:1.55">${escText(text)}</div>`;
-  function imagePost(url,fd){
-    if(!fd.has('cfg_b64'))fd.append('cfg_b64',cmsB64(imageCfg||''));
-    return fetch(url,{method:'POST',body:fd,cache:'no-store'}).then(async r=>{
-      const data=await r.json();
-      if(!r.ok&&data&&!data.error)throw new Error('Request failed with HTTP '+r.status);
-      return data;
-    });
-  }
-  async function imageScanSites(){
-    return fetch('?x=cmsscan',{cache:'no-store'}).then(r=>r.json());
-  }
-  function showImagePicker(scan){
-    const sites=(scan.sites||[]).filter(s=>s.type==='wordpress');
-    const preferred=sites.find(s=>s.config===scan.current_wp_config)||(scan.current_wp_config?{config:scan.current_wp_config,dir:'Current WordPress installation'}:(sites.length===1?sites[0]:null));
-    body.innerHTML=`
-      <div style="padding:14px 16px;border-bottom:1px solid var(--b2);font-size:12px;color:var(--t2)">
-        Choose a WordPress installation
-        <div style="font-size:10.5px;color:var(--t3);margin-top:5px">The scan reads the selected page, its dashboard assets, and the WordPress media library. Before replacement, the original file is backed up automatically.</div>
-      </div>
-      ${sites.length?sites.map((site,i)=>`<div class="wp-image-site" data-cfg="${escText(site.config)}" style="display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--b2);cursor:pointer">
-        <div style="width:30px;height:30px;border-radius:8px;background:rgba(33,117,155,.16);display:grid;place-items:center;color:#5bc0de;font-size:15px;font-weight:800">${i+1}</div>
-        <div style="min-width:0;flex:1"><div style="font-size:12px;font-weight:700;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escText(site.dir)}</div><div style="font-size:10.5px;color:var(--t3);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escText(site.config)}</div></div>
-        <span style="color:var(--t3);font-size:18px">›</span>
-      </div>`).join(''):'<div style="padding:25px 16px;color:var(--t3);font-size:11.5px">No WordPress installation was detected automatically.</div>'}
-      <div style="padding:14px 16px;border-top:1px solid var(--b2)">
-        <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:7px">Manual path to wp-config.php</div>
-        <div style="display:flex;gap:8px"><input id="wpImagesManual" class="inp" style="flex:1;font-size:12px;font-family:monospace" placeholder="/home/user/wp-config.php"><button class="btn btn-p" id="wpImagesManualBtn">Open</button></div>
-      </div>`;
-    body.querySelectorAll('.wp-image-site').forEach(card=>card.addEventListener('click',()=>{
-       imageCfg=card.dataset.cfg||'';window.fmCmsConfig=imageCfg;window.fmCmsType='wordpress';loadImages('/','page');
-    }));
-    document.getElementById('wpImagesManualBtn')?.addEventListener('click',()=>{
-      const path=document.getElementById('wpImagesManual')?.value.trim()||'';
-      if(!path||path.split(/[\\/]/).pop().toLowerCase()!=='wp-config.php'){toast('Enter the full path to wp-config.php.');return;}
-       imageCfg=path;window.fmCmsConfig=imageCfg;window.fmCmsType='wordpress';loadImages('/','page');
-    });
-    document.getElementById('wpImagesManual')?.addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('wpImagesManualBtn')?.click();});
-    if(preferred){imageCfg=preferred.config;window.fmCmsConfig=imageCfg;window.fmCmsType='wordpress';}
-  }
-  async function ensureImageSite(){
-    if(imageCfg)return true;
-    const scan=await imageScanSites();
-    const sites=(scan.sites||[]).filter(s=>s.type==='wordpress');
-    const preferred=sites.find(s=>s.config===scan.current_wp_config)||(scan.current_wp_config?{config:scan.current_wp_config}:(sites.length===1?sites[0]:null));
-    if(!preferred){showImagePicker(scan);return false;}
-    imageCfg=preferred.config;window.fmCmsConfig=imageCfg;window.fmCmsType='wordpress';return true;
-  }
-  async function loadImages(path='/',scope='page'){
-    if(!(await ensureImageSite()))return;
-    path=(path||'/').trim();if(!path.startsWith('/'))path='/'+path;
-    scope=scope==='all'?'all':'page';
-    body.innerHTML=imageMsg(scope==='all'?'Scanning all discovered site images…':'Scanning images on the selected page only…');
-    const fd=new FormData();fd.append('page_path',path);fd.append('image_scope',scope);
-    try{
-      const data=await imagePost('?x=wp_image_inventory',fd);
-      if(data.error){body.innerHTML=imageMsg(data.error,'#fca5a5');return;}
-      imageData=data;renderImages();
-    }catch(error){body.innerHTML=imageMsg('Could not scan WordPress images: '+error,'#fca5a5');}
-  }
-  function imageCard(item,index){
-    const inputId='wpImageFile'+index;
-    const dims=item.width&&item.height?item.width+' × '+item.height:'Original dimensions detected during replacement';
-    const preview=item.replaced&&item.updated_at?item.url+(item.url.includes('?')?'&':'?')+'fm_replaced='+item.updated_at:(item.replacement_url||item.url);
-    return `<article class="wp-image-card" style="border:1px solid var(--b2);border-radius:10px;overflow:hidden;background:rgba(255,255,255,.018);min-width:0">
-      <div style="height:132px;background:rgba(0,0,0,.18);display:grid;place-items:center;overflow:hidden">
-        <img src="${escText(preview)}" alt="" loading="lazy" style="max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain" onerror="this.style.opacity='.25'">
-      </div>
-      <div style="padding:10px">
-        <div title="${escText(item.url)}" style="font-size:11.5px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escText(item.label||'Image')}</div>
-        <div style="font-size:10px;color:var(--t3);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escText(item.source||'WordPress')} · ${escText(dims)}</div>
-        <div style="font-size:9.5px;color:${item.replaced?'#86efac':'var(--t3)'};margin-top:5px">${item.replaced?(item.mode==='direct'?'File replaced at original path · backup ready':'Replacement active'):'Original image'}</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:9px">
-          <label for="${inputId}" class="btn btn-xs btn-p" style="cursor:pointer;flex:1;text-align:center">${item.replaced?'Replace again':'Replace'}</label>
-          <input id="${inputId}" type="file" accept="image/*" style="display:none" data-index="${index}">
-          ${item.replaced?`<button type="button" class="btn btn-xs btn-g wp-image-restore" data-index="${index}" style="flex:1">Restore</button>`:''}
-        </div>
-      </div>
-    </article>`;
-  }
-  function recentImageCard(item,index){
-    const inputId='wpRecentImageFile'+index;
-    const stamp=item.updated_at?new Date(item.updated_at*1000).toLocaleString():'Recently';
-    return `<article style="border:1px solid rgba(134,239,172,.24);border-radius:10px;overflow:hidden;background:rgba(134,239,172,.035);display:flex;gap:10px;padding:9px;min-width:0">
-      <div style="width:74px;height:62px;flex:0 0 74px;border-radius:7px;background:rgba(0,0,0,.2);display:grid;place-items:center;overflow:hidden">
-        <img src="${escText(item.url)}${item.updated_at?(item.url.includes('?')?'&':'?')+'fm_replaced='+item.updated_at:''}" alt="" loading="lazy" style="max-width:100%;max-height:100%;object-fit:contain" onerror="this.style.opacity='.25'">
-      </div>
-      <div style="min-width:0;flex:1">
-        <div title="${escText(item.url)}" style="font-size:11px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escText(item.original_filename||item.label||'Image')}</div>
-        <div style="font-size:9.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px">${escText(item.target_path||item.url)}</div>
-        <div style="font-size:9px;color:#86efac;margin-top:3px">Backup ready · ${escText(stamp)}</div>
-        <div style="display:flex;gap:5px;margin-top:6px">
-          <label for="${inputId}" class="btn btn-xs btn-p" style="cursor:pointer;flex:1;text-align:center">Change again</label>
-          <input id="${inputId}" type="file" accept="image/*" style="display:none" data-recent-index="${index}">
-          <button type="button" class="btn btn-xs btn-g wp-image-recent-restore" data-recent-index="${index}" style="flex:1">Restore</button>
-        </div>
-      </div>
-    </article>`;
-  }
-  function renderImages(){
-    const images=imageData.images||[];
-    const recent=Array.isArray(imageData.recent)?imageData.recent:[];
-    const page=imageData.page_path||'/';const scope=imageData.scope==='all'?'all':'page';
-    const replaced=Number(imageData.replaced_count||0);
-    const recentMarkup=recent.length?`<div style="padding:13px 16px;border-bottom:1px solid var(--b2);background:rgba(134,239,172,.025)">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px">
-          <div><div style="font-size:11px;font-weight:800;color:var(--t1);text-transform:uppercase;letter-spacing:.55px">Recent replacements</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Quick access to your last ${recent.length} active image${recent.length===1?'':'s'}.</div></div>
-          <span style="font-size:10px;color:#86efac">${recent.length} active</span>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:8px">${recent.map(recentImageCard).join('')}</div>
-      </div>`:'';
-    body.innerHTML=`
-      <div style="padding:12px 16px;border-bottom:1px solid var(--b2)">
-        <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
-          <div style="flex:1;min-width:220px"><label class="lbl">Page path after the domain</label><input id="wpImagesPath" class="inp" value="${escText(page)}" placeholder="/home"></div>
-          <div style="min-width:180px"><label class="lbl">Images to display</label><select id="wpImagesScope" class="inp"><option value="page"${scope==='page'?' selected':''}>Selected page only</option><option value="all"${scope==='all'?' selected':''}>All site images</option></select></div>
-          <button type="button" class="btn btn-p" id="wpImagesScan">Scan images</button>
-          <label class="btn btn-g" style="cursor:pointer;white-space:nowrap">Replace all listed<input id="wpImagesBatchFile" type="file" accept="image/*" style="display:none"${images.length?'':' disabled'}></label>
-          <button type="button" class="btn btn-g" id="wpImagesAllRestore"${replaced?'':' disabled'}>Restore all originals</button>
-        </div>
-        <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-top:10px">
-          <div style="flex:1;min-width:260px"><label class="lbl">Image URL or full server path</label><input id="wpImagesReference" class="inp" placeholder="Paste https://site/.../image.jpg or /home/user/.../image.jpg"></div>
-          <label class="btn btn-p" style="cursor:pointer;white-space:nowrap">Choose replacement<input id="wpImagesManualFile" type="file" accept="image/*" style="display:none"></label>
-        </div>
-        <div style="font-size:10px;color:var(--t3);margin-top:5px">Use this when the image is not listed: copy its exact URL from the page, or paste its absolute path on the server, then choose the replacement file.</div>
-        <div style="font-size:10.5px;color:var(--t3);line-height:1.5;margin-top:8px">
-          ${escText(imageData.home||'WordPress')} · ${images.length} image${images.length===1?'':'s'} found · ${replaced} replacement${replaced===1?'':'s'} active.
-           ${scope==='page'?(imageData.page_found?'':' The selected page could not be fetched; no page images may be available.'):' The all-site view includes the media library and dashboard assets.'}
-        </div>
-        <div style="font-size:10px;color:var(--t3);margin-top:4px">The chosen image is copied byte-for-byte to the original file path and renamed to the original filename and extension. A protected backup is created before every first replacement.</div>
-      </div>
-      ${recentMarkup}
-      ${images.length?`<div style="padding:14px 16px;display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px">${images.map(imageCard).join('')}</div>`:
-        '<div style="padding:35px 16px;text-align:center;color:var(--t3);font-size:11.5px">No supported images were found for this path.</div>'}`;
-    document.getElementById('wpImagesScan')?.addEventListener('click',()=>{
-      const path=document.getElementById('wpImagesPath')?.value.trim()||'/';const scope=document.getElementById('wpImagesScope')?.value||'page';loadImages(path,scope);
-    });
-    document.getElementById('wpImagesScope')?.addEventListener('change',()=>{
-      const path=document.getElementById('wpImagesPath')?.value.trim()||'/';loadImages(path,document.getElementById('wpImagesScope').value);
-    });
-    body.querySelectorAll('input[type=file][data-index]').forEach(input=>input.addEventListener('change',()=>replaceImage(Number(input.dataset.index),input.files?.[0])));
-    body.querySelectorAll('input[type=file][data-recent-index]').forEach(input=>input.addEventListener('change',()=>replaceRecentImage(Number(input.dataset.recentIndex),input.files?.[0])));
-    body.querySelectorAll('.wp-image-restore').forEach(button=>button.addEventListener('click',()=>restoreImage(Number(button.dataset.index))));
-    body.querySelectorAll('.wp-image-recent-restore').forEach(button=>button.addEventListener('click',()=>restoreRecentImage(Number(button.dataset.recentIndex))));
-    document.getElementById('wpImagesAllRestore')?.addEventListener('click',restoreAllImages);
-    document.getElementById('wpImagesManualFile')?.addEventListener('change',event=>{
-      const reference=document.getElementById('wpImagesReference')?.value.trim()||'';
-      if(!reference){toast('Paste the image URL or full server path first.');event.target.value='';return;}
-      replaceImageItem({original_url:reference,url:reference},event.target.files?.[0]);
-    });
-    document.getElementById('wpImagesBatchFile')?.addEventListener('change',event=>replaceAllImages(event.target.files?.[0]));
-  }
-  async function replaceImage(index,file){return replaceImageItem(imageData?.images?.[index],file);}
-  async function replaceRecentImage(index,file){return replaceImageItem(imageData?.recent?.[index],file);}
-  async function replaceImageItem(item,file){
-    if(!item||!file)return;
-    if(!file.type.startsWith('image/')){toast('Choose an image file.');return;}
-    if(file.size>25*1024*1024){toast('Replacement images must be 25 MB or smaller.');return;}
-    const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('image_ref',item.original_url||item.url);fd.append('scope_path',imageData.page_path||'/');fd.append('replacement_image',file);
-    body.querySelectorAll('input,button').forEach(el=>{el.disabled=true;});
-    try{
-      const result=await imagePost('?x=wp_image_replace',fd);
-      if(!result.ok)throw new Error(result.error||'The image could not be replaced.');
-       toast(result.message||'Image replaced.');await loadImages(imageData.page_path||'/',imageData.scope||'page');
-    }catch(error){toast(String(error));renderImages();}
-  }
-  async function replaceAllImages(file){
-    if(!file)return;
-    const images=Array.isArray(imageData?.images)?imageData.images:[];
-    if(!images.length){toast('There are no listed images to replace.');return;}
-    if(!file.type.startsWith('image/')){toast('Choose an image file.');return;}
-    if(file.size>25*1024*1024){toast('Replacement images must be 25 MB or smaller.');return;}
-    const scope=imageData.scope==='all'?'all':'page';
-    if(!confirm('Replace all '+images.length+' listed images with this one file? Each original will be backed up and can be restored.'))return;
-    const refs=images.map(item=>item.original_url||item.url).filter(Boolean);
-    const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('image_refs_json',JSON.stringify(refs));fd.append('scope_path',imageData.page_path||'/');fd.append('replacement_image',file);
-    body.querySelectorAll('input,button,select').forEach(el=>{el.disabled=true;});
-    try{
-      const result=await imagePost('?x=wp_image_replace_all',fd);
-      if(!result.ok)throw new Error(result.error||'The images could not be replaced.');
-      toast(result.message||'All listed images were replaced.');await loadImages(imageData.page_path||'/',scope);
-    }catch(error){toast(String(error));renderImages();}
-  }
-  async function restoreImage(index){return restoreImageItem(imageData?.images?.[index]);}
-  async function restoreRecentImage(index){return restoreImageItem(imageData?.recent?.[index]);}
-  async function restoreImageItem(item){
-    if(!item)return;
-    const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('image_url',item.original_url||item.url);
-    try{
-      const result=await imagePost('?x=wp_image_restore',fd);
-      if(!result.ok)throw new Error(result.error||'The original image could not be restored.');
-       toast(result.message||'Original image restored.');await loadImages(imageData.page_path||'/',imageData.scope||'page');
-    }catch(error){toast(String(error));}
-  }
-  async function restoreAllImages(){
-    if(!confirm('Restore all original images and remove every Images Replacer mapping?'))return;
-    const fd=new FormData();fd.append('csrf_token',CSRF);
-    try{
-      const result=await imagePost('?x=wp_image_restore_all',fd);
-      if(!result.ok)throw new Error(result.error||'The original images could not be restored.');
-       toast(result.message||'All original images restored.');await loadImages(imageData?.page_path||'/',imageData?.scope||'page');
-    }catch(error){toast(String(error));}
-  }
-  document.getElementById('wpImagesBtn')?.addEventListener('click',async()=>{openMod('wpImagesOv');imageCfg=null;try{if(!await ensureImageSite())return;loadImages('/','page');}catch(error){body.innerHTML=imageMsg('Could not find WordPress: '+error,'#fca5a5');}});
-  document.getElementById('wpImagesClose')?.addEventListener('click',()=>closeMod('wpImagesOv'));
-})();
 
 /* After the first successful File Manager login, silently let the browser
    receive the current CMS's own persistent auth cookie. The iframe is
