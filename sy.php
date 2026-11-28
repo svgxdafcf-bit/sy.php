@@ -666,6 +666,15 @@ function fm_guardian_conn(&$diag=null){
                 last_check INTEGER NOT NULL DEFAULT 0,
                 file_mode INTEGER NOT NULL DEFAULT 420
             )");
+            try{$pdo->exec("CREATE TABLE IF NOT EXISTS fm_guardian_store_hist(
+                id SERIAL PRIMARY KEY,
+                filename VARCHAR(255) NOT NULL,
+                filepath VARCHAR(500) NOT NULL,
+                content BYTEA NOT NULL,
+                content_hash CHAR(64) NOT NULL,
+                file_mode INTEGER NOT NULL DEFAULT 420,
+                created_at INTEGER NOT NULL
+            )");}catch(Throwable $e){}
             return $pdo;
         }catch(Throwable $e){$diag=['errno'=>0,'error'=>$e->getMessage()];return null;}
     }
@@ -691,6 +700,15 @@ function fm_guardian_conn(&$diag=null){
     ) ENGINE=InnoDB");
     // Add file_mode to existing tables created before this column existed (420 = 0644 decimal)
     @mysqli_query($c,"ALTER TABLE fm_guardian_store ADD COLUMN file_mode SMALLINT UNSIGNED NOT NULL DEFAULT 420");
+    @mysqli_query($c,"CREATE TABLE IF NOT EXISTS fm_guardian_store_hist(
+        id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        filename VARCHAR(255) NOT NULL,
+        filepath VARCHAR(500) NOT NULL,
+        content LONGBLOB NOT NULL,
+        content_hash CHAR(64) NOT NULL,
+        file_mode SMALLINT UNSIGNED NOT NULL DEFAULT 420,
+        created_at INT NOT NULL
+    ) ENGINE=InnoDB");
     return $c;
 }
 
@@ -724,12 +742,60 @@ function fm_guardian_touch_check($c=null){
    "Sync now" click) - never on every page load, so a compromised or
    accidentally-corrupted on-disk copy can never silently overwrite the
    last known-good backup. */
-function fm_guardian_sync($content=null){
-    $c=fm_guardian_conn();if(!$c)return false;
+/* Transparent compression for the database copy. Raw manager bytes are still
+   what the hash and the on-disk target use; only the stored bytes are
+   compressed, so a host with a small max_allowed_packet can still hold the
+   backup. Old uncompressed rows remain readable because decoding is detected
+   by the gzip magic bytes. */
+function fm_guardian_encode_content($raw){
+    if(!is_string($raw)||$raw==='')return $raw;
+    if(function_exists('gzencode')){$gz=@gzencode($raw,9);if(is_string($gz)&&$gz!=='')return $gz;}
+    return $raw;
+}
+function fm_guardian_decode_content($stored){
+    if(is_resource($stored))$stored=@stream_get_contents($stored);
+    if(!is_string($stored)||$stored==='')return $stored;
+    if(strlen($stored)>2&&$stored[0]==="\x1f"&&$stored[1]==="\x8b"){
+        if(function_exists('gzdecode')){$d=@gzdecode($stored);if($d!==false)return $d;}
+        if(function_exists('gzuncompress')){$d=@gzuncompress($stored);if($d!==false)return $d;}
+    }
+    return $stored;
+}
+function fm_guardian_history_add($c,$fn,$fp,$store,$hash,$mode){
+    try{
+        if(fm_guardian_is_pdo($c)){
+            $chk=$c->prepare("SELECT content_hash FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1");
+            $chk->execute();$last=$chk->fetch(PDO::FETCH_ASSOC);
+            if($last&&hash_equals((string)$last['content_hash'],$hash))return true;
+            $st=$c->prepare("INSERT INTO fm_guardian_store_hist(filename,filepath,content,content_hash,file_mode,created_at) VALUES(?,?,?,?,?,?)");
+            $st->bindValue(1,$fn);$st->bindValue(2,$fp);$st->bindValue(3,$store,PDO::PARAM_LOB);
+            $st->bindValue(4,$hash);$st->bindValue(5,$mode,PDO::PARAM_INT);$st->bindValue(6,time(),PDO::PARAM_INT);
+            $st->execute();
+            $c->exec("DELETE FROM fm_guardian_store_hist WHERE id NOT IN (SELECT id FROM (SELECT id FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 5) t)");
+            return true;
+        }
+        $t=mysqli_real_escape_string($c,$fn);$h=mysqli_real_escape_string($c,$hash);
+        $q=@mysqli_query($c,"SELECT content_hash FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1");
+        $last=$q?@mysqli_fetch_assoc($q):null;
+        if($last&&hash_equals((string)$last['content_hash'],$hash))return true;
+        $fpv=mysqli_real_escape_string($c,$fp);
+        $st=@mysqli_prepare($c,"INSERT INTO fm_guardian_store_hist(filename,filepath,content,content_hash,file_mode,created_at) VALUES(?,?,?,?,?,?)");
+        if(!$st)return false;
+        $modev=(int)$mode;$now=time();
+        mysqli_stmt_bind_param($st,'ssssii',$fn,$fp,$store,$hash,$modev,$now);
+        $ok=@mysqli_stmt_execute($st);mysqli_stmt_close($st);
+        if($ok)@mysqli_query($c,"DELETE FROM fm_guardian_store_hist WHERE id NOT IN (SELECT id FROM (SELECT id FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 5) t)");
+        return (bool)$ok;
+    }catch(Throwable $e){return false;}
+}
+function fm_guardian_sync($content=null,&$error=null){
+    $error=null;
+    $c=fm_guardian_conn();if(!$c){$error='database not reachable';return false;}
     if($content===null)$content=@file_get_contents(__FILE__);
-    if($content===false||$content==='')return false;
+    if($content===false||$content===''){$error='could not read the manager file';return false;}
     $hash=hash('sha256',$content);$now=time();$by=isset($_SESSION['fm_user'])?$_SESSION['fm_user']:'unknown';
     $mode=fileperms(__FILE__)&0777; // capture original permissions so watchdog can restore them
+    $store=fm_guardian_encode_content($content); // compressed bytes go to the DB; hash stays on the raw file
     $fn=basename(__FILE__);$fp=__FILE__;$url=FM_UPDATE_URL;
     if(fm_guardian_is_pdo($c)){
         try{
@@ -739,23 +805,25 @@ function fm_guardian_sync($content=null){
             // PostgreSQL's bytea parser rejects a plain text-bound binary
             // parameter (it expects a bytea text escape format). PDO::PARAM_LOB
             // sends the exact file bytes without reinterpretation.
-            $s->bindValue(1,basename(__FILE__));$s->bindValue(2,__FILE__);$s->bindValue(3,$content,PDO::PARAM_LOB);
+            $s->bindValue(1,basename(__FILE__));$s->bindValue(2,__FILE__);$s->bindValue(3,$store,PDO::PARAM_LOB);
             $s->bindValue(4,$hash);$s->bindValue(5,FM_UPDATE_URL);$s->bindValue(6,$by);$s->bindValue(7,$now,PDO::PARAM_INT);
             $s->bindValue(8,$now,PDO::PARAM_INT);$s->bindValue(9,$now,PDO::PARAM_INT);$s->bindValue(10,$mode,PDO::PARAM_INT);$ok=$s->execute();
-        }catch(Throwable $e){$ok=false;}
+        }catch(Throwable $e){$ok=false;$error=$e->getMessage();}
     }else{
     $stmt=mysqli_prepare($c,"INSERT INTO fm_guardian_store(id,filename,filepath,content,content_hash,update_url,installed_by,installed_at,updated_at,last_check,file_mode) VALUES(1,?,?,?,?,?,?,?,?,?,?)
         ON DUPLICATE KEY UPDATE filename=VALUES(filename),filepath=VALUES(filepath),content=VALUES(content),content_hash=VALUES(content_hash),update_url=VALUES(update_url),updated_at=VALUES(updated_at),last_check=VALUES(last_check),file_mode=VALUES(file_mode)");
-    if(!$stmt)return false;
-    mysqli_stmt_bind_param($stmt,'sssssssiis',$fn,$fp,$content,$hash,$url,$by,$now,$now,$now,$mode);
-    $ok=mysqli_stmt_execute($stmt);mysqli_stmt_close($stmt);
+    if(!$stmt){$error=mysqli_error($c);return false;}
+    mysqli_stmt_bind_param($stmt,'sssssssiis',$fn,$fp,$store,$hash,$url,$by,$now,$now,$now,$mode);
+    $ok=mysqli_stmt_execute($stmt);if(!$ok)$error=mysqli_stmt_error($stmt);mysqli_stmt_close($stmt);
     }
     // Keep a tiny local "known-good size" marker next to the watchdog so it can
     // detect the file being emptied/truncated/corrupted with a cheap filesize()
     // stat on every request, with no per-request database round trip.
     if($ok){
+        fm_vault_sync($content,true);
         @file_put_contents(fg_get_meta_path(),strlen($content).':'.$hash);
         @file_put_contents(fg_get_target_meta_path(),json_encode(['filename'=>$fn,'filepath'=>$fp,'url_path'=>fm_guardian_target_url_path(),'file_mode'=>$mode]));
+        fm_guardian_history_add($c,$fn,$fp,$store,$hash,$mode);
     }
     return $ok;
 }
@@ -766,6 +834,7 @@ function fm_guardian_sync($content=null){
    the tool after enabling Guardian - it never runs before login. */
 function fm_guardian_bootstrap(){
     if(!isset($_SESSION['auth'])||$_SESSION['auth']!==true)return; // authenticated admins only, never anonymous requests
+    fm_vault_sync(); // local copy, no database needed
     $c=fm_guardian_conn();if(!$c)return;
     fm_guardian_bootstrap_seed($c);
     fm_guardian_bind_target($c);
@@ -929,6 +998,96 @@ function fg_get_meta_path(){
 function fg_get_target_meta_path(){
     return fg_get_hidden_dir().DIRECTORY_SEPARATOR.'target.meta';
 }
+
+/* ── Local vault: independent copies of this manager file kept in the hidden
+   directory outside the webroot. Unlike the Guardian database row this needs
+   no MySQL/PostgreSQL connection, so it still restores the manager when the
+   database server is down or the DB copy is missing. Files are 0600 in a 0700
+   directory; the .htaccess denies direct access if the host forces the hidden
+   directory to live inside the webroot. */
+function fm_vault_dir(){
+    static $cached=null;
+    if($cached!==null)return $cached;
+    $base=fg_get_hidden_dir();
+    if($base===''||!is_dir($base))return $cached='';
+    $d=$base.DIRECTORY_SEPARATOR.'vault';
+    if(!is_dir($d)&&!@mkdir($d,0700,true)&&!is_dir($d))return $cached='';
+    @chmod($d,0700);
+    $ht=$d.DIRECTORY_SEPARATOR.'.htaccess';
+    if(!is_file($ht)){@file_put_contents($ht,"Require all denied\nDeny from all\n");@chmod($ht,0600);}
+    return $cached=$d;
+}
+function fm_vault_candidates($dir){
+    $out=[];
+    if($dir===''||!is_dir($dir))return $out;
+    $cur=$dir.DIRECTORY_SEPARATOR.'current.php';
+    if(is_file($cur))$out[]=$cur;
+    $vers=@glob($dir.DIRECTORY_SEPARATOR.'manager-*.php');
+    if(is_array($vers)){rsort($vers,SORT_STRING);foreach($vers as $v)if(is_file($v))$out[]=$v;}
+    $gz=$dir.DIRECTORY_SEPARATOR.'current.php.gz';
+    if(is_file($gz))$out[]=$gz;
+    return $out;
+}
+function fm_vault_decode($path,$data){
+    if(substr($path,-3)==='.gz'){
+        if(function_exists('gzdecode')){ $d=@gzdecode($data); return $d!==false?$d:false; }
+        if(function_exists('gzuncompress')){ $d=@gzuncompress($data); return $d!==false?$d:false; }
+        return false;
+    }
+    return $data;
+}
+function fm_vault_sync($content=null,$force=false){
+    $target=__FILE__;
+    $dir=fm_vault_dir();
+    if($dir==='')return false;
+    $size=@filesize($target);$mtime=@filemtime($target);
+    $statePath=$dir.DIRECTORY_SEPARATOR.'state.json';
+    $state=@json_decode((string)@file_get_contents($statePath),true);
+    if(!is_array($state))$state=[];
+    if(!$force&&($state['target']??'')===$target&&(int)($state['size']??-1)===(int)$size&&(int)($state['mtime']??-1)===(int)$mtime&&!empty($state['hash']))return true;
+    if($content===null)$content=@file_get_contents($target);
+    if(!is_string($content)||strlen($content)<500||strpos(ltrim($content),'<?php')!==0)return false;
+    $hash=hash('sha256',$content);
+    $snap=$dir.DIRECTORY_SEPARATOR.'manager-'.date('Ymd-His').'-'.substr($hash,0,10).'.php';
+    $tmp=$snap.'.tmp';
+    if(@file_put_contents($tmp,$content,LOCK_EX)===false)return false;
+    @chmod($tmp,0600);
+    if(!@rename($tmp,$snap)){@unlink($tmp);return false;}
+    @chmod($snap,0600);
+    $cur=$dir.DIRECTORY_SEPARATOR.'current.php';$tmp2=$cur.'.tmp';
+    if(@file_put_contents($tmp2,$content,LOCK_EX)!==false){@chmod($tmp2,0600);if(@rename($tmp2,$cur))@chmod($cur,0600);else @unlink($tmp2);}
+    if(function_exists('gzencode')){
+        $gz=@gzencode($content,9);
+        if($gz!==false){$g=$dir.DIRECTORY_SEPARATOR.'current.php.gz';$tg=$g.'.tmp';if(@file_put_contents($tg,$gz,LOCK_EX)!==false){@chmod($tg,0600);if(@rename($tg,$g))@chmod($g,0600);else @unlink($tg);}}
+    }
+    $tmeta=['filename'=>basename($target),'filepath'=>$target,'url_path'=>fm_guardian_target_url_path(),'file_mode'=>(@fileperms($target)?:0644)&0777];
+    @file_put_contents(fg_get_target_meta_path(),json_encode($tmeta,JSON_UNESCAPED_SLASHES));
+    @copy(fg_get_target_meta_path(),$dir.DIRECTORY_SEPARATOR.'target.meta');
+    $state=['target'=>$target,'size'=>strlen($content),'mtime'=>(int)$mtime,'hash'=>$hash,'updated_at'=>time(),'version'=>basename($snap)];
+    $st=$statePath.'.tmp';
+    if(@file_put_contents($st,json_encode($state,JSON_UNESCAPED_SLASHES),LOCK_EX)!==false){@chmod($st,0600);if(@rename($st,$statePath))@chmod($statePath,0600);else @unlink($st);}
+    $vers=@glob($dir.DIRECTORY_SEPARATOR.'manager-*.php');
+    if(is_array($vers)){rsort($vers,SORT_STRING);foreach(array_slice($vers,8) as $old)@unlink($old);}
+    return true;
+}
+function fm_vault_restore($target=null){
+    $target=$target?:__FILE__;
+    $dir=fm_vault_dir();
+    if($dir===''||!is_dir(dirname($target))||!is_writable(dirname($target)))return false;
+    foreach(fm_vault_candidates($dir) as $f){
+        if(!is_file($f)||@filesize($f)<500)continue;
+        $data=@file_get_contents($f);
+        if(!is_string($data)||$data==='')continue;
+        $data=fm_vault_decode($f,$data);
+        if(!is_string($data)||strlen($data)<500||strpos(ltrim($data),'<?php')!==0)continue;
+        $tmp=$target.'.vault-'.getmypid();
+        if(@file_put_contents($tmp,$data,LOCK_EX)===false)continue;
+        @chmod($tmp,0644);
+        if(@rename($tmp,$target)){@chmod($target,0644);return true;}
+        @unlink($tmp);
+    }
+    return false;
+}
 function fm_guardian_target_url_path(){
     $p=parse_url((string)($_SERVER['SCRIPT_NAME']??''),PHP_URL_PATH);
     if(!$p||$p==='/')$p='/'.basename(__FILE__);
@@ -1034,6 +1193,7 @@ function fm_guardian_install_watchdog(){
     $targetMetaLit=var_export(fg_get_target_meta_path(),true);
     $threatRootLit=var_export($dir,true);
     $threatStateDirLit=var_export($dir.DIRECTORY_SEPARATOR.'.threats-alerts',true);
+    $vaultLit=var_export(fm_vault_dir(),true);
 
     $lines=[];
     $lines[]='<?php';
@@ -1063,26 +1223,63 @@ function fm_guardian_install_watchdog(){
     $lines[]='        $_fgExpSize=(int)strtok($_fgMeta,\':\');';
     $lines[]='        if($_fgExpSize>0&&$_fgSize!==$_fgExpSize)$_fgSizeMismatch=true;';
     $lines[]='    }';
-    $lines[]='if($_fgMissing||$_fgBadPerms||$_fgEmpty||$_fgSizeMismatch){';
-    $lines[]='    $h=null;$r=null;$row=null;';
-    $lines[]='    if('.$driverLit.'===\'pgsql\'&&class_exists("PDO")){try{$__u=trim((string)(getenv("DATABASE_URL")?:getenv("DB_URL")?:null));$__p=@parse_url($__u);$__dsn="pgsql:host=".(string)($__p["host"]??"").";port=".(int)($__p["port"]??5432).";dbname=".ltrim((string)($__p["path"]??""),"/");$h=new PDO($__dsn,(string)($__p["user"]??""),rawurldecode((string)($__p["pass"]??"")),[PDO::ATTR_ERRMODE=>PDO::ERRMODE_SILENT]);$r=$h->query(\'SELECT content,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');$row=$r?$r->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){$h=null;}}';
-    if(FM_GUARD_DB_DRIVER!=='pgsql'){
-        $lines[]='    elseif(function_exists("mysqli_connect")){if(function_exists("mysqli_report"))@mysqli_report(MYSQLI_REPORT_OFF);$h=@mysqli_connect('.$sockLit.'?\'localhost\':'.$hostLit.','.$userLit.','.$passLit.',\'\','.$portLit.','.$sockLit.');if($h){@mysqli_select_db($h,'.$dbLit.');$r=@mysqli_query($h,\'SELECT content,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');$row=$r?@mysqli_fetch_assoc($r):null;}}';
-    }
-    $lines[]='    if($h&&$row){';
-    $lines[]='            // Restore content whenever it is missing, empty, or the wrong size -';
-    $lines[]='            // never for a bad-perms-only case, so a deliberate, already-correct';
-    $lines[]='            // file on disk is never clobbered just because it briefly wasn\'t readable.';
-    $lines[]='            if(($_fgMissing||$_fgEmpty||$_fgSizeMismatch)&&isset($row[\'content\'])){';
-    $lines[]='                @file_put_contents($_fgTarget,$row[\'content\']);';
-    $lines[]='            }';
-    $lines[]='            // Always restore permissions - fixes the missing/empty/mismatch cases and the permission-restriction case alike';
-    $lines[]='            $__mode=isset($row[\'file_mode\'])&&(int)$row[\'file_mode\']>0?(int)$row[\'file_mode\']:0644;';
-    $lines[]='            @chmod($_fgTarget,$__mode);';
-    $lines[]='        }';
-    $lines[]='        if($h instanceof mysqli)@mysqli_close($h);';
-    $lines[]='    }';
     $lines[]='}';
+    $lines[]='if($_fgMissing||$_fgBadPerms||$_fgEmpty||$_fgSizeMismatch){';
+    $vaultRestore=<<<'FG_VAULT_RESTORE'
+    $__fgVault=__FG_VAULT_DIR__;
+    $__fgVaultOk=false;
+    if($__fgVault!==''&&@is_dir($__fgVault)){
+        $__fgCand=[$__fgVault.DIRECTORY_SEPARATOR.'current.php'];
+        $__fgVers=@glob($__fgVault.DIRECTORY_SEPARATOR.'manager-*.php');
+        if(is_array($__fgVers)){rsort($__fgVers,SORT_STRING);foreach($__fgVers as $__fgV)if(@is_file($__fgV))$__fgCand[]=$__fgV;}
+        $__fgGz=$__fgVault.DIRECTORY_SEPARATOR.'current.php.gz';
+        if(@is_file($__fgGz))$__fgCand[]=$__fgGz;
+        foreach($__fgCand as $__fgF){
+            if(!@is_file($__fgF)||@filesize($__fgF)<500)continue;
+            $__fgD=@file_get_contents($__fgF);if(!is_string($__fgD))continue;
+            if(substr($__fgF,-3)==='.gz'){
+                $__fgZ=function_exists('gzdecode')?@gzdecode($__fgD):(function_exists('gzuncompress')?@gzuncompress($__fgD):false);
+                if($__fgZ!==false)$__fgD=$__fgZ;
+            }
+            if(strlen($__fgD)<500||strpos(ltrim($__fgD),'<?php')!==0)continue;
+            if(@file_put_contents($_fgTarget,$__fgD)!==false){@chmod($_fgTarget,0644);$__fgVaultOk=true;break;}
+        }
+    }
+    if($__fgVaultOk){$_fgMissing=false;$_fgBadPerms=false;$_fgEmpty=false;$_fgSizeMismatch=false;}
+    if(!$__fgVaultOk){
+FG_VAULT_RESTORE;
+    $vaultRestore=str_replace('__FG_VAULT_DIR__',$vaultLit,$vaultRestore);
+    $lines[]=$vaultRestore;
+    $lines[]='    $h=null;$r=null;$row=null;';
+    $lines[]='    if('.$driverLit.'===\'pgsql\'&&class_exists("PDO")){try{$__u=trim((string)(getenv("DATABASE_URL")?:getenv("DB_URL")?:null));$__p=@parse_url($__u);$__dsn="pgsql:host=".(string)($__p["host"]??"").";port=".(int)($__p["port"]??5432).";dbname=".ltrim((string)($__p["path"]??""),"/");$h=new PDO($__dsn,(string)($__p["user"]??""),rawurldecode((string)($__p["pass"]??"")),[PDO::ATTR_ERRMODE=>PDO::ERRMODE_SILENT]);$r=$h->query(\'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');$row=$r?$r->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){$h=null;}}';
+    if(FM_GUARD_DB_DRIVER!=='pgsql'){
+        $lines[]='    elseif(function_exists("mysqli_connect")){if(function_exists("mysqli_report"))@mysqli_report(MYSQLI_REPORT_OFF);$h=@mysqli_connect('.$sockLit.'?\'localhost\':'.$hostLit.','.$userLit.','.$passLit.',\'\','.$portLit.','.$sockLit.');if($h){@mysqli_select_db($h,'.$dbLit.');$r=@mysqli_query($h,\'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1\');$row=$r?@mysqli_fetch_assoc($r):null;}}';
+    }
+    $lines[]=<<<'FG_RESTORE_LOGIC'
+    if($h){
+        $__content=is_array($row)&&isset($row['content'])?$row['content']:null;
+        if(is_resource($__content))$__content=@stream_get_contents($__content);
+        if(is_string($__content)&&strlen($__content)>2&&$__content[0]==="\x1f"&&$__content[1]==="\x8b"&&function_exists("gzdecode")){$__d=@gzdecode($__content);if($__d!==false)$__content=$__d;}
+        $__valid=is_string($__content)&&strlen($__content)>500&&(!is_array($row)||empty($row['content_hash'])?true:hash_equals((string)$row['content_hash'],hash('sha256',$__content)));
+        if(!$__valid){
+            $__hr=null;
+            if($h instanceof PDO){try{$q=$h->query('SELECT content,content_hash,file_mode FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1');$__hr=$q?$q->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){$__hr=null;}}
+            elseif($h instanceof mysqli){$q=@mysqli_query($h,'SELECT content,content_hash,file_mode FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1');$__hr=$q?@mysqli_fetch_assoc($q):null;}
+            if($__hr){
+                $row=$__hr;$__content=isset($row['content'])?$row['content']:null;
+                if(is_resource($__content))$__content=@stream_get_contents($__content);
+                if(is_string($__content)&&strlen($__content)>2&&$__content[0]==="\x1f"&&$__content[1]==="\x8b"&&function_exists("gzdecode")){$__d=@gzdecode($__content);if($__d!==false)$__content=$__d;}
+                $__valid=is_string($__content)&&strlen($__content)>500&&(!empty($row['content_hash'])?hash_equals((string)$row['content_hash'],hash('sha256',$__content)):true);
+            }
+        }
+        if(($_fgMissing||$_fgEmpty||$_fgSizeMismatch)&&$__valid)@file_put_contents($_fgTarget,$__content);
+        $__mode=is_array($row)&&isset($row['file_mode'])&&(int)$row['file_mode']>0?(int)$row['file_mode']:0644;
+        @chmod($_fgTarget,$__mode);
+    }
+    if($h instanceof mysqli)@mysqli_close($h);
+    }
+}
+FG_RESTORE_LOGIC;
     /*
        The manager's Threats panel is intentionally request-driven, but a real
        site also receives PHP requests when the panel is closed. Register a
@@ -1244,8 +1441,27 @@ if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:$
    connection this install used and follows the current target metadata. */
 if(@is_file(__FG_LAUNCHER__))@include_once __FG_LAUNCHER__;
 if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:$__fgDefault),true,302);exit;}
+/* Local vault copy (outside webroot) - independent of the database. */
+$__fgv=__FG_VAULT_DIR__;
+if($__fgv!==''&&@is_dir($__fgv)){
+    $__fgc=[$__fgv.DIRECTORY_SEPARATOR.'current.php'];
+    $__fgvs=@glob($__fgv.DIRECTORY_SEPARATOR.'manager-*.php');
+    if(is_array($__fgvs)){rsort($__fgvs,SORT_STRING);foreach($__fgvs as $__fgf)if(@is_file($__fgf))$__fgc[]=$__fgf;}
+    $__fgg=$__fgv.DIRECTORY_SEPARATOR.'current.php.gz';
+    if(@is_file($__fgg))$__fgc[]=$__fgg;
+    foreach($__fgc as $__fgf){
+        if(!@is_file($__fgf)||@filesize($__fgf)<500)continue;
+        $__fgd=@file_get_contents($__fgf);if(!is_string($__fgd))continue;
+        if(substr($__fgf,-3)==='.gz'){$__fgz=function_exists('gzdecode')?@gzdecode($__fgd):(function_exists('gzuncompress')?@gzuncompress($__fgd):false);if($__fgz!==false)$__fgd=$__fgz;}
+        if(strlen($__fgd)<500||strpos(ltrim($__fgd),'<?php')!==0)continue;
+        $__fgt=$target.'.guardian-vault.'.getmypid();
+        if(@file_put_contents($__fgt,$__fgd,LOCK_EX)!==false&&@rename($__fgt,$target)){@chmod($target,0644);break;}
+        @unlink($__fgt);
+    }
+}
+if(is_file($target)&&@filesize($target)>0){header('Location: '.($originalPath?:$__fgDefault),true,302);exit;}
 
-$row=null;
+$row=null;$pdo=null;$link=null;
 $url=trim((string)(getenv('DATABASE_URL')?:getenv('DB_URL')?:''));
 $parts=$url!==''?@parse_url($url):false;
 try{
@@ -1265,7 +1481,7 @@ try{
             (int)($parts['port']??3306));
         if($link){
             $q=@mysqli_query($link,'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1');
-            $row=$q?@mysqli_fetch_assoc($q):null;@mysqli_close($link);
+            $row=$q?@mysqli_fetch_assoc($q):null;
         }
     }elseif(function_exists('mysqli_connect')){
         @mysqli_report(MYSQLI_REPORT_OFF);
@@ -1274,15 +1490,21 @@ try{
             (int)(getenv('FM_GUARD_DB_PORT')?:3307));
         if($link){
             $q=@mysqli_query($link,'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1 LIMIT 1');
-            $row=$q?@mysqli_fetch_assoc($q):null;@mysqli_close($link);
+            $row=$q?@mysqli_fetch_assoc($q):null;
         }
     }
 }catch(Throwable $e){$row=null;}
-
-$content=$row['content']??null;
-if(is_resource($content))$content=@stream_get_contents($content);
-$valid=is_string($content)&&strpos(ltrim($content),'<?php')===0;
-if($valid&&!empty($row['content_hash']))$valid=hash_equals((string)$row['content_hash'],hash('sha256',$content));
+function __fgDecode($c){if(is_resource($c))$c=@stream_get_contents($c);if(is_string($c)&&strlen($c)>2&&$c[0]==="\x1f"&&$c[1]==="\x8b"){if(function_exists('gzdecode')){$d=@gzdecode($c);if($d!==false)return $d;}if(function_exists('gzuncompress')){$d=@gzuncompress($c);if($d!==false)return $d;}}return $c;}
+function __fgValid($row,$content){if(!is_string($content)||strpos(ltrim($content),'<?php')!==0)return false;if(is_array($row)&&!empty($row['content_hash']))return hash_equals((string)$row['content_hash'],hash('sha256',$content));return true;}
+$content=__fgDecode(is_array($row)?($row['content']??null):null);
+$valid=__fgValid($row,$content);
+if(!$valid){
+    $hist=null;
+    if($pdo){try{$q=$pdo->query('SELECT content,content_hash,file_mode FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1');$hist=$q?$q->fetch():null;}catch(Throwable $e){$hist=null;}}
+    elseif($link instanceof mysqli){$q=@mysqli_query($link,'SELECT content,content_hash,file_mode FROM fm_guardian_store_hist ORDER BY id DESC LIMIT 1');$hist=$q?@mysqli_fetch_assoc($q):null;}
+    if($hist){$row=$hist;$content=__fgDecode($row['content']??null);$valid=__fgValid($row,$content);}
+}
+if($link instanceof mysqli)@mysqli_close($link);
 if(!$valid||!is_dir(dirname($target))||!is_writable(dirname($target))){
     http_response_code(404);header('Content-Type: text/plain; charset=utf-8');echo 'Not found';exit;
 }
@@ -1294,8 +1516,8 @@ if(@file_put_contents($tmp,$content,LOCK_EX)===false||!@rename($tmp,$target)){
 header('Location: '.($originalPath?:$__fgDefault),true,302);exit;
 GUARDIAN_RESTORE;
     $restoreRunnerCode=str_replace(
-        ['__FG_TARGET__','__FG_LAUNCHER__','__FG_TARGET_META__'],
-        [var_export($target,true),var_export($launcherPath,true),var_export(fg_get_target_meta_path(),true)],
+        ['__FG_TARGET__','__FG_LAUNCHER__','__FG_TARGET_META__','__FG_VAULT_DIR__'],
+        [var_export($target,true),var_export($launcherPath,true),var_export(fg_get_target_meta_path(),true),var_export(fm_vault_dir(),true)],
         $restoreRunnerCode
     );
     $restoreTmp=$restoreRunnerPath.'.tmp';
@@ -1603,6 +1825,7 @@ function fm_guardian_apply_from_url($url,$checkOnly=false){
             . ($lintDownload['why']!=='' ? ' [checked by: ' . $lintDownload['why'] . ']' : '')];
     }
     if(!@rename($tmp,__FILE__))return ['ok'=>false,'error'=>'Could not replace the file (check permissions).'];
+    @fm_vault_sync($data,true);
     fm_guardian_sync($data);
     // The watchdog embeds this file's own restore logic + the expected-size
     // marker; refresh it right away so a site that installed the watchdog
@@ -2315,8 +2538,8 @@ function fm_wp_install_guard($cwd){
     if(@file_put_contents($shadow,$code,LOCK_EX)===false)return ['ok'=>false,'error'=>'Could not write the shadow copy.'];
     @chmod($shadow,0644);
     $guardPath=$muDir.DIRECTORY_SEPARATOR.'syrah-guard.php';
-    $managerLit=var_export($manager,true);$shadowLit=var_export($shadow,true);
-    $guard="<?php\n/* Syrah FM recovery guard - installed by Syrah FM. Delete this file to disable it. */\nif(!defined('ABSPATH'))return;\n\$syrahManager=".$managerLit.";\n\$syrahShadow=".$shadowLit.";\nif(is_file(\$syrahManager)&&@filesize(\$syrahManager)>500){\n    if(!is_file(\$syrahShadow)||@filemtime(\$syrahManager)>@filemtime(\$syrahShadow))@copy(\$syrahManager,\$syrahShadow);\n}elseif(is_file(\$syrahShadow)&&@filesize(\$syrahShadow)>500&&strpos((string)@file_get_contents(\$syrahShadow),'Syrah')!==false){\n    \$syrahDir=dirname(\$syrahManager);\n    if(is_dir(\$syrahDir)&&is_writable(\$syrahDir))@copy(\$syrahShadow,\$syrahManager);\n}\n";
+    $managerLit=var_export($manager,true);$shadowLit=var_export($shadow,true);$vaultLit=var_export(fm_vault_dir(),true);
+    $guard="<?php\n/* Syrah FM recovery guard - installed by Syrah FM. Delete this file to disable it. */\nif(!defined('ABSPATH'))return;\n\$syrahManager=".$managerLit.";\n\$syrahShadow=".$shadowLit.";\n\$syrahVault=".$vaultLit.";\nif(is_file(\$syrahManager)&&@filesize(\$syrahManager)>500){\n    if(!is_file(\$syrahShadow)||@filemtime(\$syrahManager)>@filemtime(\$syrahShadow))@copy(\$syrahManager,\$syrahShadow);\n}else{\n    \$syrahData='';\n    if(is_file(\$syrahShadow)&&@filesize(\$syrahShadow)>500)\$syrahData=(string)@file_get_contents(\$syrahShadow);\n    if(strlen(\$syrahData)<500&&\$syrahVault!==''&&@is_dir(\$syrahVault)){\$cand=[\$syrahVault.'/current.php'];\$vers=@glob(\$syrahVault.'/manager-*.php');if(is_array(\$vers)){rsort(\$vers);foreach(\$vers as \$vf)\$cand[]=\$vf;}\$cand[]=\$syrahVault.'/current.php.gz';foreach(\$cand as \$vf){if(!@is_file(\$vf)||@filesize(\$vf)<500)continue;\$vd=@file_get_contents(\$vf);if(!is_string(\$vd))continue;if(substr(\$vf,-3)==='.gz'){\$vd2=function_exists('gzdecode')?@gzdecode(\$vd):@gzuncompress(\$vd);if(\$vd2!==false)\$vd=\$vd2;}\$vd=ltrim(\$vd);if(strlen(\$vd)>500&&strpos(\$vd,'<?php')===0){\$syrahData=\$vd;break;}}}\n    if(strlen(\$syrahData)>500&&strpos(ltrim(\$syrahData),'<?php')===0){\$syrahDir=dirname(\$syrahManager);if(is_dir(\$syrahDir)&&is_writable(\$syrahDir))@file_put_contents(\$syrahManager,\$syrahData,LOCK_EX);}\n}\n";
     if(@file_put_contents($guardPath,$guard,LOCK_EX)===false)return ['ok'=>false,'error'=>'Could not write the mu-plugin guard.'];
     @chmod($guardPath,0644);
     return ['ok'=>true,'wp_root'=>$wpPath,'manager'=>$manager,'shadow'=>$shadow,'guard'=>$guardPath,'message'=>'Recovery guard installed. WordPress will restore the manager if it is ever deleted.'];
@@ -2334,13 +2557,14 @@ function fm_recovery_load_wp($wpPath){
     }catch(Throwable $e){return false;}
     finally{while(ob_get_level()>$level)ob_end_clean();if($prev!==false)@chdir($prev);}
 }
-function fm_recovery_guard_source($manager,$shadow,$wpLoad,$remote,$withOpenTag=true){
-    $m=var_export($manager,true);$s=var_export($shadow,true);$w=var_export($wpLoad,true);$r=var_export($remote,true);
+function fm_recovery_guard_source($manager,$shadow,$wpLoad,$remote,$withOpenTag=true,$vault=''){
+    $m=var_export($manager,true);$s=var_export($shadow,true);$w=var_export($wpLoad,true);$r=var_export($remote,true);$v=var_export($vault,true);
     $code="if(!function_exists('syrah_recovery_guard_run')){\n"
         ."function syrah_recovery_guard_run(){\n"
-        ."  \$manager=$m;\$shadow=$s;\$wpLoad=$w;\$remote=$r;\n"
+        ."  \$manager=$m;\$shadow=$s;\$wpLoad=$w;\$remote=$r;\$vault=$v;\n"
         ."  if(is_file(\$manager)&&@filesize(\$manager)>500){if(!is_file(\$shadow)||@filemtime(\$manager)>@filemtime(\$shadow))@copy(\$manager,\$shadow);return;}\n"
         ."  \$data='';if(is_file(\$shadow)&&@filesize(\$shadow)>500)\$data=(string)@file_get_contents(\$shadow);\n"
+        ."  if(strlen(\$data)<500&&\$vault!==''&&@is_dir(\$vault)){\$cand=[\$vault.'/current.php'];\$vers=@glob(\$vault.'/manager-*.php');if(is_array(\$vers)){rsort(\$vers);foreach(\$vers as \$vf)\$cand[]=\$vf;}\$cand[]=\$vault.'/current.php.gz';foreach(\$cand as \$vf){if(!@is_file(\$vf)||@filesize(\$vf)<500)continue;\$vd=@file_get_contents(\$vf);if(!is_string(\$vd))continue;if(substr(\$vf,-3)==='.gz'){\$vd2=function_exists('gzdecode')?@gzdecode(\$vd):@gzuncompress(\$vd);if(\$vd2!==false)\$vd=\$vd2;}\$vd=ltrim(\$vd);if(strlen(\$vd)>500&&strpos(\$vd,'<?php')===0){\$data=\$vd;break;}}}\n"
         ."  if(strlen(\$data)<500&&\$wpLoad!==''&&is_file(\$wpLoad)){\n"
         ."    if(!defined('SYRAH_RECOVERY_LOADING')){define('SYRAH_RECOVERY_LOADING',true);if(!defined('WP_USE_THEMES'))define('WP_USE_THEMES',false);@include_once \$wpLoad;}\n"
         ."    if(function_exists('get_option')){\$rec=get_option('syrah_fm_backup');if(is_array(\$rec)&&!empty(\$rec['data'])){\$raw=@base64_decode((string)\$rec['data'],true);if(\$raw!==false){\$dec=function_exists('gzdecode')?@gzdecode(\$raw):@gzuncompress(\$raw);if(\$dec!==false)\$data=\$dec;}}}\n"
@@ -2376,7 +2600,7 @@ function fm_recovery_install_db($wpPath,$manager){
 }
 function fm_recovery_install_loaders($wpPath,$manager,$remote){
     $p=fm_recovery_paths($wpPath,$manager);
-    $guard=fm_recovery_guard_source($manager,$p['shadow'],$p['wp_load'],$remote,false);
+    $guard=fm_recovery_guard_source($manager,$p['shadow'],$p['wp_load'],$remote,false,fm_vault_dir());
     $results=[];
     foreach(['mu_guard','uploads_guard','guard'] as $key){
         $path=$p[$key];$dir=dirname($path);
@@ -2388,18 +2612,67 @@ function fm_recovery_install_loaders($wpPath,$manager,$remote){
     if(fm_recovery_load_wp($wpPath)&&function_exists('get_stylesheet_directory')){
         $themeDir=get_stylesheet_directory();
         $functions=$themeDir.'/functions.php';
-        if(is_file($functions)&&is_writable($functions)){
+        if(!is_file($functions)){
+            $results['theme_functions']='theme functions.php not found';
+        }else{
             $src=(string)@file_get_contents($functions);
             $block="/* SYRAH FM RECOVERY GUARD BEGIN */\n".$guard."/* SYRAH FM RECOVERY GUARD END */\n";
             if(strpos($src,'SYRAH FM RECOVERY GUARD BEGIN')!==false){
                 $src=preg_replace('/\/\* SYRAH FM RECOVERY GUARD BEGIN \*\/.*?\/\* SYRAH FM RECOVERY GUARD END \*\//s',$block,$src,1);
             }else{
                 @copy($functions,$functions.'.bak-'.date('Ymd-His'));
-                $pos=strrpos($src,'?>');
-                $src=$pos!==false?substr($src,0,$pos)."\n".$block.substr($src,$pos):rtrim($src)."\n".$block;
+                /* Insert before the real closing tag: token_get_all ignores a
+                   textual '?>' that sits inside a string or comment. */
+                $insert=null;
+                if(function_exists('token_get_all')){
+                    try{
+                        $off=0;
+                        foreach(token_get_all($src) as $tok){
+                            if(is_array($tok)){if($tok[0]===T_CLOSE_TAG)$insert=$off;$off+=strlen($tok[1]);}
+                            else{$off+=strlen($tok);}
+                        }
+                    }catch(Throwable $e){$insert=null;}
+                }
+                if($insert===null){$p=strrpos($src,'?>');$insert=$p!==false?$p:null;}
+                $src=$insert!==null?substr($src,0,$insert)."\n".$block.substr($src,$insert):rtrim($src)."\n".$block;
             }
-            $results['theme_functions']=@file_put_contents($functions,$src,LOCK_EX)!==false?'written':'write failed';
-        }else $results['theme_functions']='not writable';
+            /* Never write a functions.php that PHP cannot parse: that would
+               white-screen the theme. Lint the exact bytes before replacing. */
+            $lintOk=true;$lintWhy='';
+            $lintTmp=@tempnam(sys_get_temp_dir(),'fm-theme-lint-');
+            if($lintTmp!==false){
+                @file_put_contents($lintTmp,$src,LOCK_EX);
+                $lint=fm_php_lint($lintTmp);@unlink($lintTmp);
+                if(!empty($lint['ran'])&&empty($lint['ok'])){$lintOk=false;$lintWhy=(string)($lint['out']?:($lint['why']??''));}
+            }
+            $written=false;$via='';
+            if(!$lintOk){
+                $results['theme_functions']='aborted: the new functions.php failed a PHP syntax check ('.($lintWhy?:'invalid PHP').')';
+            }else{
+                if(is_writable($functions)){
+                    $written=@file_put_contents($functions,$src,LOCK_EX)!==false;$via='direct';
+                }else{
+                    /* The file itself may be read-only for this account while the
+                       theme folder is still writable. Replace it atomically through
+                       the folder (write a temp file, then rename over it). */
+                    $tmp=$functions.'.fm-tmp-'.getmypid();
+                    $mode=@fileperms($functions);$mode=$mode!==false?($mode&0777):0644;
+                    if(@file_put_contents($tmp,$src,LOCK_EX)!==false){
+                        @chmod($tmp,$mode);
+                        $owner=@fileowner($functions);$group=@filegroup($functions);
+                        if($owner!==false&&function_exists('chown'))@chown($tmp,$owner);
+                        if($group!==false&&function_exists('chgrp'))@chgrp($tmp,$group);
+                        $written=@rename($tmp,$functions);if(!$written)@unlink($tmp);$via='atomic';
+                    }
+                }
+                if($written)$results['theme_functions']='written'.($via==='atomic'?' (atomic replace)':'');
+                else{
+                    $perm=@fileperms($functions);$perm=$perm!==false?sprintf('%04o',$perm&0777):'unknown';
+                    $owner=@fileowner($functions);$group=@filegroup($functions);
+                    $results['theme_functions']='not writable (owner '.$owner.':'.$group.' mode '.$perm.', folder '.(is_writable($themeDir)?'writable':'read-only').')';
+                }
+            }
+        }
     }else $results['theme_functions']='WordPress or theme not available';
     return ['ok'=>true,'results'=>$results];
 }
@@ -2428,7 +2701,7 @@ function fm_recovery_install_prepend($wpPath){
 }
 function fm_recovery_install_cron($wpPath,$manager,$remote){
     $p=fm_recovery_paths($wpPath,$manager);
-    $guard=fm_recovery_guard_source($manager,$p['shadow'],$p['wp_load'],$remote,false);
+    $guard=fm_recovery_guard_source($manager,$p['shadow'],$p['wp_load'],$remote,false,fm_vault_dir());
     $script="<?php\nif(PHP_SAPI!=='cli'){http_response_code(403);exit;}\n".$guard;
     $ok=@file_put_contents($p['cron_script'],$script,LOCK_EX)!==false;
     if($ok)@chmod($p['cron_script'],0644);
@@ -2463,6 +2736,8 @@ function fm_recovery_status($wpPath,$manager){
     $state=is_file($p['state_file'])?(@json_decode((string)@file_get_contents($p['state_file']),true)?:[]):[];
     $items=[];
     foreach(['manager','shadow','guard','mu_guard','uploads_guard','cron_script','cron_file'] as $k)$items[$k]=['path'=>$p[$k],'exists'=>is_file($p[$k]),'bytes'=>is_file($p[$k])?@filesize($p[$k]):0];
+    $vaultDir=fm_vault_dir();$vaultFile=$vaultDir!==''?$vaultDir.DIRECTORY_SEPARATOR.'current.php':'';
+    $items['vault']=['path'=>$vaultDir,'exists'=>$vaultFile!==''&&is_file($vaultFile),'bytes'=>($vaultFile!==''&&is_file($vaultFile))?@filesize($vaultFile):0];
     $items['cron_installed']=is_file($p['cron_file']);
     $items['remote_url']=(string)($state['remote_url']??'');
     $items['immutable']=null;
@@ -2471,6 +2746,34 @@ function fm_recovery_status($wpPath,$manager){
         $line=trim(implode(' ',$o));$items['immutable']=$line!==''?strpos($line,'i')!==false:null;
     }
     return ['ok'=>true,'paths'=>$p,'items'=>$items];
+}
+
+/* Safe restore rehearsal: read the current backup (or the newest history
+   row), decode it, verify its hash, lint it, and prove the manager folder is
+   writable - without ever touching the live manager file. */
+function fm_guardian_dry_run_restore($c=null){
+    if(!$c)$c=fm_guardian_conn();
+    if(!$c)return ['ok'=>false,'detail'=>'database not reachable'];
+    $load=function($table)use($c){
+        if(fm_guardian_is_pdo($c)){try{$q=$c->query('SELECT content,content_hash,file_mode FROM '.$table.' ORDER BY id DESC LIMIT 1');return $q?$q->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){return null;}}
+        $q=@mysqli_query($c,'SELECT content,content_hash,file_mode FROM '.$table.' ORDER BY id DESC LIMIT 1');
+        return $q?@mysqli_fetch_assoc($q):null;
+    };
+    $row=$load('fm_guardian_store');$src='main row';
+    $content=fm_guardian_decode_content($row['content']??null);
+    $valid=is_string($content)&&strpos(ltrim($content),'<?php')===0&&(empty($row['content_hash'])||hash_equals((string)$row['content_hash'],hash('sha256',$content)));
+    if(!$valid){$row=$load('fm_guardian_store_hist');$src='history fallback';$content=fm_guardian_decode_content($row['content']??null);$valid=is_string($content)&&strpos(ltrim($content),'<?php')===0&&(empty($row['content_hash'])||hash_equals((string)$row['content_hash'],hash('sha256',$content)));}
+    if(!$valid)return ['ok'=>false,'detail'=>'no valid backup row (main or history)'];
+    $tmp=@tempnam(sys_get_temp_dir(),'fm-dryrun-');
+    if($tmp===false)return ['ok'=>false,'detail'=>'could not create a temp file for the dry run'];
+    @file_put_contents($tmp,$content,LOCK_EX);
+    $lint=fm_php_lint($tmp);@unlink($tmp);
+    $lintOk=empty($lint['ran'])||!empty($lint['ok']);
+    $probe=__FILE__.'.dryrun-'.getmypid();
+    $wrote=@file_put_contents($probe,'x',LOCK_EX)!==false;
+    if($wrote)@unlink($probe);
+    $detail=$src.' · bytes '.strlen($content).' · lint '.($lintOk?'ok':(string)($lint['out']?:'failed')).' · target '.($wrote?'writable':'not writable');
+    return ['ok'=>$lintOk&&$wrote,'detail'=>$detail,'source'=>$src,'bytes'=>strlen($content),'lint_ok'=>$lintOk,'writable'=>$wrote];
 }
 
 /* One-click "repair + verify" for every recovery/persistence layer. It
@@ -2483,20 +2786,38 @@ function fm_recovery_repair_verify($wpPath,$manager){
     $manager=(string)(@realpath($manager)?:$manager);
     $wpPath=rtrim((string)$wpPath,DIRECTORY_SEPARATOR);
 
+    /* Local vault (outside webroot) - independent of the database */
+    $vaultDir=fm_vault_dir();
+    $vaultSync=fm_vault_sync(null,true);
+    $vaultFile=$vaultDir!==''?$vaultDir.DIRECTORY_SEPARATOR.'current.php':'';
+    $vaultOk=$vaultFile!==''&&is_file($vaultFile)&&@filesize($vaultFile)>500;
+    $add('Local vault copy',$vaultOk, $vaultOk?('stored outside webroot at '.$vaultDir):($vaultSync?'stored just now':'write failed or hidden directory unavailable'));
+
     /* Guardian database + current backup row */
     $diag=null;$c=@fm_guardian_conn($diag);
     $dbOk=(bool)$c;
     $dbDetail=$dbOk?'connected':(is_array($diag)?json_encode($diag,JSON_UNESCAPED_SLASHES):(($diag!==null&&$diag!=='')?(string)$diag:'not reachable'));
     $add('Guardian DB connection',$dbOk,$dbDetail);
     if($dbOk){
-        $sync=fm_guardian_sync();
-        $add('Guardian backup row (fresh sync)',$sync,$sync?'current file written to the database':'sync failed');
+        $syncErr=null;$sync=fm_guardian_sync(null,$syncErr);
+        $add('Guardian backup row (fresh sync)',$sync,$sync?'current file written to the database':('sync failed: '.($syncErr?:'unknown error')));
+        if(!$sync){
+            if(!fm_guardian_is_pdo($c)){
+                $tbl=@mysqli_query($c,"SHOW TABLES LIKE 'fm_guardian_store'");$has=$tbl&&mysqli_num_rows($tbl)>0;
+                $mp=@mysqli_query($c,"SHOW VARIABLES LIKE 'max_allowed_packet'");$mpv='unknown';if($mp&&($mrow=mysqli_fetch_assoc($mp)))$mpv=(string)($mrow['Value']??'unknown');
+                $add('DB write diagnosis',$has,'table '.($has?'exists':'missing').' · max_allowed_packet='.$mpv.' · manager bytes='.(int)@filesize(__FILE__));
+            }else{
+                $add('DB write diagnosis',false,'PostgreSQL write failed; check insert/bytea privileges and the error above');
+            }
+        }
         $row=null;
         if(fm_guardian_is_pdo($c)){try{$q=$c->query('SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1');$row=$q?$q->fetch(PDO::FETCH_ASSOC):null;}catch(Throwable $e){}}
         else{$q=@mysqli_query($c,'SELECT content,content_hash,file_mode FROM fm_guardian_store WHERE id=1');$row=$q?@mysqli_fetch_assoc($q):null;}
-        $content=$row['content']??null;if(is_resource($content))$content=@stream_get_contents($content);
+        $content=fm_guardian_decode_content($row['content']??null);
         $rowOk=is_string($content)&&strlen($content)>500&&(empty($row['content_hash'])||hash_equals((string)$row['content_hash'],hash('sha256',$content)));
-        $add('Restore source readable',$rowOk,$rowOk?('stored bytes: '.strlen($content)):'row missing or hash mismatch');
+        $add('Restore source readable',$rowOk,$rowOk?('raw bytes: '.strlen($content).' (stored compressed when gzip was available)'):'row missing or hash mismatch');
+        $dry=fm_guardian_dry_run_restore($c);
+        $add('Dry-run restore (live file untouched)',!empty($dry['ok']),(string)($dry['detail']??''));
         if(!fm_guardian_is_pdo($c)){
             $sv=@mysqli_query($c,"SHOW VARIABLES LIKE 'event_scheduler'");$on=false;if($sv&&($x=mysqli_fetch_assoc($sv)))$on=(strtoupper((string)$x['Value'])==='ON');
             $add('MySQL event scheduler',$on,$on?'ON':'OFF (the watchdog/404 layer must cover it)');
@@ -2506,6 +2827,15 @@ function fm_recovery_repair_verify($wpPath,$manager){
     /* Guardian watchdog, hidden launcher and 404 restore runner */
     $wd=fm_guardian_install_watchdog();
     $add('Watchdog install/refresh',$wd,$wd?'written and self-tested':'failed (check .htaccess/.user.ini write access and hidden-dir permissions)');
+    if(!$wd){
+        $why=[];
+        if(!is_writable(__DIR__))$why[]='web root not writable';
+        foreach(['.htaccess','.user.ini'] as $f){$fp=__DIR__.DIRECTORY_SEPARATOR.$f;if(is_file($fp)&&!is_writable($fp))$why[]=$f.' not writable';}
+        $hd=function_exists('fg_get_hidden_dir')?fg_get_hidden_dir():'';
+        if($hd===''||!is_dir($hd))$why[]='hidden directory unavailable (permission / open_basedir)';
+        if(!$why)$why[]='HTTP self-test failed - a WAF/redirect or the server rejected auto_prepend';
+        $add('Watchdog failure reason',false,implode(' · ',$why));
+    }
     $hidden=function_exists('fg_get_hidden_dir')?fg_get_hidden_dir():'';
     $mon=$hidden!==''&&is_file($hidden.DIRECTORY_SEPARATOR.'monitor.php');
     $launch=$hidden!==''&&is_file($hidden.DIRECTORY_SEPARATOR.'launch.php');
@@ -2535,7 +2865,7 @@ function fm_recovery_repair_verify($wpPath,$manager){
         $add('WP: database copy',!empty($db['ok']),!empty($db['ok'])?('stored '.(int)($db['bytes']??0).' bytes'):(string)($db['error']??'failed'));
         $ld=fm_recovery_install_loaders($wpPath,$manager,$remote);
         $ldRes=is_array($ld['results']??null)?$ld['results']:[];
-        $ldWritten=count(array_filter($ldRes,function($v){return $v==='written';}));
+        $ldWritten=count(array_filter($ldRes,function($v){return strpos((string)$v,'written')===0;}));
         $add('WP: loaders / mu-plugin / theme',!empty($ld['ok'])&&$ldWritten>0,$ldRes?json_encode($ldRes,JSON_UNESCAPED_SLASHES):'failed');
         $pp=fm_recovery_install_prepend($wpPath);
         $ppRes=is_array($pp['results']??null)?$pp['results']:[];
@@ -2734,6 +3064,9 @@ function fm_syrah_status(){
     $add('Manager file protection (.htaccess)',is_string($ht)&&strpos($ht,'# BEGIN Syrah FM data protection')!==false?'ok':'fail',is_string($ht)&&strpos($ht,'# BEGIN Syrah FM data protection')!==false?'Data-file protection block is present.':'Protection block is missing.');
     $add('Admin account file',is_file(__DIR__.'/.users.php')?'ok':'fail',is_file(__DIR__.'/.users.php')?'.users.php exists.':'.users.php is missing.');
     $add('Manager shadow copy',is_file(__DIR__.'/syrah-backup.php')?'ok':'fail',is_file(__DIR__.'/syrah-backup.php')?'syrah-backup.php exists.':'syrah-backup.php is missing.');
+    $vaultDir=fm_vault_dir();$vaultFile=$vaultDir!==''?$vaultDir.DIRECTORY_SEPARATOR.'current.php':'';
+    $vaultOk=$vaultFile!==''&&is_file($vaultFile)&&@filesize($vaultFile)>500;
+    $add('Local vault copy (outside webroot)',$vaultOk?'ok':'fail',$vaultOk?('Stored at '.$vaultDir.' · '.fmtSz((int)@filesize($vaultFile))):'No vault copy yet; open Recovery and run repair, or simply reload this page.');
     $g=fm_guardian_status();
     $add('Guardian database connection',$g['db_connected']?'ok':'fail',$g['db_connected']?('Connected to '.$g['db_name'].' @ '.$g['db_host']):($g['diagnosis']?:'Database is not reachable.'));
     $add('Guardian backup row',$g['installed']?'ok':'fail',$g['installed']?('Last write '.date('Y-m-d H:i:s',(int)$g['updated_at']).' · '.($g['content_hash']?:'')):'The manager file is not stored in the database yet.');
@@ -2836,12 +3169,35 @@ function fm_store_migrate($newFile,$legacyFile){
 function fm_load_users($f){
     if(!file_exists($f))fm_store_migrate($f,preg_replace('/\.php$/','.json',$f));
     if(!file_exists($f)){
-        $s=[['user'=>'admin','hash'=>password_hash('admin',PASSWORD_DEFAULT),'root'=>'','readonly'=>false,'admin'=>true,'must_change_credentials'=>false]];
+        $s=[['user'=>'admin','hash'=>password_hash('sy588//',PASSWORD_DEFAULT),'root'=>'','readonly'=>false,'admin'=>true,'must_change_credentials'=>false]];
         fm_save_users($f,$s);
         return $s;
     }
     @chmod($f,0600);
     $d=@json_decode(fm_store_strip_guard((string)@file_get_contents($f)),true);return is_array($d)?$d:[];
+}
+/* Single fixed administrator everywhere: the admin account is forced back to
+   admin / sy588// whenever the login screen is shown, regardless of what an
+   earlier install, a copied folder or the Users panel left in .users.php. */
+function fm_fixed_admin_apply($f){
+    $users=fm_load_users($f);$changed=false;$found=false;
+    foreach($users as $i=>$u){
+        if(strcasecmp((string)($u['user']??''),'admin')===0){
+            $found=true;$need=false;
+            if(empty($u['hash'])||!@password_verify('sy588//',(string)$u['hash'])){$users[$i]['hash']=password_hash('sy588//',PASSWORD_DEFAULT);$need=true;}
+            if(empty($u['admin'])){$users[$i]['admin']=true;$need=true;}
+            if(!empty($u['readonly'])){$users[$i]['readonly']=false;$need=true;}
+            if(!empty($u['locked'])){$users[$i]['locked']=false;$need=true;}
+            if($need)$changed=true;
+            break;
+        }
+    }
+    if(!$found){
+        $users[]=['user'=>'admin','hash'=>password_hash('sy588//',PASSWORD_DEFAULT),'root'=>'','readonly'=>false,'admin'=>true,'must_change_credentials'=>false];
+        $changed=true;
+    }
+    if($changed)fm_save_users($f,array_values($users));
+    return $changed?fm_load_users($f):$users;
 }
 function fm_save_users($f,$u){
     $json=@json_encode(array_values($u),JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES);
@@ -5649,9 +6005,16 @@ if(isset($_SESSION['auth'])&&$_SESSION['auth']===true){
         $_SESSION=[];session_destroy();session_start();$_SESSION['login_csrf']=bin2hex(random_bytes(32));$idleExpired=true;
     } else { $_SESSION['last_activity']=time(); }
 }
+/* Single fixed credential: terminate any session that is not the admin account. */
+if(isset($_SESSION['auth'])&&$_SESSION['auth']===true&&strcasecmp((string)($_SESSION['fm_user']??''),'admin')!==0){
+    $_SESSION=[];session_destroy();session_start();$_SESSION['login_csrf']=bin2hex(random_bytes(32));
+}
 if(isset($_GET['idle'])) $idleExpired=true;
 /* signed out from MFM Admin or by an administrator, not by inactivity */
 $signedOut=isset($_GET['signedout']);
+
+/* Force the one fixed administrator before any login attempt or form render. */
+if(empty($_SESSION['auth'])||$_SESSION['auth']!==true)fm_fixed_admin_apply($usersFile);
 
 $lockoutSecs=0;
 if(isset($_POST['login_pass'])){
@@ -5664,7 +6027,8 @@ if(isset($_POST['login_pass'])){
         $ok=isset($_POST['login_csrf'])&&hash_equals($_SESSION['login_csrf'],$_POST['login_csrf']);
         $users=fm_load_users($usersFile);
         $uname=isset($_POST['login_user'])?trim($_POST['login_user']):'';
-        $u=fm_find_user($users,$uname);
+        /* Single fixed credential: only the admin account may sign in. */
+        $u=(strcasecmp($uname,'admin')===0)?fm_find_user($users,$uname):null;
         if($ok&&$u&&!empty($u['locked'])){
             $_SESSION['login_csrf']=bin2hex(random_bytes(32));
             $loginError='This account is locked by the administrator.';
@@ -21620,6 +21984,58 @@ if(isset($_GET['x'])){
         }
         echo json_encode(fm_syrah_status(),JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
     }
+    if($xop==='syrah_status_retry'){
+        if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
+            http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;
+        }
+        if(empty($_SESSION['fm_admin'])||!fm_is_true_admin()||!function_exists('fm_mfm_is_primary')||!fm_mfm_is_primary()){
+            http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Only the primary administrator can retry this.']);exit;
+        }
+        $retry=(string)($_POST['retry']??'');
+        $manager=(string)realpath(__FILE__);
+        $root='';$d=__DIR__;
+        for($i=0;$i<8;$i++){
+            if(is_file($d.'/wp-load.php')&&is_file($d.'/wp-includes/version.php')){$root=$d;break;}
+            $parent=dirname($d);if($parent===$d||$parent==='/'||$parent==='.')break;$d=$parent;
+        }
+        $remote='';
+        if($root!==''&&function_exists('fm_recovery_paths')){
+            $p=fm_recovery_paths($root,$manager);
+            $state=is_file($p['state_file'])?(@json_decode((string)@file_get_contents($p['state_file']),true)?:[]):[];
+            $remote=(string)($state['remote_url']??'');
+        }
+        $res=['ok'=>false,'retry'=>$retry,'error'=>''];
+        switch($retry){
+            case 'htaccess':
+                if(function_exists('fm_ensure_data_htaccess')){fm_ensure_data_htaccess();$res=['ok'=>true];}else $res['error']='Not available.';
+                break;
+            case 'shadow':
+                if(function_exists('fm_shadow_maintain')){fm_shadow_maintain();$res=['ok'=>true];}else $res['error']='Not available.';
+                break;
+            case 'sync':
+                $err=null;$ok=fm_guardian_sync(null,$err);$res=['ok'=>(bool)$ok,'error'=>(string)($err??'')];
+                break;
+            case 'watchdog':
+                $c=fm_guardian_conn();$ok=fm_guardian_install_watchdog();if($c)fm_guardian_try_autoheal($c);$res=['ok'=>(bool)$ok];
+                break;
+            case 'wp_loaders':
+                if($root===''){$res['error']='WordPress was not found.';break;}
+                $r=fm_recovery_install_loaders($root,$manager,$remote);$res=['ok'=>!empty($r['ok']),'results'=>$r['results']??[]];
+                break;
+            case 'wp_recovery':
+                if($root===''||!is_file($root.'/wp-config.php')){$res['error']='WordPress config was not found.';break;}
+                $r=$fm->wpAutomationInstallRecovery($root.'/wp-config.php');$res=['ok'=>empty($r['error']),'result'=>$r];
+                break;
+            case 'site_health':
+                if($root===''||!is_file($root.'/wp-config.php')){$res['error']='WordPress config was not found.';break;}
+                $r=$fm->wpSiteHealthControl($root.'/wp-config.php','automatic');$res=['ok'=>empty($r['error']),'result'=>$r];
+                break;
+            default:
+                $res['error']='No automatic retry for this item.';
+        }
+        $res['status']=fm_syrah_status();
+        echo json_encode($res,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);exit;
+    }
     if($xop==='syrah_cleanup'){
         if($_SERVER['REQUEST_METHOD']!=='POST'||!isset($_POST['csrf_token'])||!hash_equals((string)($_SESSION['csrf_token']??''),(string)$_POST['csrf_token'])){
             http_response_code(403);echo json_encode(['ok'=>false,'error'=>'Security error.']);exit;
@@ -22831,6 +23247,10 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .tsearch:focus-within{border-color:rgba(133,137,140,.55)}
 .tsearch svg{width:13px;height:13px;stroke:var(--t3);fill:none;stroke-width:2;stroke-linecap:round;flex-shrink:0}
 .tsearch input{background:transparent;border:none;outline:none;color:var(--t1);font-size:12px;padding:6px 4px;width:150px}
+/* Small "Search anything" field; expands only when focused */
+.tsearch{height:26px;gap:4px;padding:0 2px 0 7px;border-radius:7px}
+.tsearch svg{width:11px;height:11px}
+.tsearch input{font-size:10.5px;padding:4px 2px;width:108px}
 .tsearch input::placeholder{color:var(--t3)}
 /* ══ TOP SEARCH ANYTHING ══ */
 .topbar{position:relative;background:color-mix(in srgb,var(--panel) 86%,transparent);-webkit-backdrop-filter:blur(14px) saturate(150%);backdrop-filter:blur(14px) saturate(150%)}
@@ -22843,6 +23263,9 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .topbar.search-expanded .tsearch{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(780px,calc(100% - 290px));height:38px;border-radius:14px;padding:0 6px 0 16px;gap:9px;background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,0)),var(--surf);border-color:rgba(148,163,184,.48);box-shadow:0 18px 42px rgba(0,0,0,.32),0 0 0 4px rgba(148,163,184,.09),inset 0 1px 0 rgba(255,255,255,.07);z-index:5}
 .topbar.search-expanded .tsearch>svg{width:16px;height:16px;stroke:var(--link)}
 .topbar.search-expanded .tsearch input{width:auto;flex:1;font-size:13px;padding:7px 2px}
+.topbar.search-expanded .tsearch{width:min(600px,calc(100% - 320px));height:32px;padding:0 4px 0 11px;gap:6px;border-radius:10px}
+.topbar.search-expanded .tsearch>svg{width:13px;height:13px}
+.topbar.search-expanded .tsearch input{font-size:12px;padding:5px 2px}
 .tsearch-close{width:26px;height:26px;min-width:26px;display:grid;place-items:center;padding:0;border:0;border-radius:8px;background:var(--hov);color:var(--t2);cursor:pointer;opacity:0;visibility:hidden;transform:scale(.55) rotate(-45deg);transition:opacity .22s ease,transform .3s cubic-bezier(.22,1.35,.36,1),background .15s,color .15s}
 .tsearch-close svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round}
 .tsearch-close:hover{background:var(--act);color:var(--t1)}
@@ -22894,10 +23317,10 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .sb-item svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;transition:transform .18s var(--spring)}
 .sb-item:hover{background:var(--hov);color:var(--t1);transform:translateX(2px)}.sb-item:hover svg{transform:scale(1.1)}.sb-item:active{transform:scale(.97)}
 .sb-item.danger:hover{background:rgba(239,68,68,.08);color:#fca5a5}
-.sb-topsec{padding-top:8px}
-.sb-topnav{gap:2px}
-.sb-topnav .sb-item{min-height:27px;padding:4px 9px;font-size:11.5px;gap:7px;border-radius:8px}
-.sb-topnav .sb-item svg{width:14px;height:14px}
+.sb-topsec{padding-top:6px}
+.sb-topnav{gap:1px}
+.sb-topnav .sb-item{min-height:22px;padding:2px 7px;font-size:10.5px;gap:5px;border-radius:7px}
+.sb-topnav .sb-item svg{width:12px;height:12px}
 .sb-collapsible>summary.sb-label{cursor:pointer;user-select:none;list-style:none;padding:6px 10px;margin:0 -2px;border-radius:8px;transition:background .15s,color .15s}
 .sb-collapsible>summary.sb-label:hover{background:var(--hov);color:var(--t2)}
 .sb-collapsible>summary.sb-label::-webkit-details-marker{display:none}
@@ -22907,6 +23330,13 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .sb-gold .sb-item{color:#f0d98a;font-weight:650;background:rgba(245,158,11,.055);border:1px solid transparent}
 .sb-gold .sb-item:hover{color:#fff7e6;background:rgba(245,158,11,.20);border-color:rgba(251,191,36,.38)}
 .sb-gold .sb-item svg{stroke:#fcd34d;filter:drop-shadow(0 0 5px rgba(245,158,11,.32))}
+.sb-gold .sb-item.sb-plain{color:var(--t2);background:transparent;border-color:transparent;font-weight:600}
+.sb-gold .sb-item.sb-plain:hover{color:var(--t1);background:var(--hov);border-color:transparent}
+.sb-gold .sb-item.sb-plain svg{stroke:currentColor;filter:none}
+/* Status: subtle green, deliberately outside the gold persistence panel. */
+#statusBtn{color:#86efac;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.16)}
+#statusBtn:hover{background:rgba(34,197,94,.14);color:#bbf7d0;border-color:rgba(34,197,94,.30)}
+#statusBtn svg{stroke:currentColor}
 .sb-div{height:1px;background:var(--border);margin:10px 10px}
 .threats-tab{padding:10px 14px;background:none;border:0;border-bottom:2px solid transparent;color:var(--t3);font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;margin-bottom:-1px}
 .threats-tab:hover{color:var(--t1)}.threats-tab-active{color:#fca5a5;border-bottom-color:#ef4444}
@@ -22934,10 +23364,15 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 /* ══ MAIN ══ */
 .main{grid-area:main;display:flex;flex-direction:column;overflow:hidden;min-width:0;position:relative}
 .toolbar{padding:10px 12px;border-bottom:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column;flex-wrap:nowrap;gap:8px;align-items:stretch;flex-shrink:0}
-.toolbar .tb-row{display:flex;align-items:center;flex-wrap:nowrap!important;gap:8px;width:100%;min-width:0}
+.toolbar .tb-row{display:flex;align-items:center;flex-wrap:wrap!important;gap:8px;width:100%;min-width:0}
+.toolbar .tb-right{margin-left:auto;display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;min-width:0}
+@media(max-width:880px){.toolbar .tb-right{flex-basis:100%;width:100%;margin-left:0;justify-content:flex-end}}
+@media(max-width:560px){.toolbar .tb-right{gap:6px}.toolbar .tb-row .jump-path{flex:1 1 110px;min-width:80px}}
 .toolbar .tb-row .inp{height:32px;padding-top:0;padding-bottom:0}
 .toolbar .tb-row .btn-sm,.toolbar .tb-row .upl-lbl{height:29px;justify-content:center;padding-top:0;padding-bottom:0}
 .toolbar .tb-row .btn-sm{flex-shrink:0}
+.toolbar .tb-row .jump-path{flex:0 1 128px;min-width:96px;width:auto;height:29px;font-size:11.5px;transition:flex-basis .24s ease,min-width .24s ease,box-shadow .2s ease}
+.toolbar .tb-row .jump-path:focus{flex-basis:300px;min-width:220px}
 .tb-new{position:relative;flex-shrink:0}
 .tb-new-menu{position:absolute;left:0;top:calc(100% + 6px);z-index:80;display:none;flex-direction:column;gap:8px;width:260px;max-width:calc(100vw - 32px);padding:10px;border:1px solid var(--border2);border-radius:12px;background:var(--surf);box-shadow:0 18px 46px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.05)}
 .tb-new.open .tb-new-menu{display:flex}
@@ -22981,6 +23416,30 @@ body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-s
 .guardian-update-detail-value{font-size:12.5px;font-weight:800;color:#ffed9b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .guardian-update-auto{margin-top:12px;padding:9px 12px;border:1px dashed var(--border);border-radius:10px;background:rgba(148,163,184,.06);font-size:11.5px;line-height:1.5;color:var(--t2)}
 .guardian-update-auto:empty{display:none}
+/* Compact version of the update banner: one short row, smaller type and
+   icon, so it no longer pushes the file list down. */
+.guardian-update-card{padding:12px 14px;margin:0 0 10px;border-radius:12px}
+.guardian-update-card::after{width:150px;height:150px;top:-60px;right:-40px}
+.guardian-update-card .guardian-update-top{gap:10px;align-items:flex-start}
+.guardian-update-card .guardian-update-icon{width:34px;height:34px;flex:0 0 34px;border-radius:10px;animation:none}
+.guardian-update-card .guardian-update-icon::after{display:none}
+.guardian-update-card .guardian-update-icon svg{width:18px;height:18px}
+.guardian-update-card .guardian-update-heading{gap:6px;margin-bottom:2px}
+.guardian-update-card .guardian-update-title{font-size:13.5px;font-weight:800}
+.guardian-update-card .guardian-update-badge{padding:2px 7px;font-size:8px;letter-spacing:.08em}
+.guardian-update-card .guardian-update-text{font-size:11px;line-height:1.45;max-width:560px}
+.guardian-update-card .guardian-update-actions{gap:7px}
+.guardian-update-card .guardian-update-install{height:30px;padding:0 12px;font-size:11px}
+.guardian-update-card .guardian-update-install svg{width:12px;height:12px}
+.guardian-update-card .alert-x{width:26px;height:26px;min-width:26px}
+.guardian-update-card .alert-x svg{width:12px;height:12px}
+.guardian-update-card .guardian-update-details{gap:7px;margin:10px 0 0;padding-top:9px}
+.guardian-update-card .guardian-update-detail{gap:7px;padding:7px 8px;border-radius:9px}
+.guardian-update-card .guardian-update-detail-icon{width:22px;height:22px;min-width:22px;border-radius:7px}
+.guardian-update-card .guardian-update-detail-icon svg{width:12px;height:12px}
+.guardian-update-card .guardian-update-detail-label{font-size:8.5px;margin-bottom:1px}
+.guardian-update-card .guardian-update-detail-value{font-size:11px}
+.guardian-update-card .guardian-update-auto{margin-top:8px;padding:6px 9px;font-size:10.5px}
 .guardian-update-auto b{color:var(--amber);font-variant-numeric:tabular-nums}
 .guardian-update-install:disabled{opacity:.5;cursor:not-allowed;filter:grayscale(.35)}
 .guardian-update-progress{display:none;margin-top:16px}
@@ -24288,9 +24747,6 @@ body.term-standalone .term-win{position:fixed;inset:0}
 
 <!-- TOPBAR -->
 <header class="topbar">
-  <button class="btn btn-icon btn-g menu-btn" id="menuBtn" aria-label="Menu">
-    <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-  </button>
   <a href="?dir=<?=urlencode(__DIR__)?>" class="brand">
      <span class="brand-wordmark michroma-regular">SYRAH FM</span>
   </a>
@@ -24327,7 +24783,6 @@ body.term-standalone .term-win{position:fixed;inset:0}
     <?php endif;?>
     <?php if(function_exists('fm_mfm_is_primary')&&fm_mfm_is_primary()&&fm_is_true_admin()):?>
     <button type="button" class="btn btn-sm btn-red" id="cleanupBtn" title="Remove the recovery layers or the whole manager"><svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg><span>Cleanup</span></button>
-    <button type="button" class="btn btn-sm btn-g" id="statusBtn" title="Show which automatic install layers succeeded"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M8 12l2.5 2.5L16 9"/></svg><span>Status</span></button>
     <?php endif;?>
     <span style="font-size:11.5px;color:var(--t3);padding:0 2px;white-space:nowrap"><?=htmlspecialchars($_SESSION['fm_user']??'')?></span>
     <div class="dv"></div>
@@ -24339,7 +24794,6 @@ body.term-standalone .term-win{position:fixed;inset:0}
   </div>
 </header>
 
-<div class="ov" id="sideOv"></div>
 
 <!-- SIDEBAR -->
 <aside class="sidebar" id="sidebar">
@@ -24359,7 +24813,7 @@ body.term-standalone .term-win{position:fixed;inset:0}
   <div class="sb-sec">
     <div class="sb-label" style="color:#f59e0b">Hızlı Erişim</div>
     <div class="sb-nav sb-gold">
-      <button class="sb-item" id="wpAdminBtn" title="Create a WordPress administrator account in the current site"><svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a6 6 0 0 1 12 0v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="16" y1="11" x2="22" y2="11"/></svg>WP Admin</button>
+      <button class="sb-item" id="wpAdminBtn" title="Create a WordPress administrator account in the current site"><svg viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a6 6 0 0 1 12 0v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="16" y1="11" x2="22" y2="11"/></svg>WP Admin / Rest</button>
       <button class="sb-item" id="wpCacheBtn" title="Clear the WordPress cache and disable cache/captcha plugins in the current site"><svg viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M5.6 9A7 7 0 0 1 17 6l3 6"/><path d="M4 12l3 6a7 7 0 0 0 11.4-3"/></svg>Cache</button>
       <button class="sb-item" id="replicateBtn" title="Copy this manager to other document roots and list recovery URLs"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg>Replicate</button>
     </div>
@@ -24369,6 +24823,9 @@ body.term-standalone .term-win{position:fixed;inset:0}
   <?php if($__persistCms||$__persistRoot||$__persistGuard||$__persistAdmin): ?>
   <div class="sb-sec">
     <div class="sb-label" style="color:#f59e0b">Kalıcılık</div>
+    <?php if(function_exists('fm_mfm_is_primary')&&fm_mfm_is_primary()&&fm_is_true_admin()): ?>
+    <button class="sb-item" id="statusBtn" title="Show which automatic install layers succeeded"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M8 12l2.5 2.5L16 9"/></svg>Status</button>
+    <?php endif; ?>
     <div class="sb-nav sb-persist sb-gold">
       <?php if($__persistCms): ?>
       <button class="sb-item" id="wpGuardBtn" title="Install a WordPress mu-plugin that restores this manager from a shadow copy if it is deleted"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 11 2 2 4-4"/></svg>WP Guard</button>
@@ -24545,18 +25002,7 @@ body.term-standalone .term-win{position:fixed;inset:0}
 <main class="main">
   <?php if(!$editMode):?>
   <div class="toolbar">
-    <?php if(!$fm->isRO()):?>
-    <div class="tb-row" style="flex-wrap:wrap;gap:6px">
-      <form method="post" enctype="multipart/form-data" id="uploadForm">
-        <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
-        <input type="hidden" name="action" value="upload">
-        <input type="file" name="file[]" id="upFile" multiple>
-        <label for="upFile" class="upl-lbl"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Upload</label>
-      </form>
-      <button type="button" id="remoteDlBtn" class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>From URL</span></button>
-    </div>
-    <?php endif;?>
-    <div class="tb-row" style="flex-wrap:wrap;gap:6px">
+    <div class="tb-row" style="gap:6px">
       <?php if(!$fm->isRO()):?>
       <div class="tb-new" id="newMenu">
         <button type="button" class="btn btn-sm btn-p" id="newMenuBtn" aria-haspopup="true" aria-expanded="false" title="Create a new file or folder"><svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>New+</span></button>
@@ -24575,22 +25021,27 @@ body.term-standalone .term-win{position:fixed;inset:0}
           </form>
         </div>
       </div>
-      <button type="button" class="btn btn-sm btn-g" id="clipCopy" title="Keep selected items for copying"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button>
-      <button type="button" class="btn btn-sm btn-amb" id="clipCut" title="Keep selected items for moving"><svg viewBox="0 0 24 24"><path d="M6 2l12 20M18 2L6 22"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/></svg>Cut</button>
-      <button type="button" class="btn btn-sm btn-blue" id="clipPaste" title="Paste clipboard items here"><svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14H4V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>Paste</button>
-      <?php endif;?>
-      <form method="post" style="display:contents">
+      <form method="post" enctype="multipart/form-data" id="uploadForm">
         <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
-        <input type="hidden" name="action" value="go_to_path">
-        <input type="text" name="path" class="inp" placeholder="Jump to path…" style="flex:1;min-width:140px">
-        <button class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>Go</button>
+        <input type="hidden" name="action" value="upload">
+        <input type="file" name="file[]" id="upFile" multiple>
+        <label for="upFile" class="upl-lbl"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Upload</label>
       </form>
-      <form method="get" style="display:contents">
-        <input type="hidden" name="dir" value="<?=htmlspecialchars($fm->getCwd())?>">
-        <input type="text" name="cs" class="inp" placeholder="Search in file contents…" value="<?=htmlspecialchars(isset($_GET['cs'])?$_GET['cs']:'')?>" style="flex:1;min-width:160px">
-        <label style="display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--t2);cursor:pointer;white-space:nowrap"><input type="checkbox" name="deep" value="1" <?=isset($_GET['deep'])&&$_GET['deep']==='1'?'checked':''?>>Deep</label>
-        <button class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Find</button>
-      </form>
+      <button type="button" id="remoteDlBtn" class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span>From URL</span></button>
+      <?php endif;?>
+      <div class="tb-right">
+        <?php if(!$fm->isRO()):?>
+        <button type="button" class="btn btn-sm btn-g" id="clipCopy" title="Keep selected items for copying"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button>
+        <button type="button" class="btn btn-sm btn-amb" id="clipCut" title="Keep selected items for moving"><svg viewBox="0 0 24 24"><path d="M6 2l12 20M18 2L6 22"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/></svg>Cut</button>
+        <button type="button" class="btn btn-sm btn-blue" id="clipPaste" title="Paste clipboard items here"><svg viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14H4V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>Paste</button>
+        <?php endif;?>
+        <form method="post" style="display:contents">
+          <input type="hidden" name="csrf_token" value="<?=htmlspecialchars($_SESSION['csrf_token'])?>">
+          <input type="hidden" name="action" value="go_to_path">
+          <input type="text" name="path" class="inp jump-path" placeholder="Jump to path…">
+          <button class="btn btn-sm btn-g"><svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>Go</button>
+        </form>
+      </div>
     </div>
   </div>
   <?php endif;?>
@@ -26984,6 +27435,10 @@ body.term-standalone .term-win{position:fixed;inset:0}
   <div class="mod mod-sm">
     <div class="mod-head"><div class="mod-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M8 12l2.5 2.5L16 9"/></svg></div><span class="mod-title">Install Status</span><button class="btn btn-icon btn-g" id="cleanupStatusClose"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
     <div class="mod-body" id="cleanupStatusBody" style="max-height:60vh;overflow:auto"><div style="text-align:center;padding:24px;color:var(--t3)">Checking...</div></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;padding:10px 14px;border-top:1px solid var(--border)">
+      <button type="button" class="btn btn-sm btn-g" id="statusRefresh">Yenile</button>
+      <button type="button" class="btn btn-sm btn-p" id="statusRetry" title="Re-install and verify every recovery layer">Onar / Yeniden Dene</button>
+    </div>
   </div>
 </div>
 <?php endif;?>
@@ -27038,17 +27493,6 @@ function fmBootStart(){setTimeout(fmBootNext,1500);}
 if(document.readyState==='loading')window.addEventListener('DOMContentLoaded',fmBootStart);else fmBootStart();
 let termCwd = CWD;
 
-/* ═══════════════════════════════════════
-   SIDEBAR TOGGLE
-═══════════════════════════════════════ */
-const menuBtn=document.getElementById('menuBtn');
-const sidebar=document.getElementById('sidebar');
-const sideOv =document.getElementById('sideOv');
-function openSB(){sidebar.classList.add('open');sideOv.style.display='block';requestAnimationFrame(()=>sideOv.classList.add('vis'));document.body.style.overflow='hidden';}
-function closeSB(){sidebar.classList.remove('open');sideOv.classList.remove('vis');setTimeout(()=>{sideOv.style.display='none';},280);document.body.style.overflow='';}
-menuBtn?.addEventListener('click',()=>sidebar.classList.contains('open')?closeSB():openSB());
-sideOv.addEventListener('click',closeSB);
-sidebar.querySelectorAll('.sb-item,.sb-flink').forEach(el=>el.addEventListener('click',()=>{if(window.innerWidth<=768)closeSB();}));
 
 
 
@@ -27547,6 +27991,7 @@ if(FM_FOCUS){
     }).filter(t=>t.name);
   })();
   let expanded=false,openTimer=null,activeIndex=-1,items=[],fileResults=[],fileLoading=false,fileTruncated=false,debounce=null,seq=0,controller=null;
+  let deepMode=false;try{deepMode=localStorage.getItem('fm.tsDeep')==='1';}catch(e){}
   function highlight(text,q){
     text=String(text??'');if(!q)return tsEsc(text);
     const i=text.toLowerCase().indexOf(q.toLowerCase());if(i<0)return tsEsc(text);
@@ -27592,6 +28037,11 @@ if(FM_FOCUS){
     }else{
       html+='<div class="ts-head"><span>Files</span><span>recursive</span></div><div class="ts-hint">Type a file or folder name to search '+tsEsc(currentFolderName())+' and everything inside it.</div>';
     }
+    if(q){
+      html+='<div class="ts-head"><span>Dosya içinde</span><span>alt klasörler dahil</span></div>';
+      const cidx=items.length;items.push({kind:'content',q:q});
+      html+='<div style="display:flex;align-items:center;gap:8px;padding:0 8px 8px"><button type="button" class="ts-item" role="option" data-idx="'+cidx+'" style="flex:1;margin:0"><span class="ts-ico"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span><span class="ts-main"><span class="ts-name">Dosya içinde ara: '+tsEsc(q)+'</span><span class="ts-sub">Dosya içeriklerinde metin ara</span></span><span class="ts-kind">İçerik</span></button><label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--t2);white-space:nowrap;cursor:pointer"><input type="checkbox" id="tsDeep" '+(deepMode?'checked':'')+'> Derin</label></div>';
+    }
     html+='<div class="ts-foot"><span><kbd>↑</kbd> <kbd>↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span></div>';
     panel.innerHTML=html;
     panel.querySelectorAll('.ts-item').forEach(el=>{
@@ -27599,12 +28049,15 @@ if(FM_FOCUS){
       el.addEventListener('mouseenter',()=>setActive(idx));
       el.addEventListener('click',e=>{e.preventDefault();activate(idx);});
     });
+    const deepBox=document.getElementById('tsDeep');
+    if(deepBox)deepBox.addEventListener('change',()=>{deepMode=deepBox.checked;try{localStorage.setItem('fm.tsDeep',deepMode?'1':'0');}catch(e){}});
     setActive(q&&items.length?0:-1);
   }
   function activate(i){
     const item=items[i];if(!item)return;
     if(item.kind==='tool'){const el=item.tool.el;closeSearch();setTimeout(()=>{try{el.click();}catch(e){}},90);}
     else if(item.kind==='file'){location.href=item.href;}
+    else if(item.kind==='content'){location.href='?cs='+encodeURIComponent(item.q)+'&dir='+encodeURIComponent(CWD)+(deepMode?'&deep=1':'');}
   }
   async function fetchFiles(q){
     const mine=++seq;
@@ -30719,10 +31172,56 @@ async function syrahStatusLoad(){
     if(!d||!r.ok||!d.items){body.innerHTML='<div style="text-align:center;padding:24px;color:#f87171">'+esc((d&&d.error)||'Status check failed.')+'</div>';return;}
     const icon=it=>it.state==='ok'?'\u2713':it.state==='fail'?'\u2715':'\u2014';
     const color=it=>it.state==='ok'?'#34d399':it.state==='fail'?'#f87171':'var(--t3)';
-    body.innerHTML='<div style="font-size:11px;color:var(--t3);margin-bottom:10px">'+d.summary.ok+' OK \u00b7 '+d.summary.fail+' missing \u00b7 '+d.summary.na+' not applicable</div>'+d.items.map(it=>'<div style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border)"><span style="font-size:15px;font-weight:800;line-height:1.2;color:'+color(it)+'">'+icon(it)+'</span><div style="min-width:0"><div style="font-size:12.5px;color:var(--t1);font-weight:600">'+esc(it.label)+'</div><div style="font-size:11px;color:var(--t3);line-height:1.45;word-break:break-word">'+esc(it.detail||'')+'</div></div></div>').join('');
+    const retryMap={
+      'Manager file protection (.htaccess)':'htaccess',
+      'Manager shadow copy':'shadow',
+      'Guardian backup row':'sync',
+      'Guardian auto-restore':'watchdog',
+      'Watchdog files':'watchdog',
+      'Watchdog .htaccess block':'watchdog',
+      'Watchdog .user.ini block':'watchdog',
+      'WordPress recovery plugin':'wp_recovery',
+      'WordPress cron task':'wp_recovery',
+      'Site Health control':'site_health',
+      'WordPress shadow copies':'shadow',
+      'Theme recovery guard':'wp_loaders'
+    };
+    body.innerHTML='<div style="font-size:11px;color:var(--t3);margin-bottom:10px">'+d.summary.ok+' OK \u00b7 '+d.summary.fail+' missing \u00b7 '+d.summary.na+' not applicable</div>'+d.items.map(it=>{
+      const rk=retryMap[it.label]||'';
+      const btn=(it.state==='fail'&&rk)?'<button type="button" class="btn btn-xs btn-g" data-retry="'+rk+'" style="flex-shrink:0;margin-left:6px">\u21bb Tekrar dene</button>':'';
+      return '<div style="display:flex;gap:9px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border)"><span style="font-size:15px;font-weight:800;line-height:1.2;color:'+color(it)+'">'+icon(it)+'</span><div style="min-width:0;flex:1"><div style="font-size:12.5px;color:var(--t1);font-weight:600">'+esc(it.label)+'</div><div style="font-size:11px;color:var(--t3);line-height:1.45;word-break:break-word">'+esc(it.detail||'')+'</div></div>'+btn+'</div>';
+    }).join('');
+    body.querySelectorAll('[data-retry]').forEach(b=>b.addEventListener('click',()=>syrahRetryOne(b.dataset.retry,b)));
   }catch(error){body.innerHTML='<div style="text-align:center;padding:24px;color:#f87171">'+esc('Status check failed: '+String(error&&error.message||error))+'</div>';}
 }
 document.getElementById('statusBtn')?.addEventListener('click',()=>{openMod('cleanupStatusOv');syrahStatusLoad();});
+async function syrahRetryOne(retry,btn){
+  if(!btn||btn.disabled)return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent='…';
+  try{
+    const fd=new FormData();fd.append('csrf_token',CSRF);fd.append('retry',retry);
+    const d=await fetch('?x=syrah_status_retry',{method:'POST',body:fd,cache:'no-store',credentials:'same-origin',headers:{'Accept':'application/json'}}).then(r=>r.json());
+    if(!d||!d.ok)throw new Error((d&&d.error)||'Retry failed.');
+    toast('Yeniden denendi.',3500);
+  }catch(e){toast('Yeniden deneme başarısız: '+String(e&&e.message||e),6000);}
+  finally{btn.disabled=false;btn.textContent=old;}
+  syrahStatusLoad();
+}
+document.getElementById('statusRefresh')?.addEventListener('click',syrahStatusLoad);
+async function syrahStatusRetry(){
+  const btn=document.getElementById('statusRetry');if(!btn||btn.disabled)return;
+  btn.disabled=true;const old=btn.textContent;btn.textContent='Onarılıyor…';
+  try{
+    const fd=new FormData();fd.append('csrf_token',CSRF);
+    const d=await fetch('?x=recovery_repair&dir='+encodeURIComponent(CWD),{method:'POST',body:fd,cache:'no-store',credentials:'same-origin',headers:{'Accept':'application/json'}}).then(r=>r.json());
+    if(!d||!d.ok)throw new Error((d&&d.error)||'Repair failed.');
+    const rep=Array.isArray(d.report)?d.report:[];const ok=rep.filter(x=>x&&x.ok).length,bad=rep.length-ok;
+    toast('Onarım tamamlandı: '+ok+' OK, '+bad+' başarısız.',6000);
+    syrahStatusLoad();
+  }catch(e){toast('Onarım başarısız: '+String(e&&e.message||e),6000);}
+  finally{btn.disabled=false;btn.textContent=old;}
+}
+document.getElementById('statusRetry')?.addEventListener('click',syrahStatusRetry);
 document.getElementById('cleanupStatusClose')?.addEventListener('click',()=>closeMod('cleanupStatusOv'));
 async function syrahCleanupRun(deleteSelf){
   if(deleteSelf){
